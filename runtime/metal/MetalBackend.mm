@@ -354,6 +354,11 @@ std::vector<DispatchTiming>
 BackendInstrumentation::takeDispatchProfile(MetalBackend &backend) {
     return std::exchange(backend.impl_->dispatchProfile, {});
 }
+
+void BackendInstrumentation::setBufferAdmission(
+    MetalBackend &backend, std::function<void(uint64_t)> admission) {
+    backend.impl_->bufferAdmission = std::move(admission);
+}
 #endif
 
 }  // namespace richengine::metal

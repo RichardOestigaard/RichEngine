@@ -90,6 +90,10 @@ public:
   // Allocation identity and exact view range, including Private storage.
   // This compares metadata only; it never maps or reads device contents.
   [[nodiscard]] bool sameView(const MetalBuffer &other) const noexcept;
+  // A view of this view's range, offset and length in bytes; the result
+  // covers [offsetBytes, offsetBytes + lengthBytes) of this view and keeps
+  // the same base allocation alive.
+  [[nodiscard]] MetalBuffer subview(uint64_t offsetBytes, uint64_t lengthBytes) const;
 
 private:
   struct Impl;

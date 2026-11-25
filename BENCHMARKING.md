@@ -54,6 +54,22 @@ Options: `--samples N` (default 1), `--progress FILE` (JSONL progress),
   ("warmup KV page 0 is outside the startup runway") even with a reduced
   `--max-context`; use `int8` for the reference-precision comparison.
 
+## MoE indirect dispatch
+
+`RICHENGINE_MOE_INDIRECT_DISPATCH` gates the staged GGUF decode expert
+passes' live-tile indirect launch: the grouping kernel writes each pass's
+threadgroup count after the live tile count, so launches size to the
+step's routed tiles instead of the workspace bound. Modes: unset/`auto`
+arms it only on the measured combination — an "Apple M5 Pro" (Apple GPU
+family 10, 20 cores) running `Qwen3.6-35B-A3B` from
+`unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q2_K_XL`, using 8-row expert tiles
+and more than one planned row. Single-row decode stays direct in auto
+mode. `0` disables it; `1` (or any other legacy presence value) forces
+eligible staged resident GGUF decode plans, gated or ungated. Bolt's
+ungated latent MoE stays opt-in: auto never selects it, force it with
+`RICHENGINE_MOE_INDIRECT_DISPATCH=1`. Prefill, canvas, register, packed,
+streamed, int8 and fused indirect-gather plans never take it.
+
 ## Results
 
 Raw results land in `build/release/bench/*.json` (or `--output-dir` under

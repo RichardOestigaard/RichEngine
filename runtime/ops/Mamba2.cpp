@@ -25,9 +25,19 @@ void kernelShape(const Mamba2Shape &shape) {
     throw std::invalid_argument("invalid Mamba2 shape");
   const Mamba2Shape nemotron{64, 64, 8, 128, 4, 4096, 6144, 10496,
                              shape.dtMinimum, shape.dtMaximum, shape.core};
-  if (!(shape.core == Mamba2Core::Nemotron64 && shape == nemotron))
+  const Mamba2Shape bolt{128, 64, 8, 128, 4, 8192, 10240, 18688,
+                         shape.dtMinimum, shape.dtMaximum, shape.core};
+  if (!((shape.core == Mamba2Core::Nemotron64 && shape == nemotron) ||
+        (shape.core == Mamba2Core::Bolt128 && shape == bolt)))
     throw std::invalid_argument(
         "declared Mamba2 core does not match the shape");
+}
+
+// The kernel name infix of a core's compiled variants: Bolt128's entries are
+// the base names' "_h128" forms, Nemotron64's unsuffixed.
+[[nodiscard]] std::string mamba2Base(std::string_view name, Mamba2Core core) {
+  if (core == Mamba2Core::Bolt128) return std::string(name) + "_h128";
+  return std::string(name);
 }
 
 // The kernel variant loading the norm weights in their stored type: bf16, or
@@ -53,12 +63,12 @@ void Mamba2::addPrefill(metal::CommandGraph &graph,
     throw std::invalid_argument("invalid Mamba2 prefill geometry");
   (void)kernelShape(shape);
   const Mamba2PrefillParams params{tokens, shape.dtMinimum, shape.dtMaximum};
-  graph.add(kPrefillMamba2Prepare.data(),
+  graph.add(mamba2Base(kPrefillMamba2Prepare, shape.core),
             {buffers.packed, buffers.convolutionWeights, buffers.convolutionIn,
              buffers.convolutionOut, buffers.postConvolution,
              buffers.timeBias, buffers.stepSizes, buffers.convolutionBias},
             params, {uint64_t{tokens} * shape.groups, 1, 1}, {128, 1, 1});
-  graph.add(kPrefillMamba2Scan.data(),
+  graph.add(mamba2Base(kPrefillMamba2Scan, shape.core),
             {buffers.postConvolution, buffers.stepSizes, buffers.aWeights,
              buffers.skipWeights, buffers.recurrentIn, buffers.recurrentOut,
              buffers.recurrentRows},
@@ -68,7 +78,7 @@ void Mamba2::addPrefill(metal::CommandGraph &graph,
              1, 1},
             {RICHENGINE_GDN_SCAN_THREADS, 1, 1});
   const std::string gate = mamba2Kernel(
-      (sums ? kPrefillMamba2GateSums : kPrefillMamba2Gate).data(),
+      mamba2Base(sums ? kPrefillMamba2GateSums : kPrefillMamba2Gate, shape.core),
       buffers.mixerNorm, shape.innerSize);
   std::vector<metal::MetalBuffer> gateBindings{
       buffers.recurrentRows, buffers.packed, buffers.mixerNorm.buffer,
@@ -149,7 +159,7 @@ PreparedInput Mamba2::addDecode(metal::CommandGraph &graph,
     }
   }
   const std::string name =
-      std::string(kVerifyMamba2Fused) + tableSuffix(input);
+      mamba2Base(kVerifyMamba2Fused, shape.core) + tableSuffix(input);
   const std::string kernel_name =
       mamba2Kernel(name, buffers.mixerNorm, shape.innerSize);
   // Every variant takes the params-through-binding-list form: the conv
@@ -236,7 +246,7 @@ void Mamba2::addCommit(metal::CommandGraph &graph, Mamba2CommitBuffers buffers,
   // Static parameters and arena/state buffers: replayable. The current/next
   // state swap alternates between the span cache's two slots.
   graph.beginBakedSpan();
-  graph.add(kVerifyMamba2Commit.data(), std::move(bindings), params,
+  graph.add(mamba2Base(kVerifyMamba2Commit, shape.core), std::move(bindings), params,
             {shape.groups, layers, lanes});
   graph.endBakedSpan();
 }

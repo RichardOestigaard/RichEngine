@@ -14,7 +14,7 @@ namespace richengine::ops {
 // declared by the family maker. Nemotron64 is Nemotron 3.5's mixer: 64 heads
 // of 64 dims in 8 groups of 128 states, a 6144-channel conv, a 10496-wide
 // packed projection storage row (10304 logical).
-enum class Mamba2Core : uint8_t { Unspecified, Nemotron64 };
+enum class Mamba2Core : uint8_t { Unspecified, Nemotron64, Bolt128 };
 
 // Tensor geometry mapped to a compiled Metal variant during graph
 // construction. The packed projection row carves

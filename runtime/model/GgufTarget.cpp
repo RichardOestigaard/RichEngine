@@ -88,6 +88,11 @@ gguf::TargetGeometry ggufTargetGeometry(const TargetLayout &layout) {
     geometry.mambaInputRows = layout.packedGdnWidth;
     geometry.expertBias = true;
     geometry.sharedIntermediateSize = layout.sharedIntermediateSize;
+    // The sigmoid router's scaling factor and, Bolt's LatentMoE only, the
+    // latent width the routed experts read and write (zero on Lightning,
+    // whose experts span the hidden size).
+    geometry.expertWeightsScale = layout.moeRoutedScale;
+    geometry.moeLatentSize = layout.moeLatentSize;
   }
   // The LFM2 targets tie their output head to the token embedding.
   geometry.tiedOutput = layout.tiedOutput;

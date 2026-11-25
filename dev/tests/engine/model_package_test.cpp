@@ -349,16 +349,28 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
         (void)backend.submit(dispatch);
         return std::memcmp(output.contents(), expected.data(), sizeof(expected)) == 0;
     };
+    bool allowRestore = true;
     {
         richengine::model::WeightImages images(backend);
+        images.setRestoreAdmission(
+            [&](uint64_t bytes, const auto &restore) -> richengine::metal::AllocationResult {
+                require(bytes == fileBytes, "restore did not request the image size");
+                if (!allowRestore) return richengine::metal::AllocationFailure::HostPressure;
+                restore();
+                return {};
+            });
         WeightFile file = images.load(
             richengine::model::packedImage(validPath, "test/valid.bin", "TEST0001", 7, 9));
+        WeightFile next = images.load(
+            richengine::model::packedImage(validPath, "test/next.bin", "TEST0001", 7, 9));
         retained = file.section(sizeof(expected), "payload");
         require(retained.contents() != nullptr &&
                     reinterpret_cast<uintptr_t>(retained.contents()) % kWeightFileAlignment == 0,
                 "an image section is not a 16 KiB-aligned CPU-visible view");
         file.finish();
-        require(backend.memoryStats().allocatedBytes >= baseline + fileBytes,
+        static_cast<void>(next.section(sizeof(expected), "payload"));
+        next.finish();
+        require(backend.memoryStats().allocatedBytes >= baseline + 2 * fileBytes,
                 "an image's memory was not tracked");
         require(readBack(), "GPU read of an image section was incorrect");
         images.release();
@@ -371,8 +383,27 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
             refused = std::string_view(error.what()).find("binds released memory") != std::string_view::npos;
         }
         require(refused, "a command bound released image memory");
-        require(images.restore() && !images.released() &&
+        // restore() admits one image at a time: the first is back while the
+        // second stays released.
+        require(!images.restore() && images.released() &&
                     backend.memoryStats().allocatedBytes >= baseline + fileBytes && readBack(),
+                "GPU read of a restored image section was incorrect");
+        allowRestore = false;
+        const uint64_t partial = backend.memoryStats().allocatedBytes;
+        bool hostRefused = false;
+        try {
+            static_cast<void>(images.restore());
+        } catch (const richengine::metal::MetalAllocationError &error) {
+            hostRefused = error.failure() == richengine::metal::AllocationFailure::HostPressure;
+        }
+        require(hostRefused &&
+                    backend.memoryStats().allocatedBytes == partial &&
+                    images.imageBytes("test/next.bin").empty() && readBack(),
+                "a refused restore changed memory or lost a restored image");
+        allowRestore = true;
+        require(images.restore() && !images.released() &&
+                    backend.memoryStats().allocatedBytes >= baseline + 2 * fileBytes && readBack() &&
+                    !images.imageBytes("test/next.bin").empty(),
                 "GPU read of a restored image section was incorrect");
         images.release();
         descriptor = open(validPath.c_str(), O_WRONLY | O_CLOEXEC);

@@ -288,6 +288,8 @@ RuntimeResources::RuntimeResources(
       releasableMemory_(*model_.images, idleSplit(aneFfn_)),
       aneFfnOutcome_(aneFfn.outcome), kvFormat_(kvFormat), buildId_(std::move(buildId)),
       cancelled_(std::move(cancelled)), hostAvailableAtStart_(hostAvailableAtStart) {
+  model_.images->setRestoreAdmission(memoryGovernor_->allocationAdmission(
+      MemoryGovernor::AdmissionMode::PreserveHostReserve));
   if (aneFfn.outcome.kind == AneFfnOutcome::Kind::Pending) aneFfnPending_ = std::move(aneFfn);
 }
 
@@ -460,7 +462,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // One plan owner is used both before allocation and during encoding. The
   // engine lends it to model execution without inspecting its plans.
   ops::ExecutionPlans operators(device, config.moeUnionCap,
-                                package.descriptor.family);
+                                package.descriptor.family,
+                                package.descriptor.name);
   model::ModelMemoryPlan modelMemoryPlan;
   try {
     modelMemoryPlan = model::plannedRuntimeMemory(device, package, operators, config.kvFormat);

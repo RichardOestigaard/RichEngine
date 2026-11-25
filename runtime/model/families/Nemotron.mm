@@ -75,7 +75,7 @@ void validateNemotronSourceConfig(id textObj,
        layout.sharedIntermediateSize},
       {"max_position_embeddings", layout.maximumContextTokens}});
   requireNumber(text[@"rms_norm_eps"], 1e-5, "rms_norm_eps");
-  requireNumber(text[@"expert_weights_scale"], 2.5,
+  requireNumber(text[@"expert_weights_scale"], layout.moeRoutedScale,
                 "expert_weights_scale");
   id act = text[@"hidden_act"];
   requireEqual([act isKindOfClass:[NSString class]]
@@ -110,15 +110,27 @@ void validateNemotronSourceConfig(id textObj,
 }
 
 // Nemotron is text-only: no vision layout, and no vision weights to load.
-ModelDescriptor nemotronDescriptor(std::string name) {
+ModelDescriptor nemotronDescriptorFor(std::string name,
+                                      const TargetLayout &layout) {
   ops::VisionLayout vision;
-  vision.outputHiddenSize = nemotronTargetLayout().hiddenSize;
+  vision.outputHiddenSize = layout.hiddenSize;
   ModelDescriptor descriptor =
-      makeModelDescriptor(std::move(name), nemotronTargetLayout(),
-                          nemotronNullDraftLayout(nemotronTargetLayout()),
+      makeModelDescriptor(std::move(name), layout,
+                          nemotronNullDraftLayout(layout),
                           vision);
   descriptor.visionSource = VisionSource::None;
   return descriptor;
+}
+
+ModelDescriptor nemotronDescriptor(std::string name) {
+  return nemotronDescriptorFor(std::move(name), nemotronTargetLayout());
+}
+
+// Bolt's descriptor: the 88-block layout — its discrimination from
+// Lightning is the family the install's signature match names, which the
+// per-layer GGUF metadata (88 blocks, moe_latent_size) then verifies.
+ModelDescriptor boltDescriptor(std::string name) {
+  return nemotronDescriptorFor(std::move(name), boltTargetLayout());
 }
 
 // The registry's erased-signature entry for the nemotron target.
@@ -135,6 +147,12 @@ const bool kRegisteredNemotronFamilies = [] {
       {.name = "Nemotron-3.5-Lightning-30B-A3B",
        .modelType = "nemotron_h_moe_text", .legacyType = "nemotron_h",
        .makeDescriptor = &nemotronDescriptor,
+       .validateSourceConfig = &validateNemotronSourceConfig,
+       .acceptsDeclaredDraft = true});
+  registerModelFamily(
+      {.name = "Nemotron-3.5-Bolt-74B-A9B",
+       .modelType = "nemotron_h_moe_text", .legacyType = "nemotron_h",
+       .makeDescriptor = &boltDescriptor,
        .validateSourceConfig = &validateNemotronSourceConfig,
        .acceptsDeclaredDraft = true});
   return true;

@@ -122,6 +122,77 @@ namespace richengine::model {
   return layout;
 }
 
+// Nemotron 3.5 Bolt 74B-A9B's layout: the same tri-hybrid arch at 88
+// blocks — attention at 7, 16, 25, 36, 47, 58, 69, 80, MoE at 40 blocks,
+// Mamba-2 elsewhere — with the mixer's doubled inner size (128 heads) and
+// the heterogeneous Star Elastic MoE: per-layer expert counts (240..496,
+// `experts` their maximum) and expert widths (1536..2560), LatentMoE
+// projections into a 1024-wide latent the routed experts read and write,
+// and a constant 5376-wide shared expert in the full hidden space.
+[[nodiscard]] constexpr TargetLayout boltTargetLayout() noexcept {
+  TargetLayout layout;
+  layout.arch = "nemotron";
+  layout.ggufArch = "nemotron_h_moe";
+  layout.ffnKind = FfnKind::SparseMoe;
+  layout.attentionQueryStride = 1;
+  layout.attentionQkNorm = false;
+  layout.maximumContextTokens = 262144;
+  layout.layers = 88;
+  layout.hiddenSize = 4096;
+  layout.vocabularySize = 131072;
+  const auto bit = [](uint32_t layer) constexpr {
+    return LayerMask{1} << layer;
+  };
+  layout.attentionMask = bit(7) | bit(16) | bit(25) | bit(36) | bit(47) |
+                         bit(58) | bit(69) | bit(78);
+  layout.moeMask = bit(1) | bit(3) | bit(5) | bit(8) | bit(10) | bit(12) |
+                   bit(14) | bit(17) | bit(19) | bit(21) | bit(23) | bit(26) |
+                   bit(28) | bit(30) | bit(32) | bit(34) | bit(37) | bit(39) |
+                   bit(41) | bit(43) | bit(45) | bit(48) | bit(50) | bit(52) |
+                   bit(54) | bit(56) | bit(59) | bit(61) | bit(63) | bit(65) |
+                   bit(67) | bit(70) | bit(72) | bit(74) | bit(76) | bit(79) |
+                   bit(81) | bit(83) | bit(85) | bit(87);
+  // qkv 4608 = 32 * 128 queries + 2 * 2 * 128 keys and values. The
+  // in_proj's logical 18560 rows (8192 gate + 10240 conv + 128 dt) pad to
+  // the 18688-row storage tile.
+  layout.packedFullWidth = 4608;
+  layout.packedGdnWidth = 18688;
+  layout.convolutionTaps = 4;
+  layout.convolutionDimension = 10240;
+  layout.mambaHeads = 128;
+  layout.mambaHeadDimension = 64;
+  layout.mambaGroups = 8;
+  layout.mambaStateSize = 128;
+  layout.mambaInnerSize = 8192;
+  layout.mambaTimeStepRank = 128;
+  layout.mambaDtMinimum = 0.001f;
+  layout.mambaDtMaximum = std::numeric_limits<float>::infinity();
+  layout.mambaCore = ops::Mamba2Core::Bolt128;
+  layout.attentionWidth = 4096;
+  layout.attentionQueryHeads = 32;
+  layout.attentionKvHeads = 2;
+  layout.attentionHeadDimension = 128;
+  layout.rotaryPairs = 0;
+  layout.stopTokens = {11, 11};
+  layout.attentionCore = kv::Core::Kv2Group16D128;
+  // The Star Elastic maximums size the scratch; the GGUF's per-layer
+  // tensors carry each block's own count and width.
+  layout.experts = 496;
+  layout.expertsPerToken = 9;
+  layout.expertIntermediateSize = 2560;
+  layout.packedExpertWidth = 2560;
+  layout.sharedIntermediateSize = 5376;
+  layout.packedSharedWidth = 5376;
+  layout.moeSharedExpert = true;
+  layout.moeUngatedExperts = true;
+  layout.moeRoutedScale = 5.0F;
+  layout.moeLatentSize = 1024;
+  layout.rmsEpsilon = 1e-5F;
+  layout.hiddenCaptureLayers = {87};
+  layout.captureLayerCount = 1;
+  return layout;
+}
+
 [[nodiscard]] TargetModelWeights
 loadNemotronWeights(metal::MetalBackend &backend, const TargetLayout &layout,
                     const TargetFiles &files);

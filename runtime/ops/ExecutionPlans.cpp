@@ -34,7 +34,8 @@ void include(Workspace &bound, const Workspace &required,
 } // namespace
 
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device,
-                               uint32_t moeUnionCap, std::string_view model)
+                               uint32_t moeUnionCap, std::string_view model,
+                               std::string_view checkpoint)
     : policy_(policyFor(device, model)),
       linear_(policy_),
       // --moe-union wins; else the resolved policy (an explicit
@@ -44,7 +45,12 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device,
       moeRouteWideRows_(moeRouteWideRows(policy_.cores)),
       // RICHENGINE_MOE_SG4 overrides the family's simdgroups for A/Bs.
       moeDecodeSimdgroups_(tuning().moeSg4 ? MoeExpertSimdgroups::Four
-                                          : moeDecodeSimdgroups(policy_)) {}
+                                          : moeDecodeSimdgroups(policy_)),
+      measuredMoeIndirectDispatch_(device.deviceName == "Apple M5 Pro" &&
+                                   device.appleGpuFamily == 10 &&
+                                   device.gpuCoreCount == 20 &&
+                                   model == "Qwen3.6-35B-A3B" &&
+                                   checkpoint == "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q2_K_XL") {}
 
 uint32_t ExecutionPlans::int8QueriesFromPages() const noexcept {
   if (!tuning().q8qAttention || !policy_.apple10Plus()) return 0;
@@ -114,6 +120,15 @@ MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phas
     else if (!canvas && tile == MoeGgufTile::Staged && tuning().moeDecodeM32)
       config.expertTile = MoeExpertTile::M32;
     config.ggufTile = tile;
+    // Live-tile indirect dispatch (RICHENGINE_MOE_INDIRECT_DISPATCH=auto):
+    // measured on the allowlisted combination only, decode plans past one
+    // row — a single-row step's grid has no live-tile slack to recover, and
+    // the ungated Bolt path stays opt-in. Auto also excludes M32 plans;
+    // MoePlan excludes register tiles in every mode.
+    config.indirectDispatch = phase == MoePhase::Decode && rows > 1 &&
+                              measuredMoeIndirectDispatch_ &&
+                              !shape.ungatedExperts &&
+                              config.expertTile == MoeExpertTile::M8;
     config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts);
     config.mxfp4Native = policy_.nativeFormats();
     // A chunk's experts run the int8 passes where its dense projections run

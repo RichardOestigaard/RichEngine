@@ -400,7 +400,7 @@ void MaxwellMtpDraft::addDecode(
                                         ops::LinearInput::Table64Paired}
                                   : ops::PreparedInput{}},
                  weights_.sharedFfn.down, downPlan);
-      ops::MoE::add(graph, {normed, shared, branch, buffers.mtp.moe, {}, {}},
+      ops::MoE::add(graph, {normed, shared, branch, buffers.mtp.moe, {}, {}, {}},
                     weights_.moe, moePlan);
       ops::Mhc::addExpandMix(graph, streams, branch, mappings, mhcShape_,
                              1);

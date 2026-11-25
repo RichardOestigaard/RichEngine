@@ -277,6 +277,7 @@ void addRepackChunks(metal::MetalBackend &backend, const WeightSource &source, c
       params.src_row_bytes = static_cast<uint32_t>(chunkRowBytes);
       params.dst_plane1 = lengths[1] ? static_cast<uint32_t>(at[1] - at[0]) : 0;
       params.dst_meta = static_cast<uint32_t>(at[2] - at[0]);
+      params.scale = repack.scale;
       // The sources' rows in image order, then zero rows, a task for each
       // run of rows within kChunkReadBytes.
       const auto stage = [&source, &repack, firstRow, rows, column, chunkRowBytes](uint8_t *host) {

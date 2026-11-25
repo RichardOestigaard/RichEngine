@@ -120,6 +120,8 @@ inline void mamba2_prepare_prefill_phase(
 
 MAMBA2_PREPARE_PREFILL_ENTRY(prefill_mamba2_prepare, 64, 64, 8, 128, 6144,
                              10496)
+MAMBA2_PREPARE_PREFILL_ENTRY(prefill_mamba2_prepare_h128, 128, 64, 8, 128, 10240,
+                             18688)
 #undef MAMBA2_PREPARE_PREFILL_ENTRY
 
 // One threadgroup carries RICHENGINE_GDN_SCAN_STATE_ROWS rows of a head's
@@ -298,6 +300,7 @@ inline void mamba2_scan_prefill_phase(
   }
 
 MAMBA2_SCAN_PREFILL_ENTRY(prefill_mamba2_scan, 64, 64, 8, 128, 6144)
+MAMBA2_SCAN_PREFILL_ENTRY(prefill_mamba2_scan_h128, 128, 64, 8, 128, 10240)
 #undef MAMBA2_SCAN_PREFILL_ENTRY
 
 // The grouped gated RMSNorm of one (token, group) task: v = y * silu(z) over
@@ -318,21 +321,37 @@ inline void mamba2_gate_prefill_phase(
   const uint token = task / Groups;
   const uint group = task % Groups;
   const ulong base = ulong(token) * InnerSize + group * GroupWidth;
-  const uint dim = 2 * thread_index;
-  const uint column = group * GroupWidth + dim;
-  const float y0 = float(recurrent[base + dim]);
-  const float y1 = float(recurrent[base + dim + 1]);
-  const float z0 = float(packed[token * PackedWidth + column]);
-  const float z1 = float(packed[token * PackedWidth + column + 1]);
-  const float v0 = y0 * richengine_silu(z0);
-  const float v1 = y1 * richengine_silu(z1);
+  // 256 threads cover a 512-column group as one adjacent pair each. Bolt's
+  // sixteen-head groups are 1024 columns wide: the same lanes cover every
+  // further 512-column span too, keeping Nemotron64's order bitwise intact.
+  constexpr uint Spans = GroupWidth / 512;
+  static_assert(GroupWidth % 512 == 0,
+                "Mamba2 groups fill whole 512-column spans");
+  float versus[2 * Spans];
+  float sum = 0.0f;
+  for (uint span = 0; span < Spans; ++span) {
+    const uint dim = span * 512 + 2 * thread_index;
+    const uint column = group * GroupWidth + dim;
+    const float y0 = float(recurrent[base + dim]);
+    const float y1 = float(recurrent[base + dim + 1]);
+    const float z0 = float(packed[token * PackedWidth + column]);
+    const float z1 = float(packed[token * PackedWidth + column + 1]);
+    versus[2 * span] = y0 * richengine_silu(z0);
+    versus[2 * span + 1] = y1 * richengine_silu(z1);
+    sum += versus[2 * span] * versus[2 * span] +
+           versus[2 * span + 1] * versus[2 * span + 1];
+  }
   const float inverse = rms_inverse_of_sums<8>(
-      v0 * v0 + v1 * v1, GroupWidth, reductions, thread_index, lane,
-      simd_group, rms_eps);
-  hidden[base + dim] =
-      bfloat((v0 * inverse) * float(norm_weight[column]));
-  hidden[base + dim + 1] =
-      bfloat((v1 * inverse) * float(norm_weight[column + 1]));
+      sum, GroupWidth, reductions, thread_index, lane, simd_group, rms_eps);
+  for (uint span = 0; span < Spans; ++span) {
+    const uint dim = span * 512 + 2 * thread_index;
+    const uint column = group * GroupWidth + dim;
+    hidden[base + dim] =
+        bfloat((versus[2 * span] * inverse) * float(norm_weight[column]));
+    hidden[base + dim + 1] =
+        bfloat((versus[2 * span + 1] * inverse) *
+               float(norm_weight[column + 1]));
+  }
 }
 
 #define MAMBA2_GATE_PREFILL_ENTRY(Name, Heads, HeadDim, Groups, PackedWidth, \
@@ -355,6 +374,8 @@ inline void mamba2_gate_prefill_phase(
 
 MAMBA2_GATE_PREFILL_ENTRY(prefill_mamba2_gate, 64, 64, 8, 10496, bfloat)
 MAMBA2_GATE_PREFILL_ENTRY(prefill_mamba2_gate_f32, 64, 64, 8, 10496, float)
+MAMBA2_GATE_PREFILL_ENTRY(prefill_mamba2_gate_h128, 128, 64, 8, 18688, bfloat)
+MAMBA2_GATE_PREFILL_ENTRY(prefill_mamba2_gate_h128_f32, 128, 64, 8, 18688, float)
 #undef MAMBA2_GATE_PREFILL_ENTRY
 
 // The *_sums variant also writes the out-projection's input sums of the
@@ -396,5 +417,9 @@ MAMBA2_GATE_PREFILL_ENTRY(prefill_mamba2_gate_f32, 64, 64, 8, 10496, float)
 MAMBA2_GATE_PREFILL_SUMS_ENTRY(prefill_mamba2_gate_sums, 64, 64, 8, 10496,
                                bfloat)
 MAMBA2_GATE_PREFILL_SUMS_ENTRY(prefill_mamba2_gate_sums_f32, 64, 64, 8, 10496,
+                               float)
+MAMBA2_GATE_PREFILL_SUMS_ENTRY(prefill_mamba2_gate_sums_h128, 128, 64, 8, 18688,
+                               bfloat)
+MAMBA2_GATE_PREFILL_SUMS_ENTRY(prefill_mamba2_gate_sums_h128_f32, 128, 64, 8, 18688,
                                float)
 #undef MAMBA2_GATE_PREFILL_SUMS_ENTRY

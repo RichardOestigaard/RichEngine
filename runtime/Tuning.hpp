@@ -18,6 +18,13 @@
 
 namespace richengine {
 
+// RICHENGINE_MOE_INDIRECT_DISPATCH policy: Auto (the default) lets the
+// execution plans arm live-tile dispatch on measured device/model/checkpoint
+// combinations only, Off disables it everywhere, and any other present value
+// ("1", "on", ...) forces it on every eligible path — the previous presence
+// flag's behavior.
+enum class MoeIndirectDispatchMode : uint8_t { Auto, Off, On };
+
 struct Tuning {
   // ops/MoE.cpp, ops/ExecutionPlans.cpp
   bool moeStats = false;      // RICHENGINE_MOE_STATS=1
@@ -64,11 +71,20 @@ struct Tuning {
   // read identical weight slices back-to-back (L2 reuse) instead of each
   // tile streaming its whole slab before the next. A/B candidate.
   bool moeTileMajor = false;      // RICHENGINE_MOE_TILE_MAJOR (presence)
-  // ops/MoE.cpp, metal/kernels/shared/moe.metal: decode expert gate/up
-  // reads each grouped row's input through grouped_routes (the prefill
-  // indirect tile's staging) instead of a gather materializing
-  // groupedInput. A/B candidate.
+  // ops/MoE.cpp, metal/kernels/shared/moe*.metal: affine decode gate/up
+  // reads each grouped row's input through grouped_routes; fused GGUF decode
+  // resolves its column tiles indirectly and sparsely gathers the rest.
+  // A/B candidate.
   bool moeIndirectGather = false; // RICHENGINE_MOE_INDIRECT (presence)
+  // ops/MoE.cpp, ops/ExecutionPlans.cpp, metal/kernels/shared/moe.metal:
+  // staged GGUF decode plans launch their expert passes on grids the
+  // grouping kernel writes after the live tile count, sizing the launches
+  // to the step's live tiles. Excludes prefill/canvas, register, streamed,
+  // packed, int8 and fused GGUF indirect gather (_gu_i). RICHENGINE_MOE_
+  // INDIRECT_DISPATCH=auto|0|<anything else>: auto arms it on measured
+  // device/model/checkpoint combinations only (ops/ExecutionPlans.cpp).
+  MoeIndirectDispatchMode moeIndirectDispatch = MoeIndirectDispatchMode::Auto;
+                                                 // RICHENGINE_MOE_INDIRECT_DISPATCH=auto|0|<other>
   // The affine scores tiles fold the shared-expert scalar gate in as a 257th
   // column; OFF makes the select re-dot the input instead. A/B candidate.
   bool moeFoldedGate = true;    // RICHENGINE_MOE_FOLDED_GATE_OFF (presence)
@@ -82,6 +98,11 @@ struct Tuning {
   // ops/Linear.cpp, ops/LinearGguf.cpp
   bool ggufPackedOn = false;  // RICHENGINE_GGUF_PACKED_ON (presence)
   bool ggufPackedOff = false; // RICHENGINE_GGUF_PACKED_OFF (presence)
+  // ops/LinearGguf.cpp BF16 float-projection A/B geometry. These variants
+  // serve bf16-weight draft projections; f32 target projections keep the
+  // production kernels.
+  uint32_t ggufFloatNaStep = 32; // RICHENGINE_GGUF_FLOAT_NA_STEP (32/64/128)
+  uint32_t ggufFloatSplits = 16; // RICHENGINE_GGUF_FLOAT_SPLITS (16/8/4)
   // ops/Linear.cpp, model/RuntimeArenas.hpp
   bool prefillFastInt8 = false; // RICHENGINE_PREFILL_FAST_INT8 (presence)
   // ops/PagedAttention.cpp: opt-in INT8-query (q8q) attention scoring on
@@ -381,10 +402,17 @@ inline Tuning makeTuning() {
   t.moeRouteM16 = envFlag("RICHENGINE_MOE_ROUTE_M16");
   t.moeTileMajor = envFlag("RICHENGINE_MOE_TILE_MAJOR");
   t.moeIndirectGather = envFlag("RICHENGINE_MOE_INDIRECT");
+  if (const char *value = std::getenv("RICHENGINE_MOE_INDIRECT_DISPATCH")) {
+    const std::string_view mode(value);
+    t.moeIndirectDispatch = mode == "auto" ? MoeIndirectDispatchMode::Auto
+        : mode == "0" ? MoeIndirectDispatchMode::Off : MoeIndirectDispatchMode::On;
+  }
   t.moeFoldedGate = !envFlag("RICHENGINE_MOE_FOLDED_GATE_OFF");
   t.gdnChunked = envUint("RICHENGINE_GDN_CHUNKED", 0);
   t.ggufPackedOn = envFlag("RICHENGINE_GGUF_PACKED_ON");
   t.ggufPackedOff = envFlag("RICHENGINE_GGUF_PACKED_OFF");
+  t.ggufFloatNaStep = envUint("RICHENGINE_GGUF_FLOAT_NA_STEP", 32);
+  t.ggufFloatSplits = envUint("RICHENGINE_GGUF_FLOAT_SPLITS", 16);
   t.prefillFastInt8 = envFlag("RICHENGINE_PREFILL_FAST_INT8");
   t.q8qAttention = envFlag("RICHENGINE_Q8Q_ATTENTION");
   t.q8qAttentionPages = envUint("RICHENGINE_Q8Q_ATTENTION_PAGES", 0);

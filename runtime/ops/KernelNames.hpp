@@ -96,6 +96,7 @@ inline constexpr std::string_view kDflashSelectPoolEdges = "dflash_select_pool_e
 
 // Row movement and tables.
 inline constexpr std::string_view kCopyRowsBf16 = "copy_rows_bf16";
+inline constexpr std::string_view kReluSquaredRowsBf16 = "relu_squared_rows_bf16";
 inline constexpr std::string_view kRopeBuildTables = "rope_build_tables";
 inline constexpr std::string_view kGegluMultiply = "geglu_multiply";
 
@@ -397,6 +398,8 @@ inline constexpr std::string_view kMoeRouteSelectF32 = "moe_route_select_f32";
 // The wide (_e512) routing family for a block of more than 256 experts
 // (MOE_WIDE_EXPERT_SLOTS, metal/abi/MoE.h).
 inline constexpr std::string_view kMoeRouteSelectF32E512 = "moe_route_select_f32_e512";
+inline constexpr std::string_view kMoeRouteSelectSigmoidE512 = "moe_route_select_sigmoid_e512";
+inline constexpr std::string_view kMoeRouteSelectSigmoidSharedE512 = "moe_route_select_sigmoid_shared_e512";
 inline constexpr std::string_view kMoeRouteCapE512 = "moe_route_cap_e512";
 inline constexpr std::string_view kMoeGroupRoutesE512 = "moe_group_routes_e512";
 inline constexpr std::string_view kMoeGroupRoutesVerifiedE512 = "moe_group_routes_verified_e512";
@@ -413,6 +416,7 @@ inline constexpr std::string_view kMoeGatherTable16 = "moe_gather_table16";
 inline constexpr std::string_view kMoeGatherPacked = "moe_gather_packed";
 inline constexpr std::string_view kMoeGatherRows = "moe_gather_rows";
 inline constexpr std::string_view kMoeGatherRowsSmall = "moe_gather_rows_small";
+inline constexpr std::string_view kMoeGatherRowsGgufSparse = "moe_gather_rows_gguf_sparse";
 inline constexpr std::string_view kMoeCombine = "moe_combine";
 // The dense shared-expert dispatches of a decode plan under
 // RICHENGINE_MOE_SHARED_DENSE (params.shared == 2 in the grouping).

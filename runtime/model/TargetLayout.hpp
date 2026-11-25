@@ -83,6 +83,10 @@ struct DiffusionSchedule final {
   bool operator==(const DiffusionSchedule &) const = default;
 };
 
+// The layer-schedule masks (attentionMask, moeMask): one bit per block.
+// 128 bits wide — nemotron_h_moe's Bolt targets 88 blocks.
+using LayerMask = unsigned __int128;
+
 struct TargetLayout final {
   // The registry discriminator: "qwen3_8", "ornith9", "qwen3_6moe",
   // "minicpm_v47_moe", "dense", "lfm2", "lfm2_moe", "lfm2_moe_24b",
@@ -121,7 +125,7 @@ struct TargetLayout final {
   uint32_t denseLayers = 0;
   // The LFM2 families' explicit full-attention layer set; 0 selects the
   // period and global-schedule rules isFullAttentionLayer applies.
-  uint64_t attentionMask = 0;
+  LayerMask attentionMask = 0;
   uint32_t maximumContextTokens = kv::kMaximumLogicalTokens;
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
@@ -295,7 +299,12 @@ struct TargetLayout final {
   // packedGdnWidth storage rows (gate | conv | dt | pad — the 10304
   // logical rows pad to a tile), of which mambaTimeStepRank are the dt
   // rows. mambaCore binds the compiled kernel set (ops/Mamba2.hpp).
-  uint64_t moeMask = 0;
+  LayerMask moeMask = 0;
+  // LatentMoE (Bolt): the routed experts read and write a latent of this
+  // width — ffn_latent_down projects the block input into it before the
+  // router-expert pass and ffn_latent_up projects the expert output back —
+  // while the router and the shared expert keep the full hidden width.
+  uint32_t moeLatentSize = 0;
   uint32_t mambaHeads = 0;
   uint32_t mambaHeadDimension = 0;
   uint32_t mambaGroups = 0;
@@ -313,7 +322,7 @@ struct TargetLayout final {
   // else every layer (the dense and Granite targets).
   [[nodiscard]] constexpr bool
   isFullAttentionLayer(uint32_t layer) const noexcept {
-    if (attentionMask) return layer < 64 && (attentionMask >> layer) & 1;
+    if (attentionMask) return (attentionMask >> layer) & 1;
     if (fullAttentionPeriod > 1)
       return (layer + 1) % fullAttentionPeriod == 0;
     if (globalLayerPeriod) return isGlobalAttentionLayer(layer);
@@ -322,7 +331,7 @@ struct TargetLayout final {
   [[nodiscard]] constexpr uint32_t attentionLayerCount() const noexcept {
     if (attentionMask) {
       uint32_t count = 0;
-      for (uint32_t layer = 0; layer < 64; ++layer)
+      for (uint32_t layer = 0; layer < 128; ++layer)
         count += (attentionMask >> layer) & 1;
       return count;
     }
@@ -429,7 +438,7 @@ struct TargetLayout final {
   // recurrent state, which the state-layer count excludes.
   [[nodiscard]] constexpr uint32_t moeLayerCount() const noexcept {
     uint32_t count = 0;
-    for (uint32_t layer = 0; layer < 64; ++layer)
+    for (uint32_t layer = 0; layer < 128; ++layer)
       count += (moeMask >> layer) & 1;
     return count;
   }
@@ -515,7 +524,7 @@ struct TargetLayout final {
   // The MoE sub-layers: nemotron's moeMask bits where set, else the
   // dense-FFN layers come first and every later layer's FFN is the MoE.
   [[nodiscard]] constexpr bool isMoeLayer(uint32_t layer) const noexcept {
-    if (moeMask) return layer < 64 && (moeMask >> layer) & 1;
+    if (moeMask) return (moeMask >> layer) & 1;
     return layer >= denseLayers;
   }
 

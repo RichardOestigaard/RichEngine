@@ -72,6 +72,10 @@ public:
   // transforms of image bytes a restore overwrites (the wbf16 repack, which
   // narrows float-segment planes in place).
   void setPostRestore(std::function<void()> hook) { postRestore_ = std::move(hook); }
+  // Admits each image's re-allocation through the engine's budget and host
+  // margins (MemoryGovernor::PreserveHostReserve); unset, restore allocates
+  // directly as before.
+  void setRestoreAdmission(metal::AllocationAdmission admission) { restoreAdmission_ = std::move(admission); }
 
   struct Contents final {
     std::string_view component;
@@ -92,6 +96,7 @@ private:
     ImageWriter write;
   };
   std::function<void()> postRestore_;
+  metal::AllocationAdmission restoreAdmission_;
   metal::MetalBackend *backend_;
   std::string contentIdentity_;
   std::vector<Image> images_;

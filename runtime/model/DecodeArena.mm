@@ -210,6 +210,16 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       geometry.target.gemmaMoe
           ? bytesFor<uint16_t>(r * geometry.target.hiddenSize)
           : 0);
+  // Bolt's latent rows. The shared expert's 5376-wide intermediate reuses
+  // GdnHidden (rows x mambaInnerSize 8192), which a MoE-only layer never
+  // touches, so it needs no allocation here.
+  const uint64_t latentBytes =
+      geometry.target.moeLatentSize
+          ? bytesFor<uint16_t>(r * geometry.target.moeLatentSize)
+          : 0;
+  put(DecodeTensor::MoeLatentRows, latentBytes);
+  put(DecodeTensor::MoeLatentOutput, latentBytes);
+  put(DecodeTensor::MoeZeroLatent, latentBytes);
   put(DecodeTensor::PageTable, bytesFor<RichKvPage>(kMaximumPageTableEntries));
   put(DecodeTensor::IndexTable,
       geometry.target.kvLayout.indexDimension

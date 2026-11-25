@@ -30,11 +30,11 @@ enum Fmt { Q4K = GGUF_FMT_Q4K, IQ4XS = GGUF_FMT_IQ4XS, IQ4NL = GGUF_FMT_IQ4NL, Q
            AF4G128 = GGUF_FMT_AF4G128, AF5G128 = GGUF_FMT_AF5G128, AF6G128 = GGUF_FMT_AF6G128,
            AF8G128 = GGUF_FMT_AF8G128, AF4P = GGUF_FMT_AF4P,
            AF2 = GGUF_FMT_AF2, AF3 = GGUF_FMT_AF3, AF2G128 = GGUF_FMT_AF2G128, AF3G128 = GGUF_FMT_AF3G128,
-           FMT_COUNT = GGUF_FMT_COUNT };
+           NVFP4 = GGUF_FMT_NVFP4, FMT_COUNT = GGUF_FMT_COUNT };
 inline const char *fmtName(uint32_t f) { return kQuantFormats[f].name; }
 // The private AF formats (AF4 and the oQ family): native blocks of an
 // element-order code bitstream then a bf16 scale and bias.
-inline bool afFormat(Fmt f) { return f >= AF4; }
+inline bool afFormat(Fmt f) { return f >= AF4 && f <= AF3G128; }
 // An AF format's code width: (block_bytes - 4 meta) * 8 over block_elements.
 inline uint32_t afBits(Fmt f) { return (kQuantFormats[f].block_bytes - 4) * 8 / kQuantFormats[f].block_elements; }
 // The bf16 a float's high half holds, truncated (fixture scales need no rounding).
@@ -71,8 +71,40 @@ inline float e8m0Half(uint8_t e) {
   float value; memcpy(&value, &bits, 4); return value;
 }
 
-// N native rows of random bytes whose half scales (d, and dmin or m for Q4_K, Q5_K, Q2_K and Q4_1) are scale(), and
-// MXFP4's exponents the power of two at or below it.
+// llama.cpp's ggml_ue4m3_to_fp32: unsigned E4M3, bias 7, then halved (the
+// FP4 table entries are twice the E2M1 values). Zero and 0x7F decode as zero.
+inline float ue4m3Half(uint8_t x) {
+  if (x == 0 || x == 0x7F) return 0.0f;
+  const uint32_t e = (x >> 3) & 0xF, m = x & 7;
+  const float raw = e ? std::ldexp(1.0f + float(m) * 0.125f, int(e) - 7) : std::ldexp(float(m), -9);
+  return raw * 0.5f;
+}
+
+// llama.cpp's ggml_fp32_to_ue4m3, for fixture scale bytes.
+inline uint8_t fp32ToUe4m3(float x) {
+  if (!(x > 0.0f)) return 0;
+  if (x > 448.0f) x = 448.0f;
+  uint32_t bits; memcpy(&bits, &x, 4);
+  const int fp32Exp = int((bits >> 23) & 0xFF) - 127;
+  const int fp32Man = int((bits >> 20) & 0x7);
+  int ue4m3Exp = fp32Exp + 7;
+  if (ue4m3Exp <= 0) {
+    int man = int(x * 512.0f + 0.5f);
+    if (man > 7) man = 7;
+    if (man < 1) return 0;
+    return uint8_t(man);
+  }
+  if (ue4m3Exp >= 15) return 0x7E;
+  int ue4m3Man = fp32Man + int((bits >> 19) & 1);
+  if (ue4m3Man > 7) {
+    ue4m3Man = 0;
+    if (++ue4m3Exp >= 15) return 0x7E;
+  }
+  return uint8_t((ue4m3Exp << 3) | ue4m3Man);
+}
+
+// N native rows of random bytes whose half scales (d, and dmin or m for Q4_K, Q5_K, Q2_K and Q4_1) are scale(),
+// MXFP4's exponents the power of two at or below it, and NVFP4's sub-scales its UE4M3 rounding.
 template <class Scale>
 std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng, Scale scale) {
   const QuantFormat &fi = kQuantFormats[f];
@@ -82,6 +114,18 @@ std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng
   for (size_t b = 0; b < v.size() / fi.block_bytes; ++b) {
     uint8_t *blk = v.data() + b * fi.block_bytes;
     const uint16_t d = scale();
+    if (f == NVFP4) {
+      // One UE4M3 sub-scale per 16-element sub-block. The first 64 blocks
+      // cover every byte value, including zero, subnormals and 0x7F; the
+      // rest use scales in the format's realistic range.
+      if (b < 64) {
+        for (uint32_t s = 0; s < 4; ++s) blk[s] = uint8_t(4 * b + s);
+      } else {
+        blk[0] = fp32ToUe4m3(2.0f * h2f(d));
+        for (uint32_t s = 1; s < 4; ++s) blk[s] = fp32ToUe4m3(2.0f * h2f(scale()));
+      }
+      continue;
+    }
     if (afFormat(f)) {
       // bf16 scale and bias after the codes; the bias centers the weights.
       const float s = h2f(d);
@@ -106,7 +150,7 @@ std::vector<uint8_t> makeNative(Fmt f, uint32_t N, uint32_t K, std::mt19937 &rng
 // model's have (a few hundredths), so the GEMM checks see realistic sums.
 inline std::uniform_real_distribution<float> scaleRange(Fmt f) {
   switch (f) {
-    case Q4K: case Q5K: case Q3K: case IQ4NL: case Q80: case Q2K: case Q40: case Q41: case MXFP4:
+    case Q4K: case Q5K: case Q3K: case IQ4NL: case Q80: case Q2K: case Q40: case Q41: case MXFP4: case NVFP4:
     case AF4: case AF5: case AF6: case AF8: case AF4G128: case AF5G128: case AF6G128: case AF8G128: case AF4P:
     case AF2: case AF3: case AF2G128: case AF3G128:
       return std::uniform_real_distribution<float>(0.0005f, 0.004f);
@@ -310,6 +354,21 @@ inline void groupPack(Fmt f, const uint8_t *row, uint32_t g, float vals[32], uin
       if (f == MXFP4) packBits(lo, 4, p0); else packPairs(lo, p0);
       return;
     }
+    case NVFP4: {
+      // block_nvfp4 {d[4] ue4m3, qs[32]}: sub-block s covers elements
+      // 16s..16s+15; byte r of its eight qs bytes holds element 16s+r low
+      // and 16s+r+8 high. Group j of the 64-element block reads sub-blocks
+      // 2j (its first 16 elements) and 2j+1 (its second).
+      for (uint32_t k = 0; k < 32; ++k) {
+        const uint32_t sub = 2 * j + k / 16, r = k % 16;
+        const uint8_t q = blk[4 + sub * 8 + r % 8];
+        const uint8_t code = r < 8 ? q & 15 : q >> 4;
+        lo[quant_slot(k)] = code;
+        vals[k] = kFP4Values[code] * ue4m3Half(blk[sub]);
+      }
+      packBits(lo, 4, p0);
+      return;
+    }
     case AF4: case AF4P: {   // 64-block {qs[32], bf16 scale, bf16 bias}: group j's qs[16 j], the shared meta
       uint16_t s16, m16; memcpy(&s16, blk + 32, 2); memcpy(&m16, blk + 34, 2);
       const float s = b2f(s16), m = b2f(m16);
@@ -411,6 +470,14 @@ inline void metaPack(Fmt f, const uint8_t *row, uint32_t unit, uint8_t *dst) {
   const QuantFormat &fi = kQuantFormats[f];
   const uint8_t *blk = row + unit * fi.block_bytes;
   switch (f) {
+    case NVFP4: {
+      // The native block's four UE4M3 scales, then scale 1: the dequant
+      // validation excludes the tensor-global `.scale` companion tensor.
+      memcpy(dst, blk, 4);
+      const float one = 1.0f;
+      memcpy(dst + 4, &one, 4);
+      return;
+    }
     // The block's leading fields.
     case Q4K: case Q5K: case IQ4XS: case IQ4NL: case Q80: case IQ3S: case IQ3XXS: case IQ2XXS: case IQ2XS: case IQ2S:
     case IQ1S: case Q40: case Q41: case MXFP4: case PQ20:
@@ -476,7 +543,7 @@ inline bool ggmlDequantize(void *ggml, Fmt f, const std::vector<uint8_t> &native
     "dequantize_row_af4", "dequantize_row_af5", "dequantize_row_af6", "dequantize_row_af8",
     "dequantize_row_af4g128", "dequantize_row_af5g128", "dequantize_row_af6g128", "dequantize_row_af8g128",
     "dequantize_row_af4p", "dequantize_row_af2", "dequantize_row_af3", "dequantize_row_af2g128",
-    "dequantize_row_af3g128"};
+    "dequantize_row_af3g128", "dequantize_row_nvfp4"};
   static_assert(std::size(symbols) == FMT_COUNT, "a GGML dequantize_row_* symbol per format");
   using Dequantize = void (*)(const void *, float *, int64_t);
   auto decode = reinterpret_cast<Dequantize>(dlsym(ggml, symbols[f]));

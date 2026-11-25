@@ -101,6 +101,7 @@ id<MTLBuffer> MetalBackend::Impl::newBuffer(uint64_t bytes, BufferStorage storag
                             NSString *label) {
         MTLResourceOptions options = storage == BufferStorage::Shared
             ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate;
+        if (bufferAdmission) bufferAdmission(bytes);
         id<MTLBuffer> buffer = [device newBufferWithLength:bytes
                                                    options:options];
         if (!buffer)
@@ -120,6 +121,12 @@ id<MTLBuffer> MetalBackend::Impl::newBufferPlaced(
         if (placement && heapArenaEnabled() &&
             bytes >= heapArenaMinBytes() &&
             (!maxBytes || bytes <= maxBytes)) {
+            // A heap placement admits the arena's whole extent on creation,
+            // not this buffer's bytes — the callback contract would bypass
+            // or double-count it, so admission builds refuse heaps.
+            if (bufferAdmission)
+                throw MetalAllocationError(
+                    "placement heaps are unsupported with buffer admission");
             if (std::shared_ptr<HeapArena> arena =
                     heapArenaFor(storage, bytes)) {
                 HeapArena::Placement placed = arena->allocate(bytes);
@@ -222,6 +229,7 @@ MetalBuffer MetalBackend::wrapSharedMemory(void *address, uint64_t bytes,
     allocation->residency = impl_->residency;
     // Metal may keep the buffer past our last view, so its deallocator holds
     // the owner too.
+    if (impl_->bufferAdmission) impl_->bufferAdmission(bytes);
     id<MTLBuffer> buffer = [impl_->device
         newBufferWithBytesNoCopy:address
                           length:bytes
@@ -278,12 +286,20 @@ MetalBuffer MetalBackend::view(const MetalBuffer &base,
     if (base.impl_->allocation->accounting.get() != impl_->accounting.get()) {
         throw MetalBackendError("Metal buffer belongs to another backend");
     }
-    if (!lengthBytes || offsetBytes > base.impl_->lengthBytes ||
-        lengthBytes > base.impl_->lengthBytes - offsetBytes) {
+    return base.subview(offsetBytes, lengthBytes);
+}
+
+MetalBuffer MetalBuffer::subview(uint64_t offsetBytes,
+                                 uint64_t lengthBytes) const {
+    if (!impl_) {
+        throw MetalBackendError("cannot view an empty Metal buffer");
+    }
+    if (!lengthBytes || offsetBytes > impl_->lengthBytes ||
+        lengthBytes > impl_->lengthBytes - offsetBytes) {
         std::ostringstream message;
         message << "Metal buffer view is out of range: offset=" << offsetBytes
                 << " length=" << lengthBytes
-                << " base_length=" << base.impl_->lengthBytes;
+                << " base_length=" << impl_->lengthBytes;
         void *frames[32];
         const int count = backtrace(frames, 32);
         char **symbols = backtrace_symbols(frames, count);
@@ -295,8 +311,8 @@ MetalBuffer MetalBackend::view(const MetalBuffer &base,
         throw MetalBackendError(message.str());
     }
     auto result = std::make_shared<MetalBuffer::Impl>();
-    result->allocation = base.impl_->allocation;
-    result->offsetBytes = base.impl_->offsetBytes + offsetBytes;
+    result->allocation = impl_->allocation;
+    result->offsetBytes = impl_->offsetBytes + offsetBytes;
     result->lengthBytes = lengthBytes;
     return MetalBuffer(std::move(result));
 }

@@ -751,6 +751,42 @@ std::vector<uint16_t> runUngated(MetalBackend &backend, const UngatedModel &m, B
   CommandGraph graph;
   MoE::add(graph, b.moe, m.weights, plan);
   static_cast<void>(backend.submitCommand(graph.dispatches()));
+  if (plan.configuration().indirectDispatch &&
+      plan.phase() == richengine::ops::MoePhase::Decode) {
+    // RICHENGINE_MOE_INDIRECT_DISPATCH: the routed up/down passes launch on
+    // the grouping's written grids while the dense shared passes stay
+    // direct. Replay the same dispatches on their recorded bounds and
+    // require the output to match bit for bit.
+    std::vector<uint16_t> indirectOutput(uint64_t{rows} * kUngatedHidden);
+    std::memcpy(indirectOutput.data(), b.moe.output.contents(),
+                indirectOutput.size() * sizeof(uint16_t));
+    std::vector<richengine::metal::ComputeDispatch> direct(graph.dispatches().begin(),
+                                                           graph.dispatches().end());
+    size_t routedPasses = 0, sharedPasses = 0;
+    for (auto &d : direct) {
+      if (d.pipelineName.starts_with("moe_shared_gguf_")) {
+        require(!d.indirectGrid, label + ": shared expert must stay direct");
+        ++sharedPasses;
+      }
+      if (d.indirectGrid) {
+        require(d.pipelineName.starts_with("moe_expert_gguf_"),
+                label + ": only a routed expert can launch indirectly");
+        ++routedPasses;
+        d.indirectGrid = {};
+      }
+    }
+    require(routedPasses == 2 && sharedPasses == 2,
+            label + ": expected two indirect routed and two direct shared passes");
+    std::memset(b.moe.output.contents(), 0x3C, b.moe.output.sizeBytes());
+    std::memset(b.moe.scratch.expertIntermediate.contents(), 0x3C,
+                b.moe.scratch.expertIntermediate.sizeBytes());
+    std::memset(b.moe.scratch.expertOutput.contents(), 0x3C,
+                b.moe.scratch.expertOutput.sizeBytes());
+    static_cast<void>(backend.submitCommand(direct));
+    require(!std::memcmp(indirectOutput.data(), b.moe.output.contents(),
+                         indirectOutput.size() * sizeof(uint16_t)),
+            label + ": direct replay of the indirect dispatches differs");
+  }
   const auto *selected = static_cast<const uint32_t *>(b.moe.scratch.selectedExperts.contents());
   const auto *routing = static_cast<const float *>(b.moe.scratch.routingWeights.contents());
   const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
@@ -927,12 +963,148 @@ int moeUngated(MetalBackend &backend) {
   return failures;
 }
 
+// ------------------------------------------------------- indirect dispatch
+// RICHENGINE_MOE_INDIRECT_DISPATCH: the staged gated decode's grouping writes
+// the expert passes' launch grids after the live tile count, and each pass
+// launches indirectly on them. Runs a gated fixture (Q4_K/Q5_K routed
+// segments, staged M8, native MXFP4 off) and checks the recorded grids, the
+// GPU-written grids after submit, and a bitwise-equal output replayed through
+// the same dispatches with their indirect grids stripped — the recorded
+// threadgroup bound launches the direct form. The grouping launches the live
+// tiles only, so the live count must sit under the bound; B2's verify rows
+// ({1, 2} per lane) also cover the verified grouping and its dead rows.
+int moeIndirect(MetalBackend &backend) {
+  int failures = 0;
+  Model m;
+  m.router = floating(backend, kExperts, kHidden, 0.05f);
+  m.sharedGate = floating(backend, 1, kHidden, 0.05f);
+  const uint32_t n[3] = {kIntermediate, kIntermediate, kHidden},
+                 k[3] = {kHidden, kHidden, kIntermediate};
+  const Fmt routed[3] = {Q4K, Q5K, Q4K}, shared[3] = {Q80, Q40, Q80};
+  for (int p = 0; p < 3; ++p) {
+    m.routed[p] = quantized(backend, routed[p], kExperts * n[p], k[p]);
+    m.shared[p] = quantized(backend, shared[p], n[p], k[p]);
+    m.formats[p] = routed[p];
+    m.formats[3 + p] = shared[p];
+  }
+  BlockMoeWeights gguf;
+  gguf.router = m.router.segment;
+  gguf.sharedScalarGate = m.sharedGate.segment;
+  gguf.gate = {m.routed[0].segment, m.shared[0].segment};
+  gguf.up = {m.routed[1].segment, m.shared[1].segment};
+  gguf.down = {m.routed[2].segment, m.shared[2].segment};
+  m.weights = gguf;
+  const MoeShape shape{kHidden, kExperts, kTopK, kIntermediate, WeightLayout::Block32};
+  const bool tileMajor = std::getenv("RICHENGINE_MOE_TILE_MAJOR") != nullptr;
+  // The fused `_gu` tile covers gate and up in one pass: two indirect expert
+  // dispatches; RICHENGINE_MOE_GGUF_FUSED_OFF splits it into three.
+  const size_t wantIndirect = std::getenv("RICHENGINE_MOE_GGUF_FUSED_OFF") ? 3 : 2;
+  for (const uint32_t lanes : {1u, 2u}) {
+    // B1 plans a single-token step (no verify padding: every row routes);
+    // B2 the draft's verify stride with {1, 2} live rows per lane.
+    const uint32_t stride = lanes == 1 ? 1u : RICHENGINE_TARGET_VERIFY_ROWS;
+    const uint32_t rows = lanes * stride;
+    Buffers b;
+    b.input = activations(uint64_t{rows} * kHidden);
+    b.residual = activations(uint64_t{rows} * kHidden);
+    for (float &v : b.residual) v = bf16(0.1f * v);
+    b.moe.input = bfloatBuffer(backend, b.input, "indirect-input");
+    b.moe.residual = bfloatBuffer(backend, b.residual, "indirect-residual");
+    b.moe.output = zeros(backend, uint64_t{rows} * kHidden * 2, "indirect-output");
+    if (lanes == 2) {
+      const std::array<uint32_t, 2> verify{1u, 2u};
+      b.moe.verifyRows =
+          upload(backend, verify.data(), verify.size() * sizeof(uint32_t), "indirect-verify-rows");
+    }
+    MoeConfig config{MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores),
+                     MoeExpertSimdgroups::Eight, MoeGgufTile::Staged};
+    config.mxfp4Native = false;
+    const MoePlan plan = MoE::decodePlan(shape, lanes, stride, config);
+    const std::string label = "indirect dispatch decode B" + std::to_string(lanes);
+    allocate(backend, b, plan);
+    CommandGraph graph;
+    MoE::add(graph, b.moe, m.weights, plan);
+    size_t indirect = 0;
+    for (const auto &d : graph.dispatches()) {
+      if (!d.indirectGrid) continue;
+      ++indirect;
+      const uint64_t at = d.indirectGrid.offsetBytes();
+      require(d.indirectGrid.sizeBytes() == kMoeDispatchGridBytes &&
+                  (at == kMoeGateUpGridOffset || at == kMoeDownGridOffset),
+              label + ": an indirect grid view is not a pass's three words");
+    }
+    require(indirect == wantIndirect,
+            label + ": " + std::to_string(indirect) + " indirect dispatches, want " +
+                std::to_string(wantIndirect));
+    std::vector<richengine::metal::ComputeDispatch> direct(graph.dispatches().begin(),
+                                                           graph.dispatches().end());
+    std::memset(b.moe.output.contents(), 0xA5, b.moe.output.sizeBytes());
+    std::memset(b.moe.scratch.expertIntermediate.contents(), 0xA5,
+                b.moe.scratch.expertIntermediate.sizeBytes());
+    std::memset(b.moe.scratch.expertOutput.contents(), 0xA5,
+                b.moe.scratch.expertOutput.sizeBytes());
+    static_cast<void>(backend.submitCommand(graph.dispatches()));
+    const auto *grid = static_cast<const uint32_t *>(b.moe.scratch.tileCount.contents());
+    const uint32_t live = grid[0];
+    // One true row can leave every bound tile live; only the padded verify
+    // dispatch must sit strictly below it.
+    require(live > 0 && live <= plan.maximumTiles() &&
+                (lanes == 1 || live < plan.maximumTiles()),
+            label + ": live tile count " + std::to_string(live) +
+                " outside expected bounds " + std::to_string(plan.maximumTiles()));
+    const auto checkGrid = [&](const uint32_t *g, uint32_t columns, const char *passName) {
+      const uint32_t first = tileMajor ? live : columns,
+                   second = tileMajor ? columns : live;
+      require(g[0] == first && g[1] == second && g[2] == 1,
+              label + ": " + passName + " grid {" + std::to_string(g[0]) + ", " +
+                  std::to_string(g[1]) + ", " + std::to_string(g[2]) + "}, want {" +
+                  std::to_string(first) + ", " + std::to_string(second) + ", 1}");
+    };
+    checkGrid(grid + kMoeGateUpGridOffset / sizeof(uint32_t), kIntermediate / GGUF_TILE_COLUMNS,
+              "gate/up");
+    checkGrid(grid + kMoeDownGridOffset / sizeof(uint32_t), kHidden / GGUF_TILE_COLUMNS, "down");
+    if (lanes == 2) {
+      // The verified grouping keeps a dead row's routes out of every tile:
+      // its route rows read ~0u, and only the lanes' verify rows routed.
+      const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
+      for (uint32_t r = 0; r < rows; ++r) {
+        const uint32_t lane = r / stride;
+        const bool dead = r % stride >= lane + 1;
+        for (uint32_t s = 0; s < kTopK; ++s)
+          require((routeRows[r * kRoutes + s] == ~0u) == dead,
+                  label + ": route row " + std::to_string(r * kRoutes + s) +
+                      " does not match its verify rows");
+      }
+    }
+    std::vector<uint16_t> want(uint64_t{rows} * kHidden);
+    std::memcpy(want.data(), b.moe.output.contents(), want.size() * 2);
+    // Direct oracle: the same dispatches with the grids stripped launch on
+    // their recorded bounds; the kernels still bound by the live tile count,
+    // so the output must match bit for bit.
+    for (auto &d : direct) d.indirectGrid = {};
+    std::memset(b.moe.output.contents(), 0x3C, b.moe.output.sizeBytes());
+    std::memset(b.moe.scratch.expertIntermediate.contents(), 0x3C,
+                b.moe.scratch.expertIntermediate.sizeBytes());
+    std::memset(b.moe.scratch.expertOutput.contents(), 0x3C,
+                b.moe.scratch.expertOutput.sizeBytes());
+    static_cast<void>(backend.submitCommand(direct));
+    if (std::memcmp(want.data(), b.moe.output.contents(), want.size() * 2)) {
+      printf("  %s: direct replay of the same dispatches differs FAIL\n", label.c_str());
+      ++failures;
+    }
+  }
+  printf("indirect dispatch: staged gated decode B1-2, %zu indirect expert passes, GPU grids and direct "
+         "parity %s\n",
+         wantIndirect, failures ? "FAIL" : "ok");
+  return failures;
+}
+
 } // namespace
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     if (argc < 2 || argc > 3) {
-      std::cerr << "usage: gguf_moe_test <metallib> [all|ungated|gated]\n";
+      std::cerr << "usage: gguf_moe_test <metallib> [all|ungated|gated|indirect]\n";
       return 2;
     }
     try {
@@ -941,6 +1113,7 @@ int main(int argc, const char *argv[]) {
       const int failures =
           (only == "ungated"   ? moeUngated(backend)
            : only == "gated"   ? moe(backend)
+           : only == "indirect" ? moeIndirect(backend)
                               : floatProjection(backend) + floatSegments(backend, 64) +
                                     floatSegments(backend, 96) + floatOnlyChain(backend) + moe(backend) +
                                     moeUngated(backend));

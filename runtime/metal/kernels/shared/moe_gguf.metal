@@ -215,13 +215,14 @@ template [[host_name("moe_expert_gguf_streamed_m32_g")]] kernel MoeExpertGgufStr
 // gate) without the expertOutput round trip or a second dispatch. The
 // threadgroup barrier between the two accumulates keeps a format change's
 // pair-table refill off the other simdgroup's in-flight dequant reads.
-template <ushort Rows>
-inline void moe_gguf_fused_tile(device bfloat *input, device const MoeTileDescriptor *tiles, device const uint *tile_count,
-                                device uchar *gw0, device uchar *gw1, device uchar *gmeta, device uchar *gsw0,
-                                device uchar *gsw1, device uchar *gsmeta, device uchar *uw0, device uchar *uw1,
-                                device uchar *umeta, device uchar *usw0, device uchar *usw1, device uchar *usmeta,
-                                device bfloat *output, constant MoeGgufFusedParams &p, uint2 group, uint simd_lane,
-                                uint simd_group, threadgroup half *stage, threadgroup half2 *tl) {
+template <ushort Rows, bool Indirect>
+inline void moe_gguf_fused_tile_impl(device bfloat *input, device const MoeTileDescriptor *tiles, device const uint *tile_count,
+                                     device uchar *gw0, device uchar *gw1, device uchar *gmeta, device uchar *gsw0,
+                                     device uchar *gsw1, device uchar *gsmeta, device uchar *uw0, device uchar *uw1,
+                                     device uchar *umeta, device uchar *usw0, device uchar *usw1, device uchar *usmeta,
+                                     device bfloat *output, constant MoeGgufFusedParams &p, uint2 group, uint simd_lane,
+                                     uint simd_group, threadgroup half *stage, threadgroup half2 *tl,
+                                     device const bfloat *source, device const uint *grouped_routes) {
   const bool tmaj = p.reserved != 0;
   const uint tile_row = tmaj ? group.x : group.y;
   const uint colb = tmaj ? group.y : group.x;
@@ -239,12 +240,25 @@ inline void moe_gguf_fused_tile(device bfloat *input, device const MoeTileDescri
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
   if (moe_column_tile(tiles, tile_row)) {
     float gs[MOE_GGUF_COLUMN_ROWS], us[MOE_GGUF_COLUMN_ROWS];
-    column_dot_any<MOE_GGUF_COLUMN_ROWS>(gate.format, x, tile.rows, p.input_size, gate.w0, gate.w1, gate.meta,
-                                         gate.row0 + origin + simd_lane, 0, p.input_size / 32, tl,
-                                         simd_group * 32 + simd_lane, GGUF_STAGED_THREADS, gs);
-    column_dot_any<MOE_GGUF_COLUMN_ROWS>(up.format, x, tile.rows, p.input_size, up.w0, up.w1, up.meta,
-                                         up.row0 + origin + simd_lane, 0, p.input_size / 32, tl,
-                                         simd_group * 32 + simd_lane, GGUF_STAGED_THREADS, us);
+    if constexpr (Indirect) {
+      column_dot_any_indirect<MOE_GGUF_COLUMN_ROWS>(gate.format, source, grouped_routes, tile_row * Rows,
+                                                    p.routes_per_row, tile.rows, p.input_size, gate.w0, gate.w1,
+                                                    gate.meta, gate.row0 + origin + simd_lane, 0,
+                                                    p.input_size / 32, tl, simd_group * 32 + simd_lane,
+                                                    GGUF_STAGED_THREADS, gs);
+      column_dot_any_indirect<MOE_GGUF_COLUMN_ROWS>(up.format, source, grouped_routes, tile_row * Rows,
+                                                    p.routes_per_row, tile.rows, p.input_size, up.w0, up.w1,
+                                                    up.meta, up.row0 + origin + simd_lane, 0,
+                                                    p.input_size / 32, tl, simd_group * 32 + simd_lane,
+                                                    GGUF_STAGED_THREADS, us);
+    } else {
+      column_dot_any<MOE_GGUF_COLUMN_ROWS>(gate.format, x, tile.rows, p.input_size, gate.w0, gate.w1, gate.meta,
+                                           gate.row0 + origin + simd_lane, 0, p.input_size / 32, tl,
+                                           simd_group * 32 + simd_lane, GGUF_STAGED_THREADS, gs);
+      column_dot_any<MOE_GGUF_COLUMN_ROWS>(up.format, x, tile.rows, p.input_size, up.w0, up.w1, up.meta,
+                                           up.row0 + origin + simd_lane, 0, p.input_size / 32, tl,
+                                           simd_group * 32 + simd_lane, GGUF_STAGED_THREADS, us);
+    }
     for (uint row = 0; row < tile.rows; ++row) {
       const ulong o = out + ulong(row) * p.output_size + origin + simd_lane;
       output[o] = bfloat(float(bfloat(us[row])) *
@@ -278,6 +292,18 @@ inline void moe_gguf_fused_tile(device bfloat *input, device const MoeTileDescri
 }
 
 template <ushort Rows>
+inline void moe_gguf_fused_tile(device bfloat *input, device const MoeTileDescriptor *tiles, device const uint *tile_count,
+                                device uchar *gw0, device uchar *gw1, device uchar *gmeta, device uchar *gsw0,
+                                device uchar *gsw1, device uchar *gsmeta, device uchar *uw0, device uchar *uw1,
+                                device uchar *umeta, device uchar *usw0, device uchar *usw1, device uchar *usmeta,
+                                device bfloat *output, constant MoeGgufFusedParams &p, uint2 group, uint simd_lane,
+                                uint simd_group, threadgroup half *stage, threadgroup half2 *tl) {
+  moe_gguf_fused_tile_impl<Rows, false>(input, tiles, tile_count, gw0, gw1, gmeta, gsw0, gsw1, gsmeta,
+                                        uw0, uw1, umeta, usw0, usw1, usmeta, output, p, group, simd_lane,
+                                        simd_group, stage, tl, nullptr, nullptr);
+}
+
+template <ushort Rows>
 [[max_total_threads_per_threadgroup(GGUF_STAGED_THREADS)]]
 kernel void moe_expert_gguf_fused(device bfloat *input [[buffer(0)]], device const MoeTileDescriptor *tiles [[buffer(1)]],
                                   device const uint *tile_count [[buffer(2)]], device uchar *gw0 [[buffer(3)]],
@@ -302,6 +328,46 @@ using MoeExpertGgufFusedKernel = void(device bfloat *, device const MoeTileDescr
                                       uint2, uint, uint);
 template [[host_name("moe_expert_gguf_m8_gu")]] kernel MoeExpertGgufFusedKernel moe_expert_gguf_fused<8>;
 template [[host_name("moe_expert_gguf_m32_gu")]] kernel MoeExpertGgufFusedKernel moe_expert_gguf_fused<32>;
+
+// The indirect fused gate/up tile (ops::MoE's sparse GGUF gather): staged
+// tiles still read the gathered dense rows, while column tiles resolve their
+// one or two live rows through grouped_routes and read the step input in
+// place. The column tile's scalar accumulation order is unchanged, so its
+// live-row outputs keep the gathered tile's bits. The extra buffers trail
+// the fused kernel's parameter payload at indices 17 and 18.
+template <ushort Rows>
+[[max_total_threads_per_threadgroup(GGUF_STAGED_THREADS)]]
+kernel void moe_expert_gguf_fused_indirect(device bfloat *input [[buffer(0)]],
+                                           device const MoeTileDescriptor *tiles [[buffer(1)]],
+                                           device const uint *tile_count [[buffer(2)]],
+                                           device uchar *gw0 [[buffer(3)]], device uchar *gw1 [[buffer(4)]],
+                                           device uchar *gmeta [[buffer(5)]], device uchar *gsw0 [[buffer(6)]],
+                                           device uchar *gsw1 [[buffer(7)]], device uchar *gsmeta [[buffer(8)]],
+                                           device uchar *uw0 [[buffer(9)]], device uchar *uw1 [[buffer(10)]],
+                                           device uchar *umeta [[buffer(11)]], device uchar *usw0 [[buffer(12)]],
+                                           device uchar *usw1 [[buffer(13)]], device uchar *usmeta [[buffer(14)]],
+                                           device bfloat *output [[buffer(15)]],
+                                           constant MoeGgufFusedParams &p [[buffer(16)]],
+                                           device const bfloat *source [[buffer(17)]],
+                                           device const uint *grouped_routes [[buffer(18)]],
+                                           uint2 group [[threadgroup_position_in_grid]],
+                                           uint simd_lane [[thread_index_in_simdgroup]],
+                                           uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup half stage[kStagedStages]; threadgroup half2 tl[kQuantPairTableEntries];
+  moe_gguf_fused_tile_impl<Rows, true>(input, tiles, tile_count, gw0, gw1, gmeta, gsw0, gsw1, gsmeta,
+                                       uw0, uw1, umeta, usw0, usw1, usmeta, output, p, group, simd_lane,
+                                       simd_group, stage, tl, source, grouped_routes);
+}
+using MoeExpertGgufFusedIndirectKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *,
+                                              device uchar *, device uchar *, device uchar *, device uchar *,
+                                              device uchar *, device uchar *, device uchar *, device uchar *,
+                                              device uchar *, device uchar *, device uchar *, device uchar *,
+                                              device bfloat *, constant MoeGgufFusedParams &,
+                                              device const bfloat *, device const uint *, uint2, uint, uint);
+template [[host_name("moe_expert_gguf_m8_gu_i")]] kernel MoeExpertGgufFusedIndirectKernel
+    moe_expert_gguf_fused_indirect<8>;
+template [[host_name("moe_expert_gguf_m32_gu_i")]] kernel MoeExpertGgufFusedIndirectKernel
+    moe_expert_gguf_fused_indirect<32>;
 
 // The pre-packed decode variant (ops::MoE's packed decode, Apple GPU family
 // 10): the gather's slot-permuted fp16 plane and per-(row, group) exponent

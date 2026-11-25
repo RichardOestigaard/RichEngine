@@ -722,7 +722,7 @@ private:
     }
     ops::MoE::add(step.graph,
                   {b.normalized, extra.sharedFfn ? h.shared : h.zeros,
-                   h.branch, b.moe, {}, {}},
+                   h.branch, b.moe, {}, {}, {}},
                   moe, *step.moe);
   }
 
@@ -806,7 +806,7 @@ private:
     }
     step.graph.beginBakedSpan();
     ops::MoE::add(step.graph, {b.normalized, residual, h.branch, b.moe,
-                               {}, b.verifyRows},
+                               {}, b.verifyRows, {}},
                   moe, *step.moe);
     step.graph.endBakedSpan();
   }

@@ -169,7 +169,12 @@ public:
   // does. The host refuses under critical pressure and, unless a request in
   // service needs the bytes (setServing), inside the warning margin or while
   // it holds for the recovery margin.
-  [[nodiscard]] metal::AllocationAdmission allocationAdmission() noexcept;
+  enum class AdmissionMode { Default, PreserveHostReserve };
+  // PreserveHostReserve honors the host margins even for work a request in
+  // service needs — restore paths whose retry can wait for headroom, unlike
+  // a stranded serving request.
+  [[nodiscard]] metal::AllocationAdmission
+  allocationAdmission(AdmissionMode mode = AdmissionMode::Default) noexcept;
   // Marks the reservations that follow as memory a request in service needs,
   // until it is cleared. The host's margins do not refuse those: holding
   // them back would strand the request and the memory it already has, while
@@ -210,7 +215,8 @@ private:
   // allocationAdmission's reservation, or nothing with the cause of the
   // refusal in failure.
   [[nodiscard]] std::optional<Reservation>
-  tryReserve(uint64_t bytes, metal::AllocationFailure &failure);
+  tryReserve(uint64_t bytes, metal::AllocationFailure &failure,
+             AdmissionMode mode);
   [[nodiscard]] uint64_t
   chargedBytes(bool refreshDevice = false) const noexcept;
   [[nodiscard]] std::optional<uint64_t> sampleHostAvailable() const noexcept;

@@ -188,6 +188,11 @@ enum class DecodeTensor : uint32_t {
   MtpCtxEmbedNormed,
   MtpCtxKeys,
   MtpCtxValues,
+  // Bolt's LatentMoE rows: the latent-down rows, the experts' latent
+  // combine and the immutable zero residual it reads. Zero-sized elsewhere.
+  MoeLatentRows,
+  MoeLatentOutput,
+  MoeZeroLatent,
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
   MoeScratch,
   MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,
@@ -263,6 +268,11 @@ public:
     // Gemma's MoE combine residual: zeroed once at arena creation.
     if (const metal::MetalBuffer zero =
             packed(DecodeTensor::ZeroResidual, kLaneCount))
+      std::memset(zero.contents(), 0, zero.sizeBytes());
+    // Bolt's latent combine residual: zeroed once here and never mutated
+    // (moe_combine reads residual only).
+    if (const metal::MetalBuffer zero =
+            packed(DecodeTensor::MoeZeroLatent, kLaneCount))
       std::memset(zero.contents(), 0, zero.sizeBytes());
 
     const uint64_t denseScratchBytes = gateScratchBytes(geometry_, operators);

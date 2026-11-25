@@ -72,6 +72,22 @@ public:
       throw GgufError("unexpected shape for " + name);
     const uint32_t format = gguf_format_of(tensor->type);
     Repack repack = planes(format, rows, columns, name);
+    if (format == GGUF_FMT_NVFP4) {
+      // llama.cpp keeps NVFP4's tensor-global scale in a sibling F32 tensor
+      // (`ssm_in.weight`'s `ssm_in.scale`) and multiplies the matmul's output
+      // by it; the repack folds it into every meta unit instead. An absent
+      // scale is 1, as llama.cpp's TENSOR_NOT_REQUIRED reads it.
+      std::string scaleName(name);
+      if (scaleName.size() > 7 && scaleName.compare(scaleName.size() - 7, 7, ".weight") == 0)
+        scaleName.replace(scaleName.size() - 7, 7, ".scale");
+      if (const GgufTensor *scaleTensor = file_.find(scaleName)) {
+        if (scaleTensor->type != ggml::kF32 || scaleTensor->elements() != 1)
+          throw GgufError("unexpected shape for " + scaleName);
+        float scale = 1.0f;
+        file_.source().readData(scaleTensor->offset, {reinterpret_cast<uint8_t *>(&scale), 4});
+        repack.scale = scale;
+      }
+    }
     repack.sources.push_back(
         tensorRows(*tensor, tensor->rows(), ggufRowBytes(kQuantFormats[format], columns), order));
     image_.repacks.push_back(std::move(repack));
@@ -600,12 +616,61 @@ void requireNemotronMetadata(const GgufFile &file,
   expect("ssm.inner_size", geometry.mambaInnerSize);
   expect("ssm.time_step_rank", geometry.mambaTimeStepRank);
   expect("expert_count", geometry.experts);
-  expect("expert_used_count", geometry.expertsPerToken);
-  expect("expert_feed_forward_length", geometry.expertIntermediateSize);
+  // Bolt states expert_used_count and expert_feed_forward_length as
+  // per-layer arrays (its expert widths vary block to block); Lightning
+  // states both flat. Either way the values they pin are the same: the
+  // used count on every MoE block, and the expert width — Lightning's one
+  // width exactly, Bolt's varying widths bounded by their maximum.
+  if (file.unsignedValue(arch + ".expert_used_count")) {
+    expect("expert_used_count", geometry.expertsPerToken);
+  } else if (const std::optional<std::span<const double>> used =
+                 file.numericArray(arch + ".expert_used_count")) {
+    for (uint32_t layer = 0; layer < geometry.layers; ++layer) {
+      if (layer >= used->size()) break;
+      const uint64_t expected =
+          geometry.isMoeLayer(layer) ? geometry.expertsPerToken : 0;
+      if (uint64_t((*used)[layer]) != expected)
+        mismatched += (mismatched.empty() ? "" : ", ") +
+                      std::string("expert_used_count[") + std::to_string(layer) + "]";
+    }
+  } else {
+    mismatched += (mismatched.empty() ? "" : ", ") + std::string("expert_used_count missing");
+  }
+  // A per-layer expert width entries check: exact for Lightning's constant
+  // width, the varying-widths bound for Bolt's LatentMoE.
+  const auto expectWidth = [&](const std::string &key, uint64_t width, uint32_t layer) {
+    const bool moe = geometry.isMoeLayer(layer);
+    const bool wrong = moe ? (geometry.moeLatentSize
+                                  ? !width || width > geometry.expertIntermediateSize
+                                  : width != geometry.expertIntermediateSize)
+                           : width != 0;
+    if (wrong)
+      mismatched += (mismatched.empty() ? "" : ", ") + key + "[" + std::to_string(layer) + "]";
+  };
+  if (file.unsignedValue(arch + ".expert_feed_forward_length")) {
+    expect("expert_feed_forward_length", geometry.expertIntermediateSize);
+  } else if (const std::optional<std::span<const double>> widths =
+                 file.numericArray(arch + ".expert_feed_forward_length")) {
+    for (uint32_t layer = 0; layer < geometry.layers; ++layer) {
+      if (layer >= widths->size()) break;
+      expectWidth("expert_feed_forward_length", uint64_t((*widths)[layer]), layer);
+    }
+  } else {
+    mismatched += (mismatched.empty() ? "" : ", ") + std::string("expert_feed_forward_length missing");
+  }
   expect("expert_shared_feed_forward_length", geometry.sharedIntermediateSize);
   expect("expert_shared_count", 1);
   expect("expert_weights_norm", 1);
-  expectFloat("expert_weights_scale", 2.5);
+  expectFloat("expert_weights_scale", geometry.expertWeightsScale);
+  // Bolt's LatentMoE declares the latent width its routed experts read and
+  // write; Lightning's experts span the hidden size and state nothing.
+  if (geometry.moeLatentSize) {
+    expect("moe_latent_size", geometry.moeLatentSize);
+  } else if (const std::optional<uint64_t> latent = file.unsignedValue(arch + ".moe_latent_size");
+             latent && *latent) {
+    mismatched += (mismatched.empty() ? "" : ", ") + std::string("moe_latent_size ") +
+                  std::to_string(*latent) + " (expected absent)";
+  }
   // The per-layer arrays name the block schedule: head_count_kv 2 on the
   // attention blocks, feed_forward_length the experts' width on the MoE
   // blocks and 0 elsewhere.
@@ -624,11 +689,7 @@ void requireNemotronMetadata(const GgufFile &file,
           file.numericArray(arch + ".feed_forward_length")) {
     for (uint32_t layer = 0; layer < geometry.layers; ++layer) {
       if (layer >= ffl->size()) break;
-      const uint64_t expected =
-          geometry.isMoeLayer(layer) ? geometry.expertIntermediateSize : 0;
-      if (uint64_t((*ffl)[layer]) != expected)
-        mismatched += (mismatched.empty() ? "" : ", ") +
-                      std::string("feed_forward_length[") + std::to_string(layer) + "]";
+      expectWidth("feed_forward_length", uint64_t((*ffl)[layer]), layer);
     }
   }
   if (const auto scaling = file.stringValue(arch + ".rope.scaling.type"); scaling && *scaling != "none")
@@ -658,14 +719,45 @@ Image nemotronLayerImage(const GgufFile &file, const TargetGeometry &g,
     b.quantized(p + "attn_v.weight", kvRows, hidden);
     b.quantized(p + "attn_output.weight", hidden, g.attentionWidth);
   } else if (kind == 2) {
-    const uint64_t routed = g.experts, width = g.expertIntermediateSize;
-    b.floatTensor(p + "ffn_gate_inp.weight", routed, hidden);
-    b.floatTensor(p + "exp_probs_b.bias", 1, routed);
-    b.quantized(p + "ffn_up_exps.weight", routed * width, hidden);
-    b.quantized(p + "ffn_down_exps.weight", routed * hidden, width);
     const uint64_t shared = g.sharedIntermediateSize;
-    b.quantized(p + "ffn_up_shexp.weight", shared, hidden);
-    b.quantized(p + "ffn_down_shexp.weight", hidden, shared);
+    if (!g.moeLatentSize) {
+      const uint64_t routed = g.experts, width = g.expertIntermediateSize;
+      b.floatTensor(p + "ffn_gate_inp.weight", routed, hidden);
+      b.floatTensor(p + "exp_probs_b.bias", 1, routed);
+      b.quantized(p + "ffn_up_exps.weight", routed * width, hidden);
+      b.quantized(p + "ffn_down_exps.weight", routed * hidden, width);
+      b.quantized(p + "ffn_up_shexp.weight", shared, hidden);
+      b.quantized(p + "ffn_down_shexp.weight", hidden, shared);
+    } else {
+      // Bolt's LatentMoE: the experts read and write the latent width, and
+      // the block's expert count and width live in the tensor shapes alone
+      // — the GGUF's metadata states only their maximums. The shapes must
+      // agree: up [E * width, latent], down [E * latent, width] and the
+      // router [E, hidden].
+      const uint64_t latent = g.moeLatentSize;
+      const GgufTensor *router = file.find(p + "ffn_gate_inp.weight");
+      const GgufTensor *up = file.find(p + "ffn_up_exps.weight");
+      const GgufTensor *down = file.find(p + "ffn_down_exps.weight");
+      uint64_t experts = g.experts, width = g.expertIntermediateSize;
+      if (router && up && down) {
+        experts = router->rows();
+        if (!experts || up->columns() != latent || down->rows() % latent ||
+            down->rows() / latent != experts || up->rows() % experts ||
+            up->rows() / experts != down->columns())
+          throw GgufError("inconsistent LatentMoE expert shapes in " + p);
+        width = down->columns();
+      }
+      b.floatTensor(p + "ffn_gate_inp.weight", experts, hidden);
+      b.floatTensor(p + "exp_probs_b.bias", 1, experts);
+      b.quantized(p + "ffn_up_exps.weight", experts * width, latent);
+      b.quantized(p + "ffn_down_exps.weight", experts * latent, width);
+      b.quantized(p + "ffn_up_shexp.weight", shared, hidden);
+      b.quantized(p + "ffn_down_shexp.weight", hidden, shared);
+      // The latent projections append to the MoE sections: the reader's
+      // positional reads of the sections above are unchanged.
+      b.quantized(p + "ffn_latent_down.weight", latent, hidden);
+      b.quantized(p + "ffn_latent_up.weight", hidden, latent);
+    }
   } else {
     // The Mamba-2 mixer: the in_proj (its stored rows pad to the image's
     // storage tile), the taps-major conv kernel and bias, the raw ssm_a

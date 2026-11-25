@@ -91,18 +91,35 @@ struct MoeGroupParams {
   // [l * lane_rows, (l + 1) * lane_rows). Zero on a non-verify dispatch,
   // which never runs the verified grouping.
   uint32_t lane_rows;
+  // RICHENGINE_MOE_INDIRECT_DISPATCH (ops/MoE.cpp): nonzero gate/up and
+  // down column counts make the grouping kernel also write the expert
+  // passes' indirect dispatch grids after the live tile count — three
+  // words {columns or tiles, tiles or columns, 1} per pass at
+  // kMoeGateUpGridOffset and kMoeDownGridOffset bytes into the tile-count
+  // scratch, the tile-major flag selecting which axis the live count
+  // takes. Zero leaves those words untouched.
+  uint32_t gate_up_columns = 0;
+  uint32_t down_columns = 0;
+  uint32_t tile_major = 0;
 };
 
-static_assert(sizeof(MoeGroupParams) == 28,
-              "MoE grouping parameters are 28 bytes on both sides");
+static_assert(sizeof(MoeGroupParams) == 40,
+              "MoE grouping parameters are 40 bytes on both sides");
 
-// RICHENGINE_MOE_STATS (ops/MoE.cpp): the grouping kernel's per-dispatch
-// record, appended to a ring in the tile-count scratch at
-// kMoeStatsLogOffset. tile_count[1] holds the same dispatch's distinct
-// routed-expert count. The host reads the ring after the command and
-// prints one "moe-stats" line per record.
+// Byte offsets in the tile-count scratch (ops/MoE.cpp): word zero holds
+// the live tile count; the grouping writes the expert passes' indirect
+// dispatch grids (kMoeDispatchGridBytes each) at kMoeGateUpGridOffset and
+// kMoeDownGridOffset. kMoeIndirectTileCountBytes is the scratch size that
+// layout needs. RICHENGINE_MOE_STATS's per-dispatch record ring follows
+// at kMoeStatsLogOffset, slot (stats - 1) % kMoeStatsLogSlots; the host
+// reads the ring after the command and prints one "moe-stats" line per
+// record.
 enum {
-  kMoeStatsLogOffset = 16,
+  kMoeGateUpGridOffset = 4,
+  kMoeDownGridOffset = 16,
+  kMoeDispatchGridBytes = 12,
+  kMoeIndirectTileCountBytes = 28,
+  kMoeStatsLogOffset = 32,
   kMoeStatsLogSlots = 256,
 };
 struct MoeStatsRecord {
@@ -122,8 +139,8 @@ struct MoeRouteGroupParams {
   MoeGroupParams group;
 };
 
-static_assert(sizeof(MoeRouteGroupParams) == 52,
-              "MoE route-group parameters are 52 bytes on both sides");
+static_assert(sizeof(MoeRouteGroupParams) == 64,
+              "MoE route-group parameters are 64 bytes on both sides");
 
 // RICHENGINE_MOE_UNION (ops/MoE.cpp): the decode union cap keeps the
 // `budget` routed experts with the largest summed routing weight across the
@@ -280,10 +297,14 @@ struct MoeGgufFusedParams {
   uint32_t up_routed_format;
   uint32_t up_shared_format;
   uint32_t reserved;
+  // Source row divisor for the indirect column tiles
+  // (moe_expert_gguf_*_gu_i): grouped route values are row * routes_per_row +
+  // slot. Unused by the gathered kernels.
+  uint32_t routes_per_row;
 };
 
-static_assert(sizeof(MoeGgufFusedParams) == 32,
-              "MoE GGUF fused parameters are 32 bytes on both sides");
+static_assert(sizeof(MoeGgufFusedParams) == 36,
+              "MoE GGUF fused parameters are 36 bytes on both sides");
 
 struct MoeCombineParams {
   uint32_t rows;

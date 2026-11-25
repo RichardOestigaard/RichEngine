@@ -82,6 +82,7 @@ TargetModelGeometry commonGeometry(const TargetLayout &layout) {
   result.moeUngatedExperts = layout.moeUngatedExperts;
   result.sharedIntermediateSize = layout.sharedIntermediateSize;
   result.moeRoutedScale = layout.moeRoutedScale ? layout.moeRoutedScale : 1.0F;
+  result.moeLatentSize = layout.moeLatentSize;
   result.gdnCore = layout.gdnCore;
   result.pleNgram = layout.pleNgram;
   result.captureLayerCount = layout.captureLayerCount;
@@ -270,11 +271,24 @@ TargetModel::~TargetModel() = default;
 TargetModel::TargetModel(TargetModel &&other)
     : weights_(other.weights_), weightsBase_(other.weightsBase_),
       geometry_(std::move(other.geometry_)), backend_(other.backend_),
-      operators_(other.operators_), encoderFactory_(other.encoderFactory_) {
+      operators_(other.operators_), encoderFactory_(other.encoderFactory_),
+      layerStatsCapture_(std::move(other.layerStatsCapture_)) {
   // The encoder references the model it was built against — rebuild it for
   // the moved-to object instead of moving the pointer.
   if (encoderFactory_) encoder_ = encoderFactory_(*this);
   if (!encoder_) encoder_ = std::make_unique<StandardLayerEncoder>(*this);
+}
+
+const char *TargetModel::layerKind(uint32_t index) const noexcept {
+  if (index >= weights_->layers.size()) return "invalid";
+  const TargetLayerWeights &layer = weights_->layers[index];
+  if (std::holds_alternative<Mamba2MixerWeights>(layer.mixer)) return "mamba";
+  if (std::holds_alternative<AttentionMixerWeights>(layer.mixer)) return "attention";
+  if (std::holds_alternative<GdnMixerWeights>(layer.mixer)) return "gdn";
+  if (std::holds_alternative<LfmConvWeights>(layer.mixer)) return "conv";
+  if (std::holds_alternative<ops::MoeWeights>(layer.ffn)) return "moe";
+  if (std::holds_alternative<DenseFfnWeights>(layer.ffn)) return "dense";
+  return "other";
 }
 
 namespace {
@@ -295,6 +309,40 @@ void includeDenseFfn(TargetModelGeometry &geometry, const ops::Projection &gate,
   geometry.gateUpProjections.push_back(up.shape());
 }
 
+// A one-segment block projection view of a MoE weight tensor. The segments
+// stay owned by the layer image; the view copies only their buffer handles.
+ops::Projection segmentProjection(const ops::QuantizedSegment &segment) {
+  if (!segment.plane0 || !segment.outputSize || !segment.inputSize)
+    throw WeightStoreError("LatentMoE projection segment is empty");
+  return {segment.outputSize, segment.inputSize,
+          ops::BlockWeights{{segment}}};
+}
+
+// Bolt's encoder-side dense projections: the latent down/up pair and the
+// shared expert, whose segments live inside the MoE block rather than in
+// ordinary projection fields.
+void includeLatentMoeProjections(TargetModelGeometry &geometry,
+                                 const ops::BlockMoeWeights &block) {
+  const uint32_t latent = geometry.moeLatentSize;
+  const uint32_t hidden = geometry.hiddenSize;
+  const uint32_t shared = geometry.sharedIntermediateSize;
+  const bool consistent =
+      block.latentDown.outputSize == latent &&
+      block.latentDown.inputSize == hidden &&
+      block.latentUp.outputSize == hidden &&
+      block.latentUp.inputSize == latent &&
+      block.up.shared.outputSize == shared &&
+      block.up.shared.inputSize == hidden &&
+      block.down.shared.outputSize == hidden &&
+      block.down.shared.inputSize == shared;
+  if (!consistent)
+    throw WeightStoreError("LatentMoE projection shapes do not match the target");
+  includeProjection(geometry, segmentProjection(block.latentDown));
+  includeProjection(geometry, segmentProjection(block.latentUp));
+  includeProjection(geometry, segmentProjection(block.up.shared));
+  includeProjection(geometry, segmentProjection(block.down.shared));
+}
+
 // No source mixes MoE layouts, so one plan runs every block of a step; the
 // first MoE block seen seeds the shared layout (a mixed-FFN target's leading
 // dense layers never reach here).
@@ -305,6 +353,11 @@ void includeMoeFfn(TargetModelGeometry &geometry, const ops::MoeWeights &ffn) {
   }
   if (ffn.layout() != geometry.moeLayout)
     throw WeightStoreError("the MoE blocks of a target must share one weight layout");
+  if (geometry.moeLatentSize) {
+    if (ffn.layout() != ops::WeightLayout::Block32)
+      throw WeightStoreError("LatentMoE requires GGUF block weights");
+    includeLatentMoeProjections(geometry, ffn.blocks());
+  }
 }
 
 // The projections each layer's FFN dispatches. Gemma's block binds the
@@ -546,6 +599,50 @@ std::vector<metal::MetalBuffer> TargetModel::addPrefill(
                                                 chunk.rows);
     step.aneFfn = split;
   }
+  // RICHENGINE_LAYER_STATS=1: copy a trailing row window of every layer's
+  // output into one shared debug buffer. Runtime.mm reads it after the
+  // prefill command retires; the capture is debug-only and never affects
+  // the model's own rows.
+  static const bool layerStatsEnabled = [] {
+    const char *e = std::getenv("RICHENGINE_LAYER_STATS");
+    return e && e[0] == '1';
+  }();
+  layerStatsCapture_.rowsCap = 0;
+  layerStatsCapture_.sequences = 0;
+  layerStatsCapture_.rows.fill(0);
+  uint32_t layerStatsSequences = 0;
+  if (layerStatsEnabled) {
+    for (const PrefillStep &step : steps)
+      layerStatsSequences += step.sequences.size();
+    if (layerStatsSequences > ExecutionLimits::maximumBatchWidth)
+      throw std::invalid_argument("too many prefill sequences for layer stats");
+    constexpr uint32_t rowsCap = 16;
+    const uint64_t bytes = uint64_t{geometry_.layers + 1} *
+                           ExecutionLimits::maximumBatchWidth * rowsCap *
+                           geometry_.hiddenSize * sizeof(uint16_t);
+    if (!layerStatsCapture_.buffer ||
+        layerStatsCapture_.buffer.sizeBytes() < bytes)
+      layerStatsCapture_.buffer = backend_.allocateBuffer(
+          bytes, metal::BufferStorage::Shared, "prefill-layer-stats");
+    layerStatsCapture_.rowsCap = rowsCap;
+    layerStatsCapture_.sequences = layerStatsSequences;
+    uint32_t ordinal = 0;
+    for (const PrefillStep &step : steps)
+      for (const TargetModelPrefillSequence &sequence : step.sequences) {
+        const uint32_t copyRows = std::min(sequence.rows, rowsCap);
+        layerStatsCapture_.rows[ordinal] = copyRows;
+        const uint32_t sourceRow =
+            sequence.rowBegin + sequence.rows - copyRows;
+        const uint32_t destinationRow =
+            ordinal * rowsCap; // slot 0: the embedding input
+        ops::RowCopy::add(
+            graph, step.buffers.hidden[0], {sourceRow, geometry_.hiddenSize, 0},
+            layerStatsCapture_.buffer,
+            {destinationRow, geometry_.hiddenSize, 0}, copyRows,
+            geometry_.hiddenSize);
+        ++ordinal;
+      }
+  }
   // The command's layers over its steps: each step's next layer runs
   // whole — its mixer, which may read the other step's written K/V through
   // the shared page tables, then its FFN, whose split part the other
@@ -568,6 +665,25 @@ std::vector<metal::MetalBuffer> TargetModel::addPrefill(
       const metal::MetalBuffer output = step.buffers.hidden[(index & 1) ^ 1];
       layerOutputs[at] =
           encoder_->addPrefillLayer(step, index, input, output);
+    }
+    if (layerStatsEnabled && layerStatsCapture_.buffer) {
+      const uint32_t rowsCap = layerStatsCapture_.rowsCap;
+      uint32_t ordinal = 0;
+      for (size_t at = 0; at < steps.size(); ++at)
+        for (const TargetModelPrefillSequence &sequence : steps[at].sequences) {
+          const uint32_t copyRows = std::min(sequence.rows, rowsCap);
+          const uint32_t sourceRow =
+              sequence.rowBegin + sequence.rows - copyRows;
+          const uint32_t destinationRow =
+              ((index + 1) * ExecutionLimits::maximumBatchWidth + ordinal) *
+              rowsCap;
+          ops::RowCopy::add(
+              graph, layerOutputs[at], {sourceRow, geometry_.hiddenSize, 0},
+              layerStatsCapture_.buffer,
+              {destinationRow, geometry_.hiddenSize, 0}, copyRows,
+              geometry_.hiddenSize);
+          ++ordinal;
+        }
     }
     if (split &&
         (steps.size() == 1 || index + 1 == geometry_.layers ||
@@ -758,11 +874,11 @@ void TargetModel::addPrefillFfn(PrefillStep &step, uint32_t index, const TargetL
             operators_.moePrefill(geometry_.moeShape(), sequence.rows);
         ops::MoE::add(step.graph,
                       {u16(b.normalized), u16(residual), u16(output), b.moe,
-                       {}, {}},
+                       {}, {}, {}},
                       weights, plan);
       }
     } else {
-      ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}, {}},
+      ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}, {}, {}},
                     weights, *step.moe);
     }
   };
@@ -992,7 +1108,7 @@ void TargetModel::addVerifyFfn(VerifyStep &step, const TargetLayerWeights &layer
     step.graph.beginBakedSpan();
     ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm,
                              b.normalized, geometry_.hiddenSize, step.rows);
-    ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}, b.verifyRows},
+    ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, {}, b.verifyRows, {}},
                   weights, *step.moe);
     step.graph.endBakedSpan();
   };

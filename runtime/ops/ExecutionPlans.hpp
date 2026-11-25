@@ -17,7 +17,8 @@ public:
   // model: the descriptor's family name — model-scoped measured rows apply.
   explicit ExecutionPlans(const DeviceCapabilities &device,
                           uint32_t moeUnionCap = 0,
-                          std::string_view model = {});
+                          std::string_view model = {},
+                          std::string_view checkpoint = {});
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
 
   // committedTokens is the chunk's history before its rows — the q8q
@@ -74,6 +75,9 @@ private:
   uint32_t moeUnionCap_;
   uint32_t moeRouteWideRows_;
   MoeExpertSimdgroups moeDecodeSimdgroups_ = MoeExpertSimdgroups::Eight;
+  // RICHENGINE_MOE_INDIRECT_DISPATCH=auto arms live-tile dispatch only on
+  // this measured device/model/checkpoint combination.
+  bool measuredMoeIndirectDispatch_ = false;
 };
 
 } // namespace richengine::ops

@@ -14,8 +14,12 @@ struct GgufRepackParams {
   uint32_t src_row_bytes; // bytes per staged row
   uint32_t dst_plane1;    // byte offsets in the output buffer
   uint32_t dst_meta;
+  // NVFP4's tensor-global fp32 scale (llama.cpp's separate `.scale` tensor),
+  // folded into every meta unit the kernel writes; 1 for every other format.
+  float scale = 1.0f;
+  uint32_t reserved = 0;
 };
-static_assert(sizeof(GgufRepackParams) == 24, "GGUF repack parameters are 24 bytes on both sides");
+static_assert(sizeof(GgufRepackParams) == 32, "GGUF repack parameters are 32 bytes on both sides");
 
 // The same repack from a safetensors affine tensor's stored planes
 // (gguf_repack_stored, model/AffineToBlock.cpp): the host stages the chunk's

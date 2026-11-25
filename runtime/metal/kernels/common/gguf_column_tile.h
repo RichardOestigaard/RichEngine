@@ -20,17 +20,21 @@ using namespace metal;
 // step rounds once (and as fast as the fma() chain). Each thread loads the next group's payload while the group's FMAs
 // run, and its meta unit when the next group enters a new one, and reads the activations 16 bytes at a time (their
 // rows of K, a multiple of 64, start 16-byte aligned in page-aligned buffers).
-template <class F, ushort Rows>
-inline void column_dot(device const bfloat *x, uint rows, uint input_size, device uchar *w0, device uchar *w1,
-                       device uchar *meta, uint column, uint g_begin, uint g_end, threadgroup half2 *tl,
-                       thread float (&sums)[Rows]) {
+template <class F, ushort Rows, class RowBase>
+inline void column_dot_rows(uint rows, uint input_size, device uchar *w0, device uchar *w1,
+                            device uchar *meta, uint column, uint g_begin, uint g_end, RowBase row_base,
+                            threadgroup half2 *tl, thread float (&sums)[Rows]) {
   const uint groups = input_size / 32, units = groups / F::MetaGroups;
   const uint plane_tile = column / QUANT_TILE_ROWS, plane_row = column % QUANT_TILE_ROWS;
   device uchar *tw0 = w0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P0;
   device uchar *tw1 = w1 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P1;
   device uchar *tmeta = meta + (ulong(plane_tile) * units * QUANT_TILE_ROWS + plane_row) * F::MetaBytes;
+  device const bfloat *row[Rows];
 #pragma unroll
-  for (ushort r = 0; r < Rows; ++r) sums[r] = 0.0f;
+  for (ushort r = 0; r < Rows; ++r) {
+    sums[r] = 0.0f;
+    row[r] = r < rows ? row_base(r) : row_base(0);
+  }
   typename F::Payload w =
       F::load(tw0 + ulong(g_begin) * QUANT_TILE_ROWS * F::P0, tw1 + ulong(g_begin) * QUANT_TILE_ROWS * F::P1);
   typename F::Meta m = F::loadMeta(tmeta + ulong(g_begin / F::MetaGroups) * QUANT_TILE_ROWS * F::MetaBytes);
@@ -49,7 +53,7 @@ inline void column_dot(device const bfloat *x, uint rows, uint input_size, devic
 #pragma unroll
     for (ushort r = 0; r < Rows; ++r) {
       if (r >= rows) break;
-      device const uint4 *xr = reinterpret_cast<device const uint4 *>(x + ulong(r) * input_size + g * 32);
+      device const uint4 *xr = reinterpret_cast<device const uint4 *>(row[r] + g * 32);
       float sum = 0.0f;
 #pragma unroll
       for (ushort i = 0; i < 8; ++i) {
@@ -65,6 +69,30 @@ inline void column_dot(device const bfloat *x, uint rows, uint input_size, devic
   }
 }
 
+template <class F, ushort Rows>
+inline void column_dot(device const bfloat *x, uint rows, uint input_size, device uchar *w0, device uchar *w1,
+                       device uchar *meta, uint column, uint g_begin, uint g_end, threadgroup half2 *tl,
+                       thread float (&sums)[Rows]) {
+  column_dot_rows<F, Rows>(rows, input_size, w0, w1, meta, column, g_begin, g_end,
+                           [&](uint r) { return x + ulong(r) * input_size; }, tl, sums);
+}
+
+// column_dot over rows resolved through grouped_routes: route values are the
+// source row times routes_per_row plus the route slot, exactly as the gather
+// resolves them. Only live rows are resolved, so padding's ~0u is never read.
+template <class F, ushort Rows>
+inline void column_dot_indirect(device const bfloat *x, device const uint *routes, uint route_base,
+                                uint routes_per_row, uint rows, uint input_size, device uchar *w0,
+                                device uchar *w1, device uchar *meta, uint column, uint g_begin,
+                                uint g_end, threadgroup half2 *tl, thread float (&sums)[Rows]) {
+  column_dot_rows<F, Rows>(rows, input_size, w0, w1, meta, column, g_begin, g_end,
+                           [&](uint r) {
+                             const uint route = routes[route_base + r];
+                             return x + ulong(route / routes_per_row) * input_size;
+                           },
+                           tl, sums);
+}
+
 // column_dot in the run-time format `format` (uniform per threadgroup), after its pair table, which every thread of
 // the threadgroup fills.
 template <ushort Rows>
@@ -75,5 +103,21 @@ inline void column_dot_any(uint format, device const bfloat *x, uint rows, uint 
     typedef decltype(f) F;
     quant_pair_table<F>(tl, thread_index, threads);
     column_dot<F, Rows>(x, rows, input_size, w0, w1, meta, column, g_begin, g_end, tl, sums);
+  });
+}
+
+// column_dot_indirect in the run-time format `format` (uniform per
+// threadgroup), after its pair table as column_dot_any fills it.
+template <ushort Rows>
+inline void column_dot_any_indirect(uint format, device const bfloat *x, device const uint *routes,
+                                    uint route_base, uint routes_per_row, uint rows, uint input_size,
+                                    device uchar *w0, device uchar *w1, device uchar *meta, uint column,
+                                    uint g_begin, uint g_end, threadgroup half2 *tl, uint thread_index,
+                                    uint threads, thread float (&sums)[Rows]) {
+  quant_format_switch(format, [&](auto f) {
+    typedef decltype(f) F;
+    quant_pair_table<F>(tl, thread_index, threads);
+    column_dot_indirect<F, Rows>(x, routes, route_base, routes_per_row, rows, input_size, w0, w1, meta,
+                                 column, g_begin, g_end, tl, sums);
   });
 }

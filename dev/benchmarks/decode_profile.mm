@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -234,10 +235,12 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
 } // namespace
 
 int main(int argc, char **argv) {
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
   @autoreleasepool {
     try {
       if (argc < 3) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
+                     "--memory-cap-mib MIB "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
                      "[--prompt-file PATH] [--dump-tokens PATH] "
                      "[--weight-layout auto|affine|block] "
@@ -247,6 +250,9 @@ int main(int argc, char **argv) {
       }
       uint32_t promptTokens = 512;
       uint32_t cycles = 4;
+      // The guarded launcher's memory ceiling for the backend's buffers, in
+      // MiB; required so every allocation the model makes is admitted.
+      uint32_t memoryCapMiB = 0;
       const char *promptFile = nullptr;
       const char *dumpTokens = nullptr;
       kv::Format format = kv::Format::Int8;
@@ -291,14 +297,56 @@ int main(int argc, char **argv) {
           }
         } else if (option == "--ane-ffn-minimum-rows")
           aneFfnMinimumRows = parseCount(argv[index + 1], "--ane-ffn-minimum-rows");
+        else if (option == "--memory-cap-mib")
+          memoryCapMiB = parseCount(argv[index + 1], "--memory-cap-mib");
         else
           throw std::invalid_argument("unknown option");
       }
+      if (!memoryCapMiB)
+        throw std::invalid_argument(
+            "--memory-cap-mib is required; launch via the guarded recipe "
+            "(make benchmark-decode-profile)");
+      // The Neural Engine split allocates outside the backend's accounting,
+      // so admission could never see it: auto calibration and a nonzero
+      // given share are refused while the cap governs (an explicit 0 is a
+      // no-op and allowed).
+      if (aneFfnCalibrate || (aneFfnShare && *aneFfnShare != 0.0))
+        throw std::invalid_argument(
+            "--ane-ffn-share is unsupported with --memory-cap-mib: the "
+            "Neural Engine allocates outside the backend's memory "
+            "accounting (pass 0 or omit the option)");
 
+      constexpr uint64_t MiB = 1024 * 1024;
+      // Headroom the host keeps for everything but this process.
+      constexpr uint64_t hostReserve = 6 * 1024 * MiB;
       metal::MetalBackend backend(argv[1]);
       const std::filesystem::path root(argv[2]);
+      const uint64_t cap = std::min(
+          uint64_t{memoryCapMiB} * MiB,
+          backend.capabilities().recommendedMaxWorkingSetBytes);
+      // Every buffer the backend allocates is admitted against the cap, the
+      // host reserve and the system memory pressure; a refusal throws out of
+      // the allocation, before Metal commits the memory.
+      const std::function<void(uint64_t)> admission =
+          [&backend, cap](uint64_t pending) {
+        const auto stats = backend.memoryStats();
+        const uint64_t used =
+            std::max(stats.allocatedBytes, stats.deviceCurrentAllocatedBytes);
+        const auto available = queryHostAvailableMemory();
+        if (querySystemMemoryPressure() != MemoryPressure::Normal ||
+            !available || *available < hostReserve ||
+            pending > *available - hostReserve || used > cap ||
+            pending > cap - used) {
+          throw std::runtime_error(
+              "decode-profile memory admission denied "
+              "(cap, host reserve, or pressure)");
+        }
+      };
+      BackendInstrumentation::setBufferAdmission(backend, admission);
+      admission(0);
       model::ModelPackage model =
           model::loadModelPackage(backend, root, model::inspectModelPackage(root), blockWeights);
+      admission(0);
       ops::ExecutionPlans operators(backend.capabilities());
 
       const std::vector<uint32_t> prompt =
@@ -315,9 +363,8 @@ int main(int argc, char **argv) {
       const uint32_t extentPages = kvLayout.maximumExtentPages();
       const uint32_t pageCount =
           (pagesPerLane * 4 + extentPages - 1) / extentPages * extentPages;
-      MemoryGovernor governor(
-          backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
-          queryHostAvailableMemory, 0);
+      MemoryGovernor governor(backend, cap, hostReserve,
+                              queryHostAvailableMemory, 0);
       kv::PageStorage pages(backend, governor.allocationAdmission(), kvLayout,
                             pageCount, extentPages);
       for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent) {
@@ -370,11 +417,13 @@ int main(int argc, char **argv) {
       }
       model::RuntimeContext context{backend, model, pages, states, operators, aneFfn.get()};
       model::Runtime executor(context);
+      admission(0);
       // A split the start left pending is set up once the runtime has
       // prefilled a full chunk on the GPU alone, whose GPU time gives the
       // mixer, on the runtime's own prefill buffers, which then takes it.
       if (started.outcome.kind == engine::AneFfnOutcome::Kind::Pending) {
         const double before = executor.telemetry().totalPrefillGpuSeconds;
+        admission(0);
         static_cast<void>(executor.warmupPrefill(ops::FfnSplit::kMaximumRows));
         const double prefillMilliseconds =
             1000.0 * (executor.telemetry().totalPrefillGpuSeconds - before);
@@ -402,13 +451,16 @@ int main(int argc, char **argv) {
                         pageRange(index * pagesPerLane, pagesPerLane), 1, {}};
       }
       // Warm prefill and B1 decode with real work before measuring.
+      admission(0);
       prefill(executor, lanes[0], prompt);
+      admission(0);
       static_cast<void>(decodeCycle(backend, executor, std::span<Lane>(&lanes[0], 1)));
       executor.end(lanes[0].id);
 
       // Prefill: fused timing first, then the attributed replay. Both cover
       // every chunk of the prompt.
       const double prefillBefore = executor.telemetry().totalPrefillGpuSeconds;
+      admission(0);
       const auto prefillStart = std::chrono::steady_clock::now();
       prefill(executor, lanes[0], prompt);
       const double prefillWall =
@@ -428,9 +480,11 @@ int main(int argc, char **argv) {
         // cycles, as the profiled prefill's would leave it.
         std::printf("prefill %u rows: dispatch profiling skipped (Neural Engine split)\n",
                     promptTokens);
+        admission(0);
         prefill(executor, lanes[0], prompt);
       } else {
         BackendInstrumentation::setDispatchProfiling(backend, true);
+        admission(0);
         prefill(executor, lanes[0], prompt);
         BackendInstrumentation::setDispatchProfiling(backend, false);
         Table prefillTable;
@@ -442,8 +496,10 @@ int main(int argc, char **argv) {
 
       auto profileWidth = [&](const char *title, std::span<Lane> active) {
         std::vector<CycleTiming> fused;
-        for (uint32_t cycle = 0; cycle < cycles; ++cycle)
+        for (uint32_t cycle = 0; cycle < cycles; ++cycle) {
+          admission(0);
           fused.push_back(decodeCycle(backend, executor, active));
+        }
         std::sort(fused.begin(), fused.end(),
                   [](const CycleTiming &left, const CycleTiming &right) {
                     return left.gpuSeconds < right.gpuSeconds;
@@ -462,8 +518,10 @@ int main(int argc, char **argv) {
                     static_cast<unsigned long long>(median.commands),
                     tokens / gpuTotal, tokens / wallTotal);
         BackendInstrumentation::setDispatchProfiling(backend, true);
-        for (uint32_t cycle = 0; cycle < cycles; ++cycle)
+        for (uint32_t cycle = 0; cycle < cycles; ++cycle) {
+          admission(0);
           static_cast<void>(decodeCycle(backend, executor, active));
+        }
         BackendInstrumentation::setDispatchProfiling(backend, false);
         Table table;
         accumulate(table,
@@ -473,11 +531,13 @@ int main(int argc, char **argv) {
       profileWidth("B1 decode cycle", std::span<Lane>(&lanes[0], 1));
       // Add one lane at a time so M16 and M24 paths are measured too.
       for (uint32_t index = 1; index < lanes.size(); ++index) {
+        admission(0);
         prefill(executor, lanes[index], prompt);
         const std::string title = "B" + std::to_string(index + 1) + " decode cycle";
         profileWidth(title.c_str(), std::span<Lane>(lanes.data(), index + 1));
       }
 
+      admission(0);
       for (Lane &lane : lanes)
         executor.end(lane.id);
       if (dumpTokens) {
@@ -488,6 +548,10 @@ int main(int argc, char **argv) {
                                         lane.emitted.size(), file));
         std::fclose(file);
       }
+      const auto finalStats = backend.memoryStats();
+      std::printf("peak memory: %llu accounted bytes, %llu device bytes\n",
+                  static_cast<unsigned long long>(finalStats.peakAllocatedBytes),
+                  static_cast<unsigned long long>(finalStats.devicePeakAllocatedBytes));
       return 0;
     } catch (const std::exception &error) {
       std::cerr << "decode-profile: " << error.what() << '\n';

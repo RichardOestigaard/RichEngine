@@ -403,6 +403,74 @@ Runtime::prefillAsync(const BatchPlan &plan,
       ++impl->counters.aneFfnReruns;
     }
     impl->releasePrefillInputBank(inputBank);
+    // RICHENGINE_LAYER_STATS=1: the per-layer hidden row windows copied
+    // during TargetModel::addPrefill, read after the command's retirement.
+    const auto &layerStats = impl->targetModel.layerStatsCapture();
+    if (layerStats.buffer && layerStats.rowsCap && layerStats.sequences &&
+        layerStats.buffer.contents()) {
+      const uint32_t hidden = impl->geometry.target.hiddenSize;
+      const uint32_t rowsCap = layerStats.rowsCap;
+      const auto *values = static_cast<const uint16_t *>(
+          layerStats.buffer.contents());
+      const auto bf16 = [](uint16_t u) {
+        const uint32_t bits = uint32_t{u} << 16;
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+      };
+      const uint64_t totalRows = uint64_t{impl->geometry.target.layers + 1} *
+                                 ExecutionLimits::maximumBatchWidth * rowsCap;
+      if (layerStats.buffer.sizeBytes() >=
+          totalRows * hidden * sizeof(uint16_t)) {
+        for (uint32_t sequence = 0; sequence < layerStats.sequences;
+             ++sequence) {
+          const uint32_t rows = layerStats.rows[sequence];
+          for (uint32_t slot = 0; slot <= impl->geometry.target.layers;
+               ++slot) {
+            double absoluteSum = 0.0, lastAbsoluteSum = 0.0;
+            float maximum = 0.0f, lastMaximum = 0.0f;
+            uint32_t nans = 0, infinities = 0;
+            const uint64_t baseRow =
+                (uint64_t{slot} * ExecutionLimits::maximumBatchWidth +
+                 sequence) * rowsCap;
+            for (uint32_t row = 0; row < rows; ++row) {
+              const uint16_t *at =
+                  values + (baseRow + row) * hidden;
+              double rowAbsoluteSum = 0.0;
+              float rowMaximum = 0.0f;
+              for (uint32_t column = 0; column < hidden; ++column) {
+                const float value = bf16(at[column]);
+                if (std::isnan(value)) {
+                  ++nans;
+                  continue;
+                }
+                if (std::isinf(value)) {
+                  ++infinities;
+                  continue;
+                }
+                const float absolute = std::fabs(value);
+                absoluteSum += absolute;
+                rowAbsoluteSum += absolute;
+                maximum = std::max(maximum, absolute);
+                rowMaximum = std::max(rowMaximum, absolute);
+              }
+              if (row + 1 == rows) {
+                lastAbsoluteSum = rowAbsoluteSum;
+                lastMaximum = rowMaximum;
+              }
+            }
+            const double elements = double(rows) * hidden;
+            fprintf(stderr,
+                    "lstats seq=%u layer=%d kind=%s rows=%u mean=%.6g "
+                    "max=%.6g nan=%u inf=%u lastmean=%.6g lastmax=%.6g\n",
+                    sequence, int(slot) - 1,
+                    slot ? impl->targetModel.layerKind(slot - 1) : "embedding",
+                    rows, absoluteSum / elements, maximum, nans, infinities,
+                    lastAbsoluteSum / hidden, lastMaximum);
+          }
+        }
+      }
+    }
     // RICHENGINE_PREFILL_DUMP: per-sequence FNVs of the just-written GDN
     // state cells (pre-swap parity) and of the last-encoded layer's arena
     // tensors at each sequence's row slice. Pair with

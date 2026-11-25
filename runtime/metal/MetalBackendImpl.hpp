@@ -1129,6 +1129,7 @@ struct MetalBackend::Impl {
     // its layout.
     bool dispatchProfiling = false;
     std::vector<DispatchTiming> dispatchProfile;
+    std::function<void(uint64_t)> bufferAdmission;
     __strong id<MTLDevice> device = nil;
     __strong id<MTLCommandQueue> queue = nil;
     // Runs the notify() callbacks of the backend's shared events, on a

@@ -31,9 +31,10 @@ namespace {
 // agrees with the packed in_proj and the conv input it splits into.
 void requireNemotronLayout(const TargetLayout &layout) {
   requireTargetLayout(layout, /*affine=*/false);
-  if (layout.mambaHeads != 64 || layout.mambaHeadDimension != 64 ||
-      layout.mambaGroups != 8 || layout.mambaStateSize != 128 ||
-      layout.mambaInnerSize != 4096 || layout.mambaTimeStepRank != 64 ||
+  if (layout.mambaHeadDimension != 64 || layout.mambaGroups != 8 ||
+      layout.mambaStateSize != 128 ||
+      layout.mambaInnerSize != layout.mambaHeads * layout.mambaHeadDimension ||
+      layout.mambaTimeStepRank != layout.mambaHeads ||
       layout.convolutionDimension !=
           layout.mambaInnerSize +
               2 * layout.mambaGroups * layout.mambaStateSize ||
@@ -96,10 +97,21 @@ AttentionMixerWeights readNemotronAttention(
   return attention;
 }
 
+// A one-segment block projection view of an encoder-side MoE tensor (the
+// latent pair, or Bolt's shared expert). The segment handles copy; the layer
+// image remains their owner.
+ops::Projection moeSegmentProjection(const ops::QuantizedSegment &segment) {
+  if (!segment.plane0 || !segment.outputSize || !segment.inputSize)
+    throw WeightStoreError("LatentMoE projection segment is empty");
+  return {segment.outputSize, segment.inputSize,
+          ops::BlockWeights{{segment}}};
+}
+
 // The ungated relu-squared MoE block: the F32 router, the F32 per-expert
 // selection bias, the expert up/down slabs and the ungated shared
-// expert's — the gate slab slots stay empty.
-ops::MoeWeights readNemotronMoe(WeightFile &file) {
+// expert's — the gate slab slots stay empty. Bolt's images then carry the
+// latent down/up projections, which Lightning's do not.
+ops::MoeWeights readNemotronMoe(WeightFile &file, bool latent) {
   ops::BlockMoeWeights block;
   block.router = readQuantizedSegment(file, "router");
   block.expertBias = readQuantizedSegment(file, "expert-bias");
@@ -107,6 +119,10 @@ ops::MoeWeights readNemotronMoe(WeightFile &file) {
   block.down.routed = readQuantizedSegment(file, "experts-down");
   block.up.shared = readQuantizedSegment(file, "shared-expert-up");
   block.down.shared = readQuantizedSegment(file, "shared-expert-down");
+  if (latent) {
+    block.latentDown = readQuantizedSegment(file, "latent-down");
+    block.latentUp = readQuantizedSegment(file, "latent-up");
+  }
   return ops::MoeWeights{std::move(block)};
 }
 
@@ -220,7 +236,10 @@ private:
   }
 
   // The MoE block: its input norm feeds the router and the ungated
-  // experts; the block's output adds to the block input.
+  // experts; the block's output adds to the block input. Bolt's latent
+  // experts keep the router hidden-width, gather the latent-down rows and
+  // combine latent-wide; the latent-up projection, true residual and dense
+  // shared expert then compose outside the MoE op.
   void addPrefillMoe(TargetModel::PrefillStep &step,
                      const TargetLayerWeights &layer,
                      metal::MetalBuffer input,
@@ -230,8 +249,44 @@ private:
     ops::Normalization::addRms(step.graph, input, layer.inputNorm,
                                b.normalized, model_.geometry_.hiddenSize,
                                step.rows);
-    ops::MoE::add(step.graph, {b.normalized, input, output, b.moe, {}, {}},
+    if (!model_.geometry_.moeLatentSize) {
+      ops::MoE::add(step.graph, {b.normalized, input, output, b.moe, {}, {}},
+                    weights, *step.moe);
+      return;
+    }
+
+    const ops::Linear &linear = model_.operators_.linear();
+    const ops::BlockMoeWeights &block = weights.blocks();
+    const ops::Projection latentDown = moeSegmentProjection(block.latentDown);
+    const ops::Projection latentUp = moeSegmentProjection(block.latentUp);
+    const ops::Projection sharedUp = moeSegmentProjection(block.up.shared);
+    const ops::Projection sharedDown = moeSegmentProjection(block.down.shared);
+    const uint32_t sharedWidth = model_.geometry_.sharedIntermediateSize;
+
+    // gdnHidden is rows x mambaInnerSize (8192 on Bolt) scratch of the
+    // Mamba layers. A MoE-only layer never runs a mixer, so it holds the
+    // shared expert's narrower intermediate here.
+    ops::PreparedInput prepared = linear.addPrefill(
+        step.graph, b.normalized, latentDown, b.moeLatentRows,
+        b.projectionSums, step.rows, b.linearScratch);
+    linear.addPrefill(step.graph, b.normalized, sharedUp, b.gdnHidden,
+                      b.projectionSums, step.rows, b.linearScratch, prepared);
+    ops::RowCopy::addReluSquared(step.graph, b.gdnHidden,
+                                 {0, sharedWidth, 0}, b.gdnHidden,
+                                 {0, sharedWidth, 0}, step.rows, sharedWidth);
+    ops::MoE::add(step.graph,
+                  {.input = b.normalized, .residual = b.moeZeroLatent,
+                   .output = b.moeLatentOutput, .scratch = b.moe,
+                   .expertInput = b.moeLatentRows},
                   weights, *step.moe);
+    // Residual reads and writes are elementwise at the same output address
+    // in every linear tile, so the second residual chain may run in place.
+    linear.addPrefillResidual(step.graph, b.moeLatentOutput, latentUp, input,
+                              output, b.projectionSums, step.rows,
+                              b.linearScratch);
+    linear.addPrefillResidual(step.graph, b.gdnHidden, sharedDown, output,
+                              output, b.projectionSums, step.rows,
+                              b.linearScratch);
   }
 
   // A verify step's Mamba-2 block: the norm, in_proj, conv/scan/norm and
@@ -301,13 +356,75 @@ private:
                     metal::MetalBuffer output) const {
     const TargetModelVerifyBuffers &b = step.buffers;
     const ops::MoeWeights &weights = std::get<ops::MoeWeights>(layer.ffn);
+    if (!model_.geometry_.moeLatentSize) {
+      step.graph.beginBakedSpan();
+      ops::Normalization::addRms(step.graph, input, layer.inputNorm,
+                                 b.normalized, model_.geometry_.hiddenSize,
+                                 step.rows);
+      ops::MoE::add(step.graph,
+                    {b.normalized, input, output, b.moe, {}, b.verifyRows},
+                    weights, *step.moe);
+      step.graph.endBakedSpan();
+      return;
+    }
+
+    const ops::Linear &linear = model_.operators_.linear();
+    const ops::BlockMoeWeights &block = weights.blocks();
+    const ops::Projection latentDown = moeSegmentProjection(block.latentDown);
+    const ops::Projection latentUp = moeSegmentProjection(block.latentUp);
+    const ops::Projection sharedUp = moeSegmentProjection(block.up.shared);
+    const ops::Projection sharedDown = moeSegmentProjection(block.down.shared);
+    const ops::LinearPlan latentDownPlan = linear.decodePlan(
+        latentDown, step.planLanes, ops::LinearEpilogue::None, nullptr,
+        step.rowCapacity);
+    const ops::LinearPlan latentUpPlan = linear.decodePlan(
+        latentUp, step.planLanes, ops::LinearEpilogue::Residual, nullptr,
+        step.rowCapacity);
+    const ops::LinearPlan sharedUpPlan = linear.decodePlan(
+        sharedUp, step.planLanes, ops::LinearEpilogue::None, nullptr,
+        step.rowCapacity);
+    const ops::LinearPlan sharedDownPlan = linear.decodePlan(
+        sharedDown, step.planLanes, ops::LinearEpilogue::Residual, nullptr,
+        step.rowCapacity);
+    const uint32_t sharedWidth = model_.geometry_.sharedIntermediateSize;
+
     step.graph.beginBakedSpan();
-    ops::Normalization::addRms(step.graph, input, layer.inputNorm,
-                               b.normalized, model_.geometry_.hiddenSize,
-                               step.rows);
+    // The router reads the bf16 rows as well as the linear consumer's
+    // table, so the row stores must stay on even under RICHENGINE_NORM_NR.
+    const ops::PreparedInput normalized = ops::Normalization::addRms(
+        step.graph, input, layer.inputNorm, b.normalized,
+        model_.geometry_.hiddenSize, step.rows, b.linearScratch,
+        latentDownPlan.input(), true);
+    ops::PreparedInput prepared = linear.add(
+        step.graph,
+        {.input = b.normalized, .output = b.moeLatentRows,
+         .scratch = b.linearScratch, .prepared = normalized},
+        latentDown, latentDownPlan);
+    // gdnHidden is idle on this MoE-only layer and wide enough for the
+    // shared expert's intermediate (8192 >= 5376 on Bolt).
+    linear.add(step.graph,
+               {.input = b.normalized, .output = b.gdnHidden,
+                .scratch = b.linearScratch, .prepared = prepared},
+               sharedUp, sharedUpPlan);
+    ops::RowCopy::addReluSquared(step.graph, b.gdnHidden,
+                                 {0, sharedWidth, 0}, b.gdnHidden,
+                                 {0, sharedWidth, 0}, step.rows, sharedWidth);
     ops::MoE::add(step.graph,
-                  {b.normalized, input, output, b.moe, {}, b.verifyRows},
+                  {.input = b.normalized, .residual = b.moeZeroLatent,
+                   .output = b.moeLatentOutput, .scratch = b.moe,
+                   .verifyRows = b.verifyRows,
+                   .expertInput = b.moeLatentRows},
                   weights, *step.moe);
+    // Residual reads and writes are elementwise at the same output address
+    // in every linear tile, so the second residual chain may run in place.
+    linear.add(step.graph,
+               {.input = b.moeLatentOutput, .output = output,
+                .residual = input, .scratch = b.linearScratch},
+               latentUp, latentUpPlan);
+    linear.add(step.graph,
+               {.input = b.gdnHidden, .output = output, .residual = output,
+                .scratch = b.linearScratch},
+               sharedDown, sharedDownPlan);
     step.graph.endBakedSpan();
   }
 
@@ -340,7 +457,7 @@ TargetModelWeights loadNemotronWeights(metal::MetalBackend &backend,
     // record or zero projections register in the runtime geometry.
     if (layout.isMoeLayer(index)) {
       layer.mixer = EmptyMixerWeights{};
-      layer.ffn = readNemotronMoe(file);
+      layer.ffn = readNemotronMoe(file, layout.moeLatentSize != 0);
     } else {
       layer.ffn = EmptyFfnWeights{};
       if (layout.isFullAttentionLayer(index))

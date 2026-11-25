@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "model/GgufFile.hpp"
+#include "model/TargetLayout.hpp"
 
 namespace richengine::model::gguf {
 
@@ -46,7 +47,7 @@ struct TargetGeometry {
   bool sharedExpert = true;
   // A mask-typed attention schedule (LFM2, LFM3) when set: bit `layer` is a
   // full-attention layer. Zero keeps the fullAttentionPeriod schedule.
-  uint64_t attentionMask = 0;
+  LayerMask attentionMask = 0;
   // LFM3's global layers within the attention mask: bit `layer` is a
   // global (theta-1e6 partial rotary) attention layer; the remaining
   // attention layers are sliding-window local ones.
@@ -116,7 +117,7 @@ struct TargetGeometry {
   // mambaHeadDimension values over an mambaStateSize state, mambaGroups
   // shared B/C groups, a mambaInnerSize gate, mambaTimeStepRank dt rows
   // and the ssm_in projection's padded storage rows.
-  uint64_t moeMask = 0;
+  LayerMask moeMask = 0;
   uint32_t mambaHeads = 0;
   uint32_t mambaHeadDimension = 0;
   uint32_t mambaGroups = 0;
@@ -124,16 +125,24 @@ struct TargetGeometry {
   uint32_t mambaInnerSize = 0;
   uint32_t mambaTimeStepRank = 0;
   uint32_t mambaInputRows = 0;
+  // nemotron_h_moe's routed-expert scaling factor (expert_weights_scale)
+  // and, Bolt's LatentMoE only, the latent width its routed experts read
+  // and write (moe_latent_size) — zero where the experts span the full
+  // hidden size. Bolt's per-layer expert counts and widths live in the
+  // tensor shapes alone; experts and expertIntermediateSize stay the
+  // maximums.
+  float expertWeightsScale = 0.0F;
+  uint32_t moeLatentSize = 0;
   // The general.architecture a GGUF of this target declares; empty keeps
   // the Qwen families' names.
   std::string arch;
   [[nodiscard]] bool isFullAttentionLayer(uint32_t layer) const noexcept {
-    if (attentionMask) return layer < 64 && (attentionMask >> layer) & 1;
+    if (attentionMask) return (attentionMask >> layer) & 1;
     return (layer + 1) % fullAttentionPeriod == 0;
   }
   // nemotron_h_moe's MoE sub-layers (zero moeMask elsewhere).
   [[nodiscard]] bool isMoeLayer(uint32_t layer) const noexcept {
-    return layer < 64 && (moeMask >> layer) & 1;
+    return (moeMask >> layer) & 1;
   }
   // LFM3's global layers inside its attention mask (zero elsewhere).
   [[nodiscard]] bool isGlobalAttentionLayer(uint32_t layer) const noexcept {
@@ -202,6 +211,9 @@ struct Repack {
   uint64_t rows = 0;
   uint64_t columns = 0;
   uint64_t plane0 = 0, plane1 = 0, meta = 0; // image offsets; plane1 when the format has one
+  // NVFP4's tensor-global fp32 scale (the sibling `.scale` tensor llama.cpp
+  // multiplies the matmul's output by), folded into every meta unit.
+  float scale = 1.0f;
   std::vector<TensorRows> sources;
 };
 struct Image {

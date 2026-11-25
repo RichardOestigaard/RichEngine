@@ -83,7 +83,11 @@
 #define GGUF_FMT_AF3 29u
 #define GGUF_FMT_AF2G128 30u
 #define GGUF_FMT_AF3G128 31u
-#define GGUF_FMT_COUNT 32u
+// NVFP4: llama.cpp's block_nvfp4 (ggml type 40), 64 elements — 4 UE4M3
+// scales, one per 16-element sub-block, and 32 packed E2M1 bytes — with the
+// tensor's fp32 global scale folded into the meta unit at repack.
+#define GGUF_FMT_NVFP4 32u
+#define GGUF_FMT_COUNT 33u
 
 // The tensor type AF4 sections carry in a GgufTensorDescriptor (and
 // kQuantFormats' ggml_type column): a private id no GGUF file may use, not
@@ -164,6 +168,11 @@ QUANT_CONSTANT QuantFormat kQuantFormats[GGUF_FMT_COUNT] = {
     {GGUF_PRIVATE_TYPE_AF3, 64, 28, 12, 0, 4, 2, "af3"},
     {GGUF_PRIVATE_TYPE_AF2G128, 128, 36, 8, 0, 4, 4, "af2g128"},
     {GGUF_PRIVATE_TYPE_AF3G128, 128, 52, 12, 0, 4, 4, "af3g128"},
+    // NVFP4: plane0 the E2M1 nibbles as MXFP4's slot-order bitstream; meta 8
+    // bytes per 64-element unit — the 4 UE4M3 sub-block scales, then the
+    // tensor's fp32 global scale (llama.cpp's separate `.scale` tensor,
+    // folded in by the repack).
+    {40, 64, 36, 16, 0, 8, 2, "nvfp4"},
 };
 
 // The format that stores a GGUF tensor type; GGUF_FMT_COUNT when none does.

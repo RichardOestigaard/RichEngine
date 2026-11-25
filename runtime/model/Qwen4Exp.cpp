@@ -1720,7 +1720,7 @@ private:
     const ops::MoeWeights &weights =
         std::get<ops::MoeWeights>(layer.ffn);
     ops::MoeBuffers buffers{b.normalized, prefill_.zeros, prefill_.branch,
-                            b.moe, {}, {}};
+                            b.moe, {}, {}, {}};
     if (!step.moe || !moeStreaming(weights, index) ||
         step.moe->phase() != ops::MoePhase::Prefill ||
         moeHasMxfp4(weights.blocks())) {
@@ -1744,7 +1744,7 @@ private:
     const TargetModelVerifyBuffers &b = step.buffers;
     ops::MoE::add(step.graph,
                   {b.normalized, verify_.zeros, verify_.branch, b.moe,
-                   {}, b.verifyRows},
+                   {}, b.verifyRows, {}},
                   std::get<ops::MoeWeights>(layer.ffn), *step.moe);
   }
 

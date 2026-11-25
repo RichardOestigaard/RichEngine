@@ -1067,6 +1067,7 @@ TENSOR_TYPES = {
     29: "IQ1_M",
     30: "BF16",
     39: "MXFP4",
+    40: "NVFP4",
     142: "PQ2_0",
 }
 QUANTIZED_TYPES = {
@@ -1088,6 +1089,7 @@ QUANTIZED_TYPES = {
     "IQ4_NL",
     "IQ4_XS",
     "MXFP4",
+    "NVFP4",
     "PQ2_0",
 }
 # The token rows the embedding kernels gather (gguf_embedding_format in
@@ -1649,6 +1651,12 @@ NEMOTRON_MOE_TENSORS = {
     "ffn_up_shexp.weight": QUANTIZED_TYPES,
     "ffn_down_shexp.weight": QUANTIZED_TYPES,
 }
+# Bolt's LatentMoE projections, present on the MoE blocks of a GGUF
+# declaring moe_latent_size.
+NEMOTRON_LATENT_TENSORS = {
+    "ffn_latent_down.weight": QUANTIZED_TYPES,
+    "ffn_latent_up.weight": QUANTIZED_TYPES,
+}
 NEMOTRON_MODEL_TENSORS = {
     "token_embd.weight": EMBEDDING_TYPES,
     "output_norm.weight": F32,
@@ -1694,16 +1702,47 @@ def _nemotron_h_moe_fields(arch, text, metadata):
     def positive(key):
         return metadata.positive(arch + "." + key)
 
-    # The MoE blocks share one expert width; a GGUF narrowing a block
-    # states a geometry the tensor set does not.
-    moe_width = positive("expert_feed_forward_length")
-    ffl = metadata.values.get(arch + ".feed_forward_length")
-    if any(width and width != moe_width for width in ffl[:layers]):
+    # The MoE expert width: Lightning states expert_feed_forward_length
+    # flat and every MoE block shares it; Bolt's Star Elastic blocks narrow
+    # their own — both its feed_forward_length and expert_feed_forward_length
+    # are per-layer arrays whose nonzero entries vary. The maximum sizes the
+    # target's scratch and stands as the config's width.
+    def widths_of(key):
+        value = metadata.values.get(arch + "." + key)
+        if isinstance(value, list):
+            entries = value[:layers]
+            if not all(type(width) is int and width >= 0 for width in entries):
+                raise ModelError(
+                    "invalid GGUF metadata: " + arch + "." + key
+                )
+            return [width for width in entries if width]
+        if type(value) is int and value > 0:
+            return [value]
+        raise ModelError("missing or invalid GGUF metadata: " + arch + "." + key)
+
+    widths = widths_of("expert_feed_forward_length") + widths_of(
+        "feed_forward_length"
+    )
+    if not widths:
         raise ModelError(
-            "unsupported GGUF metadata: "
-            + arch
-            + ".feed_forward_length differs between MoE blocks"
+            "missing or invalid GGUF metadata: " + arch + ".expert_feed_forward_length"
         )
+    moe_width = max(widths)
+    # The experts each token routes: Lightning's flat count, or the one
+    # nonzero count Bolt's per-layer array states across its MoE blocks.
+    used = metadata.values.get(arch + ".expert_used_count")
+    if isinstance(used, list):
+        entries = used[:layers]
+        counts = {count for count in entries if count}
+        if len(counts) != 1 or not all(
+            type(count) is int and count >= 0 for count in entries
+        ):
+            raise ModelError(
+                "invalid GGUF metadata: " + arch + ".expert_used_count"
+            )
+        used_count = counts.pop()
+    else:
+        used_count = positive("expert_used_count")
     # The Mamba-2 head count is its time-step rank (the per-head scalar
     # vectors' width); the head width is the inner size divided evenly.
     heads = positive("ssm.time_step_rank")
@@ -1712,7 +1751,7 @@ def _nemotron_h_moe_fields(arch, text, metadata):
         raise ModelError("invalid GGUF metadata: " + arch + ".ssm.inner_size")
     text.update(
         num_experts=positive("expert_count"),
-        num_experts_per_tok=positive("expert_used_count"),
+        num_experts_per_tok=used_count,
         # Every FFN is a MoE block's expert width, stated flat as the
         # config's intermediate_size too.
         intermediate_size=moe_width,
@@ -1766,35 +1805,64 @@ def _nemotron_h_moe_fields(arch, text, metadata):
         if type(epsilon) is not float or epsilon <= 0:
             raise ModelError("missing or invalid GGUF metadata: " + arch + "." + key)
         text[name] = 1e-5 if abs(epsilon - 1e-5) <= 1e-5 * 1e-6 else epsilon
+    # The rope keys are converter artifacts — the attention blocks are
+    # NoPE and nothing reads them. Lightning's GGUF states them; Bolt's
+    # drops rope.freq_base. Emit what is present, refuse only an invalid
+    # value.
     theta = metadata.values.get(arch + ".rope.freq_base")
-    if type(theta) is not float or theta <= 0:
-        raise ModelError(
-            "missing or invalid GGUF metadata: " + arch + ".rope.freq_base"
-        )
-    text["rope_theta"] = theta
-    # The attention blocks' rotary is partial: rope.dimension_count is the
-    # rotated head width, half of it the pair count the table holds.
+    if theta is not None:
+        if type(theta) is not float or theta <= 0:
+            raise ModelError(
+                "invalid GGUF metadata: " + arch + ".rope.freq_base"
+            )
+        text["rope_theta"] = theta
     rotary = metadata.values.get(arch + ".rope.dimension_count")
-    if type(rotary) is not int or rotary <= 0 or rotary % 2:
-        raise ModelError(
-            "missing or invalid GGUF metadata: " + arch + ".rope.dimension_count"
-        )
-    text["rotary_pairs"] = rotary // 2
+    if rotary is not None:
+        if type(rotary) is not int or rotary <= 0 or rotary % 2:
+            raise ModelError(
+                "invalid GGUF metadata: " + arch + ".rope.dimension_count"
+            )
+        text["rotary_pairs"] = rotary // 2
+    # Bolt's LatentMoE declares the latent width its routed experts read
+    # and write; Lightning's experts span the hidden size and state nothing.
+    latent = metadata.values.get(arch + ".moe_latent_size")
+    if latent is not None:
+        if type(latent) is not int or latent <= 0:
+            raise ModelError(
+                "invalid GGUF metadata: " + arch + ".moe_latent_size"
+            )
+        text["moe_latent_size"] = latent
 
 
 def _nemotron_tensors(metadata, layers):
     """nemotron_h_moe: attn_norm on every block, and the attention, MoE or
-    Mamba-2 tensor set beside it as the two per-layer lists schedule it."""
-    kinds = _nemotron_layer_kinds(metadata, text_architecture(metadata), layers)
+    Mamba-2 tensor set beside it as the two per-layer lists schedule it.
+    Bolt's MoE blocks carry the LatentMoE projections beside the expert
+    slabs, and an NVFP4 ssm_in/ssm_out projection its scalar scale tensor —
+    the repack folds it into the planes' meta units, so a file whose NVFP4
+    projection lacks it is not loadable."""
+    arch = text_architecture(metadata)
+    kinds = _nemotron_layer_kinds(metadata, arch, layers)
+    latent = type(metadata.values.get(arch + ".moe_latent_size")) is int
     block = {
         "attention": NEMOTRON_ATTENTION_TENSORS,
-        "moe": NEMOTRON_MOE_TENSORS,
+        "moe": (
+            NEMOTRON_MOE_TENSORS | NEMOTRON_LATENT_TENSORS
+            if latent
+            else NEMOTRON_MOE_TENSORS
+        ),
         "mamba": NEMOTRON_MAMBA_TENSORS,
     }
     tensors = dict(NEMOTRON_MODEL_TENSORS)
     for layer in range(layers):
         for name, types in (NEMOTRON_LAYER_TENSORS | block[kinds[layer]]).items():
             tensors[f"blk.{layer}.{name}"] = types
+        if kinds[layer] == "mamba":
+            for stem in ("ssm_in", "ssm_out"):
+                # GGML type 40 is NVFP4 (TENSOR_TYPES); the type table is
+                # empty where the header was read without it.
+                if metadata.tensors.get(f"blk.{layer}.{stem}.weight") == 40:
+                    tensors[f"blk.{layer}.{stem}.scale"] = F32
     return tensors
 
 

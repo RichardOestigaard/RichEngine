@@ -209,7 +209,7 @@ public:
     // into gdnOutput.
     if (!skipMoe)
       ops::MoE::addGemma(step.graph,
-                       {b.gdnHidden, b.zeroResidual, b.fullPacked, b.moe, b.gdnOutput, {}},
+                       {b.gdnHidden, b.zeroResidual, b.fullPacked, b.moe, b.gdnOutput, {}, {}},
                        {ffn.routerWeights, ffn.perExpertScale, ffn.expertGate,
                         ffn.expertUp, ffn.expertDown},
                        *step.moe);
@@ -335,7 +335,7 @@ public:
                                b.gdnHidden, hidden, step.rows);
     // Routed experts: raw sum into fullPacked, post-normed into gdnOutput.
     ops::MoE::addGemma(step.graph,
-                       {b.gdnHidden, b.zeroResidual, b.fullPacked, b.moe, b.gdnOutput, b.verifyRows},
+                       {b.gdnHidden, b.zeroResidual, b.fullPacked, b.moe, b.gdnOutput, b.verifyRows, {}},
                        {ffn.routerWeights, ffn.perExpertScale, ffn.expertGate,
                         ffn.expertUp, ffn.expertDown},
                        *step.moe);

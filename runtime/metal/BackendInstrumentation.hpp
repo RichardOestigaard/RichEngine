@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -35,6 +36,11 @@ public:
   static void setDispatchProfiling(MetalBackend &backend, bool enabled);
   [[nodiscard]] static std::vector<DispatchTiming>
   takeDispatchProfile(MetalBackend &backend);
+  // Called with the pending byte count before every buffer allocation the
+  // backend makes; throwing refuses it. Placement heaps are unsupported
+  // while an admission is installed.
+  static void setBufferAdmission(MetalBackend &backend,
+                                 std::function<void(uint64_t)> admission);
 };
 
 } // namespace richengine::metal

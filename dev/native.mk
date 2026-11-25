@@ -145,6 +145,7 @@ TEST_TARGET_SAMPLING_TEST := $(ENGINE_TEST_BUILD)/target-sampling
 TEST_VERIFY_INPUT_TEST := $(ENGINE_TEST_BUILD)/verify-input
 TEST_CANVAS_KERNELS_TEST := $(ENGINE_TEST_BUILD)/canvas-kernels
 TEST_GELU_SATURATION_TEST := $(ENGINE_TEST_BUILD)/gelu-saturation
+TEST_MAMBA2_H128_PIPELINE_TEST := $(ENGINE_TEST_BUILD)/mamba2-h128-pipelines
 TEST_Q4_PREFILL_PROFILE := $(ENGINE_TEST_BUILD)/q4-prefill-profile
 TEST_Q4_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/q4-decode-profile
 TEST_I8_PREFILL_AB := $(ENGINE_TEST_BUILD)/i8-prefill-ab
@@ -295,6 +296,7 @@ TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) \
 	$(TEST_VERIFY_INPUT_TEST) \
 	$(TEST_CANVAS_KERNELS_TEST) \
 	$(TEST_GELU_SATURATION_TEST) \
+	$(TEST_MAMBA2_H128_PIPELINE_TEST) \
 	$(TEST_METAL_BACKEND_TEST) \
 	$(TEST_HANDOFF_TEST) \
 	$(TEST_STAGE_BARRIER_TEST) $(TEST_STAGE_BARRIER_LIB) \
@@ -828,6 +830,19 @@ $(TEST_GELU_SATURATION_TEST): dev/tests/engine/gelu_saturation_metal_test.mm \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
 		-framework Foundation -framework Metal -o $@
 
+.PHONY: test-mamba2-h128-pipelines
+test-mamba2-h128-pipelines: $(TEST_MAMBA2_H128_PIPELINE_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_MAMBA2_H128_PIPELINE_TEST) $(LIB)
+
+.PHONY: test-mamba2-h128-pipelines8
+test-mamba2-h128-pipelines8: $(TEST_MAMBA2_H128_PIPELINE_TEST) $(LIB8)
+	$(METAL_TEST_ENV) $(TEST_MAMBA2_H128_PIPELINE_TEST) $(LIB8)
+
+$(TEST_MAMBA2_H128_PIPELINE_TEST): dev/tests/engine/mamba2_h128_pipeline_test.mm \
+	$(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		-framework Foundation -framework Metal -o $@
+
 $(TEST_Q4_PREFILL_PROFILE): dev/benchmarks/q4_prefill_profile.mm \
 		$(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) \
@@ -1152,8 +1167,13 @@ benchmark-decode: all $(TEST_Q4_DECODE_PROFILE)
 
 # decode-profile replays the installed model's prefill and decode commands as
 # separate dispatches; DECODE_PROFILE_ARGS passes --prompt-tokens/--cycles.
+# The guard refuses to launch without proven host headroom and caps the
+# backend's admitted memory at DECODE_PROFILE_MEMORY_MIB.
+DECODE_PROFILE_MEMORY_MIB ?= 28672
 benchmark-decode-profile: preflight $(TARGET) $(TEST_DECODE_PROFILE) $(LIB)
-	$(TEST_DECODE_PROFILE) $(LIB) "$(MODEL_ROOT)" $(DECODE_PROFILE_ARGS)
+	$(BUILD_ID_PYTHON) dev/benchmarks/guard_decode_profile.py \
+		--memory-cap-mib $(DECODE_PROFILE_MEMORY_MIB) -- \
+		$(TEST_DECODE_PROFILE) $(LIB) "$(MODEL_ROOT)" $(DECODE_PROFILE_ARGS)
 
 # Attention kernels alone on one layer of synthetic Q8 history across cache
 # lengths; ATTENTION_SWEEP_ARGS passes --histories/--shapes/--lanes/--repeat.

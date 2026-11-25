@@ -140,6 +140,15 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       geometry.target.gemmaMoe
           ? bytesFor<uint16_t>(uint64_t{rows} * geometry.target.hiddenSize)
           : 0);
+  // Bolt's latent rows. The shared expert's 5376-wide intermediate reuses
+  // GdnHidden (rows x mambaInnerSize 8192), idle on every MoE-only layer.
+  const uint64_t latentBytes =
+      geometry.target.moeLatentSize
+          ? bytesFor<uint16_t>(uint64_t{rows} * geometry.target.moeLatentSize)
+          : 0;
+  put(PrefillTensor::MoeLatentRows, latentBytes);
+  put(PrefillTensor::MoeLatentOutput, latentBytes);
+  put(PrefillTensor::MoeZeroLatent, latentBytes);
   put(PrefillTensor::ContextProjected,
       bytesFor<uint16_t>(uint64_t{rows} * geometry.draft.hiddenSize));
   put(PrefillTensor::ContextHidden,

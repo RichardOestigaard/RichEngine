@@ -37,4 +37,18 @@ void RowCopy::add(metal::CommandGraph &graph, metal::MetalBuffer source,
             {kThreads, 1, 1});
 }
 
+void RowCopy::addReluSquared(metal::CommandGraph &graph, metal::MetalBuffer source,
+                             RowRegion from, metal::MetalBuffer destination, RowRegion to,
+                             uint32_t rows, uint32_t width) {
+  if (!rows || !width || !holds(source, from, rows, width) ||
+      !holds(destination, to, rows, width))
+    throw std::invalid_argument("invalid relu-squared rows");
+  const RowCopyParams params{rows,        width,     from.row,
+                             from.stride, from.column, to.row,
+                             to.stride,   to.column};
+  graph.add(std::string(kReluSquaredRowsBf16), {std::move(source), std::move(destination)},
+            params, {(uint64_t{rows} * width + kThreads - 1) / kThreads, 1, 1},
+            {kThreads, 1, 1});
+}
+
 } // namespace richengine::ops

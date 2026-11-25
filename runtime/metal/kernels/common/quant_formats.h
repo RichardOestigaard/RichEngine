@@ -455,6 +455,36 @@ struct FmtMXFP4N {
   static uint indices(Chunk q) { return FmtMXFP4::indices(q); }
   static QuantCoef coef(Meta e, ushort g) { return FmtMXFP4::coef(e, g); }
 };
+// UE4M3 as llama.cpp's ggml_ue4m3_to_fp32 decodes it: half the mathematical
+// E4M3 value (the table entries are twice E2M1, so one halving serves both),
+// zero and 0x7F mapping to zero.
+inline float quant_ue4m3(uchar x) {
+  if (x == 0 || x == 0x7F) return 0.0f;
+  const uint e = (x >> 3) & 0xF, m = x & 7;
+  const float raw = e ? ldexp(1.0f + float(m) * 0.125f, int(e) - 7) : ldexp(float(m), -9);
+  return raw * 0.5f;
+}
+// NVFP4: plane0 the E2M1 nibbles as MXFP4's slot-order bitstream; meta 8
+// bytes per 64-element unit — the 4 UE4M3 sub-block scales (byte s scaling
+// elements 16s..16s+15 of the unit), then the tensor's fp32 global scale g
+// (llama.cpp's `.scale` tensor, folded in by the repack). value =
+// g * ue4m3 * kFP4Values. Group j of the unit reads scales 2j (its first 16
+// elements) and 2j + 1.
+struct FmtNVFP4 {
+  QUANT_FORMAT(GGUF_FMT_NVFP4, QuantCodebook, 0, 16, false);
+  struct Payload { uint4 a; }; typedef uint Chunk; typedef uint2 Meta; typedef float Scale;
+  static half value(uint i) { return half(kFP4Values[i]); }
+  static Payload load(device uchar *p0, device uchar *) { return {*((device uint4 *)p0)}; }
+  static Meta loadMeta(device uchar *m) { return *((device uint2 *)m); }
+  static Chunk chunk(Payload w, ushort c) { return w.a[c]; }
+  static Chunk loadChunk(device uchar *p0, device uchar *, ushort c) { return *((device uint *)(p0 + 4 * c)); }
+  static uint indices(Chunk q) { return q; }
+  static QuantCoef coef(Meta mt, ushort j) {
+    const float g = as_type<float>(mt.y);
+    return {float2(g * quant_ue4m3(uchar((mt.x >> (8 * (2 * j))) & 0xFFu)),
+                   g * quant_ue4m3(uchar((mt.x >> (8 * (2 * j + 1))) & 0xFFu)))};
+  }
+};
 // AF4 (MLX affine Q4 group-64, the engine's private type GGUF_PRIVATE_TYPE_AF4): plane0 4-bit codes as Q4_0's;
 // meta the bf16 scale and bias of the native 64-element block, which its two groups of 32 share.
 // value = s * q + m.
@@ -552,7 +582,7 @@ struct FmtPQ20 {
   X(FmtAF4, af4) X(FmtAF5, af5) X(FmtAF6, af6) X(FmtAF8, af8)                                                     \
   X(FmtAF4G128, af4g128) X(FmtAF5G128, af5g128) X(FmtAF6G128, af6g128) X(FmtAF8G128, af8g128)      \
   X(FmtAF2, af2) X(FmtAF3, af3) X(FmtAF2G128, af2g128) X(FmtAF3G128, af3g128)                    \
-  X(FmtAF4P, af4p)
+  X(FmtAF4P, af4p) X(FmtNVFP4, nvfp4)
 
 // Runs body(F()) with the format type of run-time format id `format` (GGUF_FMT_*), for kernels whose tiles pick
 // their tensor, and so its format, at run time. The branch is uniform in a threadgroup. The host passes known ids

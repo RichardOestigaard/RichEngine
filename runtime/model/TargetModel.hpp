@@ -265,6 +265,10 @@ struct TargetModelGeometry final {
   // The routed experts' norm_topk_prob scaling factor (GGUF
   // expert_weights_scale; Nemotron's 2.5, 1.0 elsewhere).
   float moeRoutedScale = 1.0F;
+  // Bolt's LatentMoE width: the routed experts read and write this width,
+  // while their router and shared expert stay hidden-width. Zero keeps the
+  // experts hidden-width.
+  uint32_t moeLatentSize = 0;
   // Every block's gate, up and down expert projections — routed and shared
   // — resident in a format the int8 prefill tile takes
   // (gguf_prefill_int8_format): its prefill plans run the int8 expert
@@ -338,18 +342,22 @@ struct TargetModelGeometry final {
            captureLayerCount;
   }
   [[nodiscard]] constexpr ops::MoeShape moeShape() const noexcept {
+    // A latent MoE's shared expert runs encoder-side: the op's shape must
+    // not route it, or MoeShape::valid rejects the latent form.
+    const bool shared = moeSharedExpert && !moeLatentSize;
     return {hiddenSize,
             experts,
             expertsPerToken,
             expertIntermediateSize,
             moeLayout,
             moeExpertFormat,
-            moeSharedExpert,
+            shared,
             moeUngatedExperts,
-            moeUngatedExperts,
-            moeUngatedExperts ? sharedIntermediateSize : 0u,
+            moeUngatedExperts && shared,
+            moeUngatedExperts && shared ? sharedIntermediateSize : 0u,
             moeRoutedScale,
-            moeInt8Experts};
+            moeInt8Experts,
+            moeLatentSize};
   }
   // The widest FFN intermediate of the target: a mixed target (LFM2-MoE)
   // carries both a dense intermediate for its leading layers and the MoE
@@ -590,6 +598,13 @@ struct TargetModelPrefillBuffers final {
   // Gemma's MoE combine binds a zeroed hidden-width residual so the routed
   // sum lands unmixed; empty elsewhere.
   metal::MetalBuffer zeroResidual;
+  // Bolt's LatentMoE rows: the encoder's hidden->latent projection, the
+  // experts' latent combine and the immutable zero residual that combine
+  // reads. Empty on every other target. The shared expert's intermediate
+  // reuses gdnHidden, which is idle on a MoE-only layer.
+  metal::MetalBuffer moeLatentRows;
+  metal::MetalBuffer moeLatentOutput;
+  metal::MetalBuffer moeZeroLatent;
   metal::MetalBuffer chunkKeys;
   metal::MetalBuffer chunkValues;
   // WY/UT scratch for the chunked GDN scan; empty keeps the serial scan.
@@ -637,6 +652,11 @@ struct TargetModelVerifyBuffers final {
   // experts both read, and the zeroed rows the routed combine adds to.
   metal::MetalBuffer gemmaResidual;
   metal::MetalBuffer zeroResidual;
+  // Bolt's LatentMoE rows, as in TargetModelPrefillBuffers; the shared
+  // expert's intermediate reuses the idle gdnHidden scratch.
+  metal::MetalBuffer moeLatentRows;
+  metal::MetalBuffer moeLatentOutput;
+  metal::MetalBuffer moeZeroLatent;
   metal::MetalBuffer capturedTargetHidden;
   metal::MetalBuffer finalHidden;
   metal::MetalBuffer logits;
@@ -727,6 +747,20 @@ public:
   // lanes). Every op still processes the step's lanes; padding rows read
   // stale activations and write results no active row reads.
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
+
+  // RICHENGINE_LAYER_STATS debug capture: one fixed-capacity row window per
+  // sequence, slot 0 the embedding input and slots 1..layers the layers'
+  // outputs. Empty unless the environment gate was on during addPrefill.
+  struct LayerStatsCapture final {
+    metal::MetalBuffer buffer;
+    uint32_t rowsCap = 0;
+    uint32_t sequences = 0;
+    std::array<uint32_t, ExecutionLimits::maximumBatchWidth> rows{};
+  };
+  [[nodiscard]] const LayerStatsCapture &layerStatsCapture() const noexcept {
+    return layerStatsCapture_;
+  }
+  [[nodiscard]] const char *layerKind(uint32_t index) const noexcept;
 
   // Returns each step's hidden buffer holding the last layer's output rows.
   // The dense FFN of a command the split takes (FfnSplit::splits) runs
@@ -881,6 +915,7 @@ private:
   // encoder against the moved-to object.
   std::unique_ptr<TargetLayerEncoder> encoder_;
   std::unique_ptr<TargetLayerEncoder> (*encoderFactory_)(const TargetModel &);
+  mutable LayerStatsCapture layerStatsCapture_;
 };
 
 } // namespace richengine::model

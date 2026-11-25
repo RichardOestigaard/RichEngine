@@ -246,6 +246,9 @@ uint32_t readOnlyBufferMask(std::string_view entry) noexcept {
         return 0b001111u;
     }
     if (entry.starts_with("moe_expert_gguf_")) {
+        if (entry.find("_gu_i") != std::string_view::npos) {
+            return 0x67fffu;
+        }
         if (entry.find("_gu") != std::string_view::npos) {
             return 0b0111111111111111u;
         }

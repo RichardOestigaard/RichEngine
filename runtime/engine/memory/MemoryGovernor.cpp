@@ -166,7 +166,8 @@ uint64_t MemoryGovernor::hostHeadroomBytes(
 }
 
 std::optional<MemoryGovernor::Reservation>
-MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
+MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure,
+                           AdmissionMode mode) {
   if (!bytes) {
     throw std::invalid_argument("memory reservation must be positive");
   }
@@ -186,13 +187,16 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   const uint64_t hostRoom = hostHeadroomBytes(hostAvailable, 0);
   const bool hostRoomFits =
       requested <= hostRoom && hostRoom - requested >= kHostWarningMarginBytes;
+  const bool enforceHostMargins =
+      !serving_ || mode == AdmissionMode::PreserveHostReserve;
   // A request that only the host headroom refuses waits for host memory
   // while the idle headroom may still clear the margin. Hold host pressure
   // so the paced reclaim frees toward the recovery margin for it.
-  if (engineFits && !serving_ && !hostRoomFits)
+  if (engineFits && enforceHostMargins && !hostRoomFits)
     hostConstrained_ = true;
-  const bool hostRefuses = pressure == MemoryPressure::Critical ||
-                           (!serving_ && (!hostRoomFits || hostHeld()));
+  const bool hostRefuses =
+      pressure == MemoryPressure::Critical ||
+      (enforceHostMargins && (!hostRoomFits || hostHeld()));
   if (hostRefuses || !engineFits) {
     // The host's refusal lifts with its pressure, the limit's only once
     // memory is freed: a refusal they share is the host's.
@@ -207,11 +211,12 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   return Reservation(this, bytes);
 }
 
-metal::AllocationAdmission MemoryGovernor::allocationAdmission() noexcept {
-  return [this](uint64_t bytes, const std::function<void()> &allocate)
+metal::AllocationAdmission
+MemoryGovernor::allocationAdmission(AdmissionMode mode) noexcept {
+  return [this, mode](uint64_t bytes, const std::function<void()> &allocate)
              -> metal::AllocationResult {
     metal::AllocationFailure failure;
-    auto reservation = tryReserve(bytes, failure);
+    auto reservation = tryReserve(bytes, failure, mode);
     if (!reservation)
       return failure;
     try {

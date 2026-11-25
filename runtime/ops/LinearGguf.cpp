@@ -1073,14 +1073,31 @@ void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const Qu
   requireBytes(weights.plane0, uint64_t{n} * k * weights.floatElementBytes(), "float projection weight");
   requireBytes(input, uint64_t{rows} * k * 2, "float projection input");
   requireBytes(output, rowBytes(rows, outStride, uint64_t{outOffset} + n, element), "float projection output");
-  const std::string kernel =
+  const bool bf16Weight = weights.formatId == QuantizedSegment::kBfloat16;
+  std::string kernel =
       std::string(accelerator ? kGgufFloatNa : kGgufFloat) +
-      (weights.formatId == QuantizedSegment::kBfloat16 ? "wbf16_" : "") +
+      (bf16Weight ? "wbf16_" : "") +
       (type == FloatOutput::Float32 ? "f32" : "bf16");
+  uint32_t threadWidth = accelerator ? 128u : 512u;
+  if (bf16Weight && type == FloatOutput::BFloat16) {
+    if (accelerator) {
+      const uint32_t step = tuning().ggufFloatNaStep;
+      if ((step == 64 || step == 128) && k % step == 0)
+        kernel += "_k" + std::to_string(step);
+    } else {
+      const uint32_t splits = tuning().ggufFloatSplits;
+      if (splits == 4 || splits == 8) {
+        kernel += "_s" + std::to_string(splits);
+        threadWidth = splits * 32;
+      } else if (rows == 8 && envFlag("RICHENGINE_GGUF_FLOAT_M8")) {
+        kernel += "_m8";
+      }
+    }
+  }
   const metal::DispatchSize grid = accelerator ? metal::DispatchSize{(n + 31) / 32, (rows + 63) / 64, 1}
                                                : metal::DispatchSize{n / 8, (rows + 31) / 32, 1};
   graph.add(kernel, {std::move(input), weights.plane0, std::move(output)},
-            GgufFloatParams{rows, k, n, outStride, outOffset}, grid, {accelerator ? 128u : 512u, 1, 1});
+            GgufFloatParams{rows, k, n, outStride, outOffset}, grid, {threadWidth, 1, 1});
 }
 
 void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what, uint32_t planeInputs) {

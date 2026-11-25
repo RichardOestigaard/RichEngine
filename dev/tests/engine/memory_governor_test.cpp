@@ -553,6 +553,11 @@ void testRequestInServiceGrowsThroughHostPressure() {
   require(grow(400 * kMiB) && !governor.snapshot().hostGrowthAllowed,
           "a request in service waited for the warning margin");
   available = hostReserve / 2;
+  bool attempted = false;
+  const auto strict = governor.allocationAdmission(MemoryGovernor::AdmissionMode::PreserveHostReserve);
+  const auto refused = strict(100 * kMiB, [&] { attempted = true; });
+  require(!refused && refused.failure == metal::AllocationFailure::HostPressure && !attempted,
+          "weight restore bypassed the host reserve while serving");
   require(static_cast<bool>(grow(100 * kMiB)),
           "a request in service waited for the host's reserve");
   const metal::AllocationResult pastLimit = grow(kGiB);

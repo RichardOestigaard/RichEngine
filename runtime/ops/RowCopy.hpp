@@ -25,6 +25,11 @@ public:
   static void add(metal::CommandGraph &graph, metal::MetalBuffer source,
                   RowRegion from, metal::MetalBuffer destination, RowRegion to,
                   uint32_t rows, uint32_t width);
+  // destination = relu(source)^2 elementwise over the same row span —
+  // Bolt's ungated shared-expert activation between its dense projections.
+  static void addReluSquared(metal::CommandGraph &graph, metal::MetalBuffer source,
+                             RowRegion from, metal::MetalBuffer destination, RowRegion to,
+                             uint32_t rows, uint32_t width);
 };
 
 } // namespace richengine::ops

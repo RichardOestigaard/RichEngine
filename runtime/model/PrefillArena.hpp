@@ -70,6 +70,11 @@ enum class PrefillTensor : uint32_t {
   // The zeroed hidden-width rows Gemma's routed MoE combine adds to;
   // memset once at arena creation.
   ZeroResidual,
+  // Bolt's LatentMoE rows: the latent-down rows, the experts' latent
+  // combine and the immutable zero residual it reads. Zero-sized elsewhere.
+  MoeLatentRows,
+  MoeLatentOutput,
+  MoeZeroLatent,
   ChunkKeys,
   ChunkValues,
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
@@ -259,6 +264,10 @@ public:
     if (const metal::MetalBuffer counters = get(PrefillTensor::LinearCounters))
       std::memset(counters.contents(), 0, counters.sizeBytes());
     if (const metal::MetalBuffer zero = get(PrefillTensor::ZeroResidual))
+      std::memset(zero.contents(), 0, zero.sizeBytes());
+    // Bolt's latent combine residual: zeroed once here and never mutated
+    // (moe_combine reads residual only).
+    if (const metal::MetalBuffer zero = get(PrefillTensor::MoeZeroLatent))
       std::memset(zero.contents(), 0, zero.sizeBytes());
   }
 

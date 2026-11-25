@@ -44,8 +44,22 @@ constant uint kMamba2DecodeSimdgroups = 8;
 template <uint HeadsPerGroup, uint HeadDim, uint StateSize,
           uint Rows = RICHENGINE_TARGET_VERIFY_ROWS>
 struct Mamba2DecodeShared {
-  bfloat x[Rows * HeadsPerGroup * HeadDim];
-  bfloat bc[Rows * 2 * StateSize];
+  // A group's post-conv x|B|C rows stage in threadgroup memory only when the
+  // whole struct fits the 32KB budget: Bolt's sixteen-head groups would take
+  // 43KB at sixteen rows, so there the scan reads the values back out of
+  // `mixed` (the prologue writes every post-conv value there for the commit
+  // regardless) and only the small per-head scalars stay here. The arrays
+  // keep a one-element floor so the unstaged layout still types.
+  // Metal lodges no static data members, so the fit arithmetic rides
+  // enumerators.
+  enum : uint {
+    kStagedBytes = Rows * HeadsPerGroup * HeadDim * 2 +
+                   Rows * 2 * StateSize * 2 + Rows * HeadsPerGroup * 4 * 2 +
+                   HeadsPerGroup * 4 + 2 * kMamba2DecodeSimdgroups * 4,
+    kStageOperands = kStagedBytes <= 32768 ? 1u : 0u
+  };
+  bfloat x[kStageOperands ? Rows * HeadsPerGroup * HeadDim : 1];
+  bfloat bc[kStageOperands ? Rows * 2 * StateSize : 1];
   float step[Rows * HeadsPerGroup];
   float decay[Rows * HeadsPerGroup];
   float skip[HeadsPerGroup];
@@ -119,10 +133,13 @@ inline void mamba2_decode_prologue(
           gdn_conv_silu_pending(conv_rows, conv_state_in, tape_conv, pending,
                                 conv_weights, PackedWidth, ConvDim, token,
                                 channel, conv_bias);
-      if (e < GroupWidth)
-        shared.x[token * GroupWidth + e] = value;
-      else
-        shared.bc[token * 2 * StateSize + e - GroupWidth] = value;
+      if constexpr (Mamba2DecodeShared<HeadsPerGroup, HeadDim,
+                                       StateSize>::kStageOperands) {
+        if (e < GroupWidth)
+          shared.x[token * GroupWidth + e] = value;
+        else
+          shared.bc[token * 2 * StateSize + e - GroupWidth] = value;
+      }
       mixed[token * ConvDim + channel] = value;
     }
     // dt' per head of the group: lanes 0..HeadsPerGroup-1 own one each.
@@ -151,9 +168,17 @@ inline void mamba2_decode_prologue(
             mamba2_group_channel<InnerSize, Groups, StateSize>(group, e,
                                                                GroupWidth);
         raw[channel] = conv_rows[token * PackedWidth + channel];
-        post[channel] = e < GroupWidth
-                            ? shared.x[token * GroupWidth + e]
-                            : shared.bc[token * 2 * StateSize + e - GroupWidth];
+        // Unstaged groups read the post-conv value back out of `mixed`;
+        // this thread wrote it above, so program order carries it.
+        if constexpr (Mamba2DecodeShared<HeadsPerGroup, HeadDim,
+                                         StateSize>::kStageOperands) {
+          post[channel] = e < GroupWidth
+                              ? shared.x[token * GroupWidth + e]
+                              : shared
+                                    .bc[token * 2 * StateSize + e - GroupWidth];
+        } else {
+          post[channel] = mixed[token * ConvDim + channel];
+        }
       }
       if (lane < HeadsPerGroup)
         reinterpret_cast<device float *>(step_tape +
@@ -192,7 +217,7 @@ template <uint Heads, uint HeadDim, uint Groups, uint StateSize, uint ConvDim,
 inline void mamba2_decode_scan(
     device const float *state_in, device float *state_out,
     device const uchar *tape, device const float *a_weights,
-    device bfloat *hidden,
+    device const bfloat *mixed, device bfloat *hidden,
     threadgroup Mamba2DecodeShared<Heads / Groups, HeadDim, StateSize> &shared,
     uint group, uint lane, uint simd_group, uint tokens, uint pending,
     bool tape_step) {
@@ -201,7 +226,29 @@ inline void mamba2_decode_scan(
   constexpr uint GroupWidth = HeadsPerGroup * HeadDim;
   constexpr uint Rows = RICHENGINE_TARGET_VERIFY_ROWS;
   constexpr uint Batches = GroupWidth / kMamba2DecodeSimdgroups;
+  constexpr bool kStage =
+      Mamba2DecodeShared<HeadsPerGroup, HeadDim, StateSize>::kStageOperands;
   static_assert(Batches % RowsInFlight == 0, "rows in flight tile the group");
+  // One token's post-conv operands: threadgroup-staged when they fit, the
+  // prologue's `mixed` writes otherwise (the barrier after the prologue
+  // carries mem_device in that layout, and the same addresses hit the
+  // threadgroup's cache lines across the scan's batches).
+  const auto x_at = [&](uint token, uint row) -> bfloat {
+    if constexpr (kStage)
+      return shared.x[token * GroupWidth + row];
+    else
+      return mixed[ulong(token) * ConvDim +
+                   mamba2_group_channel<InnerSize, Groups, StateSize>(
+                       group, row, GroupWidth)];
+  };
+  const auto bc_at = [&](uint token, uint index) -> bfloat {
+    if constexpr (kStage)
+      return shared.bc[token * 2 * StateSize + index];
+    else
+      return mixed[ulong(token) * ConvDim +
+                   mamba2_group_channel<InnerSize, Groups, StateSize>(
+                       group, GroupWidth + index, GroupWidth)];
+  };
   // Row r covers (head, dim) = (r / HeadDim, r % HeadDim); r = batch*8+sg
   // walks every (head, dim) pair of the group.
   const auto base = [&](uint batch, uint r) {
@@ -261,18 +308,17 @@ inline void mamba2_decode_scan(
       for (uint r = 0; r < RowsInFlight; ++r) {
         const uint head = rows[r] / HeadDim;
         const float dA = shared.decay[token * HeadsPerGroup + head];
-        const float x = float(shared.x[token * GroupWidth + rows[r]]);
+        const float x = float(x_at(token, rows[r]));
         const float scale = shared.step[token * HeadsPerGroup + head] * x;
         float partial = 0.0f;
         for (uint i = 0; i < 4; ++i) {
           state[r][i] =
               fma(scale,
-                  float(shared.bc[token * 2 * StateSize + lane * 4 + i]),
+                  float(bc_at(token, lane * 4 + i)),
                   state[r][i] * dA);
           partial +=
               state[r][i] *
-              float(
-                  shared.bc[token * 2 * StateSize + StateSize + lane * 4 + i]);
+              float(bc_at(token, StateSize + lane * 4 + i));
         }
         result[r] = simd_sum(partial) + shared.skip[head] * x;
       }
@@ -364,43 +410,69 @@ inline void mamba2_decode_batch_phase(
       a_weights, dt_bias, step_sizes, skip_weights, tape_conv, pending,
       taped ? tape_out + params.step_tape[batch] : (device uchar *)nullptr,
       shared, params.dt_min, params.dt_max, group.x, lane, simd_group, tokens);
-  threadgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel);
+  // Unstaged groups read the prologue's `mixed` writes back in the scan, so
+  // their barrier must publish device memory across the threadgroup; staged
+  // groups keep the threadgroup-only barrier.
+  constexpr bool kStage =
+      Mamba2DecodeShared<HeadsPerGroup, HeadDim, StateSize>::kStageOperands;
+  threadgroup_barrier(kStage ? mem_flags::mem_threadgroup
+                             : (mem_flags::mem_threadgroup |
+                                mem_flags::mem_device),
+                      memory_order_acq_rel);
   mamba2_decode_scan<Heads, HeadDim, Groups, StateSize, ConvDim, RowsInFlight>(
-      state_in, state_out, tape, a_weights, lane_hidden, shared, group.x, lane,
-      simd_group, tokens, pending, taped);
+      state_in, state_out, tape, a_weights, mixed, lane_hidden, shared,
+      group.x, lane, simd_group, tokens, pending, taped);
   // The gate reads the scan's hidden writes across simdgroups.
   threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device,
                       memory_order_acq_rel);
   const uint thread_index = simd_group * 32 + lane;
+  // A 512-column group takes one adjacent pair per thread. Bolt's groups
+  // are two such spans; the second span's tiles sit eight heads later.
+  constexpr uint GateSpans = GroupWidth / 512;
+  static_assert(GroupWidth % 512 == 0,
+                "Mamba2 groups fill whole 512-column spans");
   for (uint token = 0; token < stride; ++token) {
-    const uint dim = 2 * thread_index;
-    const uint column = group.x * GroupWidth + dim;
-    const float y0 = float(lane_hidden[token * InnerSize + column]);
-    const float y1 = float(lane_hidden[token * InnerSize + column + 1]);
-    const float z0 = float(packed[token * PackedWidth + column]);
-    const float z1 = float(packed[token * PackedWidth + column + 1]);
-    const float v0 = y0 * richengine_silu(z0);
-    const float v1 = y1 * richengine_silu(z1);
+    float versus[2 * GateSpans];
+    float sum = 0.0f;
+    for (uint span = 0; span < GateSpans; ++span) {
+      const uint dim = span * 512 + 2 * thread_index;
+      const uint column = group.x * GroupWidth + dim;
+      const float y0 = float(lane_hidden[token * InnerSize + column]);
+      const float y1 = float(lane_hidden[token * InnerSize + column + 1]);
+      const float z0 = float(packed[token * PackedWidth + column]);
+      const float z1 = float(packed[token * PackedWidth + column + 1]);
+      versus[2 * span] = y0 * richengine_silu(z0);
+      versus[2 * span + 1] = y1 * richengine_silu(z1);
+      sum += versus[2 * span] * versus[2 * span] +
+             versus[2 * span + 1] * versus[2 * span + 1];
+    }
     const float inverse = rms_inverse_of_sums<kMamba2DecodeSimdgroups>(
-        v0 * v0 + v1 * v1, GroupWidth,
+        sum, GroupWidth,
         shared.reductions + (token & 1) * kMamba2DecodeSimdgroups,
         thread_index, lane, simd_group, params.rms_eps);
-    const bfloat gated0 =
-        bfloat((v0 * inverse) * float(norm_weight[column]));
-    const bfloat gated1 =
-        bfloat((v1 * inverse) * float(norm_weight[column + 1]));
-    lane_hidden[token * InnerSize + column] = gated0;
-    lane_hidden[token * InnerSize + column + 1] = gated1;
-    if (table) {
-      // The thread's adjacent pair of dims is its table slot's pair: the
-      // simdgroup covers this group's (g*8+sg)-th 64-column tile, lane the
-      // (2*lane, 2*lane+1) elements.
-      Table::write_row(
-          table + ulong(batch) * InnerSize * stride,
-          sums + ulong(batch) * (stride / q4sg::kRows) *
-                     Table::sums_per_tile(InnerSize),
-          InnerSize, group.x * HeadsPerGroup + simd_group, token, lane,
-          gated0, gated1);
+    for (uint span = 0; span < GateSpans; ++span) {
+      const uint dim = span * 512 + 2 * thread_index;
+      const uint column = group.x * GroupWidth + dim;
+      const bfloat gated0 =
+          bfloat((versus[2 * span] * inverse) * float(norm_weight[column]));
+      const bfloat gated1 =
+          bfloat((versus[2 * span + 1] * inverse) *
+                 float(norm_weight[column + 1]));
+      lane_hidden[token * InnerSize + column] = gated0;
+      lane_hidden[token * InnerSize + column + 1] = gated1;
+      if (table) {
+        // The thread's adjacent pair of dims is its table slot's pair: the
+        // simdgroup covers this group's (g*heads+span*8+sg)-th 64-column
+        // tile, lane the (2*lane, 2*lane+1) elements.
+        Table::write_row(
+            table + ulong(batch) * InnerSize * stride,
+            sums + ulong(batch) * (stride / q4sg::kRows) *
+                       Table::sums_per_tile(InnerSize),
+            InnerSize,
+            group.x * HeadsPerGroup + span * kMamba2DecodeSimdgroups +
+                simd_group,
+            token, lane, gated0, gated1);
+      }
     }
   }
 }
@@ -492,6 +564,20 @@ MAMBA2_DECODE_PACKED_ENTRY(verify_mamba2_fused_packed_f32, 64, 64, 8, 128,
                            6144, 10496, float)
 MAMBA2_DECODE_PACKED_ENTRY(verify_mamba2_fused_packed, 64, 64, 8, 128, 6144,
                            10496, bfloat)
+// Bolt's geometry (_h128): 128 heads of 64 in 8 groups, 10240 conv channels,
+// 18688 packed rows.
+MAMBA2_DECODE_ENTRY(verify_mamba2_fused_h128, 128, 64, 8, 128, 10240, 18688, bfloat)
+MAMBA2_DECODE_ENTRY(verify_mamba2_fused_h128_f32, 128, 64, 8, 128, 10240, 18688, float)
+MAMBA2_DECODE_TABLE_ENTRY(verify_mamba2_fused_h128_table64, 128, 64, 8, 128, 10240,
+                          18688, q4sg::Table64, bfloat)
+MAMBA2_DECODE_TABLE_ENTRY(verify_mamba2_fused_h128_table16_f32, 128, 64, 8, 128,
+                          10240, 18688, gguf_sg::Table16, float)
+MAMBA2_DECODE_TABLE_ENTRY(verify_mamba2_fused_h128_table16, 128, 64, 8, 128, 10240,
+                          18688, gguf_sg::Table16, bfloat)
+MAMBA2_DECODE_PACKED_ENTRY(verify_mamba2_fused_h128_packed_f32, 128, 64, 8, 128,
+                           10240, 18688, float)
+MAMBA2_DECODE_PACKED_ENTRY(verify_mamba2_fused_h128_packed, 128, 64, 8, 128, 10240,
+                           18688, bfloat)
 #undef MAMBA2_DECODE_PACKED_ENTRY
 #undef MAMBA2_DECODE_TABLE_ENTRY
 #undef MAMBA2_DECODE_ENTRY
@@ -529,6 +615,9 @@ inline void mamba2_decode_tree_prologue(
   constexpr uint GroupWidth = HeadsPerGroup * HeadDim;
   constexpr uint GroupChannels = GroupWidth + 2 * StateSize;
   constexpr uint Rows = RICHENGINE_TREE_VERIFY_NODES;
+  static_assert(Mamba2DecodeShared<HeadsPerGroup, HeadDim, StateSize,
+                                   Rows>::kStageOperands,
+                "the tree scan stages its operands in threadgroup memory");
   float a_w = 0.0f;
   if (lane < HeadsPerGroup)
     a_w = a_weights[group * HeadsPerGroup + lane];
@@ -724,35 +813,50 @@ inline void mamba2_decode_tree_batch_phase(
   threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device,
                       memory_order_acq_rel);
   const uint thread_index = simd_group * 32 + lane;
+  constexpr uint GateSpans = GroupWidth / 512;
+  static_assert(GroupWidth % 512 == 0,
+                "Mamba2 groups fill whole 512-column spans");
   for (uint token = 0; token < Rows; ++token) {
-    const uint dim = 2 * thread_index;
-    const uint column = group.x * GroupWidth + dim;
-    const float y0 = float(lane_hidden[token * InnerSize + column]);
-    const float y1 = float(lane_hidden[token * InnerSize + column + 1]);
-    const float z0 = float(packed[token * PackedWidth + column]);
-    const float z1 = float(packed[token * PackedWidth + column + 1]);
-    const float v0 = y0 * richengine_silu(z0);
-    const float v1 = y1 * richengine_silu(z1);
+    float versus[2 * GateSpans];
+    float sum = 0.0f;
+    for (uint span = 0; span < GateSpans; ++span) {
+      const uint dim = span * 512 + 2 * thread_index;
+      const uint column = group.x * GroupWidth + dim;
+      const float y0 = float(lane_hidden[token * InnerSize + column]);
+      const float y1 = float(lane_hidden[token * InnerSize + column + 1]);
+      const float z0 = float(packed[token * PackedWidth + column]);
+      const float z1 = float(packed[token * PackedWidth + column + 1]);
+      versus[2 * span] = y0 * richengine_silu(z0);
+      versus[2 * span + 1] = y1 * richengine_silu(z1);
+      sum += versus[2 * span] * versus[2 * span] +
+             versus[2 * span + 1] * versus[2 * span + 1];
+    }
     const float inverse = rms_inverse_of_sums<kMamba2DecodeSimdgroups>(
-        v0 * v0 + v1 * v1, GroupWidth,
+        sum, GroupWidth,
         shared.reductions + (token & 1) * kMamba2DecodeSimdgroups,
         thread_index, lane, simd_group, params.rms_eps);
-    const bfloat gated0 =
-        bfloat((v0 * inverse) * float(norm_weight[column]));
-    const bfloat gated1 =
-        bfloat((v1 * inverse) * float(norm_weight[column + 1]));
-    lane_hidden[token * InnerSize + column] = gated0;
-    lane_hidden[token * InnerSize + column + 1] = gated1;
-    if (table) {
-      // The thread's adjacent pair of dims is its table slot's pair: the
-      // simdgroup covers this group's (g*8+sg)-th 64-column tile, lane the
-      // (2*lane, 2*lane+1) elements.
-      Table::write_row(
-          table + ulong(batch) * InnerSize * Rows,
-          sums + ulong(batch) * (Rows / q4sg::kRows) *
-                     Table::sums_per_tile(InnerSize),
-          InnerSize, group.x * HeadsPerGroup + simd_group, token, lane,
-          gated0, gated1);
+    for (uint span = 0; span < GateSpans; ++span) {
+      const uint dim = span * 512 + 2 * thread_index;
+      const uint column = group.x * GroupWidth + dim;
+      const bfloat gated0 =
+          bfloat((versus[2 * span] * inverse) * float(norm_weight[column]));
+      const bfloat gated1 =
+          bfloat((versus[2 * span + 1] * inverse) *
+                 float(norm_weight[column + 1]));
+      lane_hidden[token * InnerSize + column] = gated0;
+      lane_hidden[token * InnerSize + column + 1] = gated1;
+      if (table) {
+        // As in the chain gate: each 512-column span's simdgroup tiles sit
+        // eight heads later within Bolt's sixteen-head groups.
+        Table::write_row(
+            table + ulong(batch) * InnerSize * Rows,
+            sums + ulong(batch) * (Rows / q4sg::kRows) *
+                       Table::sums_per_tile(InnerSize),
+            InnerSize,
+            group.x * HeadsPerGroup + span * kMamba2DecodeSimdgroups +
+                simd_group,
+            token, lane, gated0, gated1);
+      }
     }
   }
 }
@@ -993,6 +1097,7 @@ inline void mamba2_commit_batch_phase(
   }
 
 MAMBA2_COMMIT_ENTRY(verify_mamba2_commit, 64, 64, 8, 128, 6144, 10496)
+MAMBA2_COMMIT_ENTRY(verify_mamba2_commit_h128, 128, 64, 8, 128, 10240, 18688)
 #undef MAMBA2_COMMIT_ENTRY
 
 // The tree commit: the carried convolution always moves to the retained

@@ -158,8 +158,9 @@ public:
   template <class Params>
   void addIndirect(std::string pipeline, std::vector<MetalBuffer> buffers,
                    const Params &params, MetalBuffer grid,
-                   DispatchSize threads = {kDefaultThreads, 1, 1}) {
-    add(std::move(pipeline), std::move(buffers), params, {1, 1, 1}, threads);
+                   DispatchSize threads = {kDefaultThreads, 1, 1},
+                   DispatchSize groups = {1, 1, 1}) {
+    add(std::move(pipeline), std::move(buffers), params, groups, threads);
     ComputeDispatch &dispatch = dispatches_.back();
     if (dispatch.bakeable || dispatch.gpuSpan)
       throw std::invalid_argument("indirect dispatch cannot join a span");

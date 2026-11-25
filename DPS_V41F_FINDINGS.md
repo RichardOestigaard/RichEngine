@@ -56,7 +56,7 @@ input forces one SIMD group and loses GQA/KV reuse.
 | 4 | MoE expert column tile for 1–2 live rows | upstream `ed63ffb5` | 5–9% faster per MoE layer on 35B Q4_K, 5–25% on M6; one-lane step 27.7 vs 29.7 ms | M / low |
 | 5 | Treat `min_p=1` and `top_k=1` as greedy | upstream `8d5e05b2`; `runtime/ops/Sampling.hpp` | small, free; default sampling unchanged | XS / low |
 | 6 | Support pruned routed-expert counts | upstream `7b21db34`; `runtime/model/ModelDescriptor.mm` | enables 256/512-expert Flash-Next variants | S / low |
-| 7 | Auto-select the 8-row verify build for block-8 drafts | local audit; `REGRESSION_FINDINGS.md` | 16-row verify costs ~10% bandwidth with no acceptance gain | S / low |
+| 7 | Auto-select the 8-row verify build for block-8 drafts | local audit (since landed: `make verify8` + `_engine_binary`) | 16-row verify costs ~10% bandwidth with no acceptance gain | S / low |
 
 **Status (Oct 2026), verified against upstream `f52d1ad5` and this fork's dev
 HEAD:**
@@ -387,8 +387,8 @@ tile rereads K/V eight times. Do not implement this path.
 - `docs/performance.md:177` says the default KV format is INT4, while
   benchmarks run `--kv-format int8`.
 - The "acceptance down from 87%" note in `docs/performance.md:36-38` was a
-  prompt-remap artifact; `REGRESSION_FINDINGS.md` reports 87.3–88.7% and
-  ~94–104 tok/s B1 after the fix.
+  prompt-remap artifact in the benchmark; the verbatim prompt measures
+  87.3–88.7% and ~94–104 tok/s B1.
 - `docs/DECODE_SPEED_PLAN.md` says submit-ahead is prefill-only; decode ring2
   is default-on (`runtime/engine/Engine.cpp:321`). Its prepare-fusion item is
   effectively shipped through table-norm.

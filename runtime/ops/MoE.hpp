@@ -58,6 +58,12 @@ struct MoeShape final {
   // plans then run the int8 passes and size their scratch
   // (MoeConfig::int8Passes).
   bool int8Experts = false;
+  // Nemotron Bolt's latent expert width: the encoder projects the hidden
+  // rows down to this width before the grouped experts and projects the
+  // op's latent combine back up after it. Zero keeps the experts at
+  // hiddenSize. Latent experts are ungated GGUF blocks without an in-op
+  // shared expert.
+  uint32_t latentSize = 0;
 
   // The shared expert's intermediate width (expertIntermediateSize unless
   // sharedExpertIntermediateSize overrides it).
@@ -84,6 +90,14 @@ struct MoeShape final {
         (sharedExpertIntermediateSize &&
          (!sharedExpertUnitWeight || sharedExpertIntermediateSize % 64 != 0)))
       return false;
+    // Latent experts are Bolt's ungated GGUF form: the encoder runs the
+    // hidden<->latent projections and any shared expert outside the op, so
+    // the op's routed slabs both operate at latentSize. The staged tiles'
+    // 64-column K tiling sets the alignment.
+    if (latentSize &&
+        (weightLayout != WeightLayout::Block32 || !ungatedExperts ||
+         latentSize % 64 != 0 || latentSize > hiddenSize || sharedExpert))
+      return false;
     // The ungated block path bounds its 256-column gather and combine
     // blocks (moe_gather_rows, moe_combine) and stages 64-column tiles, so
     // it needs only the 64 alignment the tile math requires of K; every
@@ -93,13 +107,12 @@ struct MoeShape final {
       return false;
     if (experts <= MOE_EXPERT_SLOTS)
       return expertIntermediateSize % (ungatedBlock ? 64u : 256u) == 0;
-    // More experts than the routing kernels' slots hold: the wide (_e512)
-    // family routes a GGUF block with a shared expert on 512-slot scores
-    // and 512-slot select and grouping instances (upstream's
-    // SPLASH_MOE_WIDE_EXPERT_SLOTS). The staged expert tiles take any
+    // More experts than the narrow routing kernels' slots hold: the wide
+    // (_e512) family routes a GGUF block on 512-slot scores and 512-slot
+    // select and grouping instances. The staged expert tiles take any
     // 64-column intermediate; the affine slabs' N256 tiles keep the 256
-    // expert bound, as does sigmoid gating, which has no wide select.
-    return sharedExpert && weightLayout == WeightLayout::Block32 &&
+    // expert bound.
+    return weightLayout == WeightLayout::Block32 &&
            experts <= MOE_WIDE_EXPERT_SLOTS &&
            expertIntermediateSize % 64 == 0;
   }
@@ -144,6 +157,10 @@ struct BlockMoeWeights final {
   BlockExpertProjection up;
   BlockExpertProjection down;
   QuantizedSegment expertBias{};     // [1][experts] F32, sigmoid-gated MoE only
+  // Bolt's LatentMoE projections, [latent][hidden] and [hidden][latent];
+  // empty everywhere else. The encoder runs them outside the MoE op.
+  QuantizedSegment latentDown{};
+  QuantizedSegment latentUp{};
 };
 
 // The affine weights of a sparse MoE block: Q8 router and shared-expert
@@ -438,6 +455,12 @@ struct MoeConfig final {
   // projections are formats the int8 prefill tile takes (MoE::add's
   // addInt8Experts, kernels/shared/moe_int8.metal).
   bool int8Passes = false;
+  // Live-tile indirect dispatch of the staged GGUF decode expert passes
+  // (MoE::add): the plan derives it — RICHENGINE_MOE_INDIRECT_DISPATCH
+  // forces it, the execution plans' auto mode arms it on measured
+  // device/model/checkpoint combinations. Callers plan through
+  // ExecutionPlans or set it directly.
+  bool indirectDispatch = false;
   bool operator==(const MoeConfig &) const = default;
 };
 
@@ -476,8 +499,14 @@ private:
 };
 
 struct MoeBuffers final {
+  // Rows of hiddenSize bf16 values. The router always reads these rows.
   metal::MetalBuffer input;
+  // Rows of hiddenSize bf16 normally. On a latent shape they are rows of
+  // latentSize zeros: the encoder projects the op's latent result back to
+  // hidden width and applies the true residual and shared expert outside.
   metal::MetalBuffer residual;
+  // Rows of hiddenSize bf16 normally, rows of latentSize bf16 on a latent
+  // shape (the routed experts' weighted sum, including residual above).
   metal::MetalBuffer output;
   MoeScratch scratch;
   // Gemma 4 routes from the post-attention residual, not the FFN input: the
@@ -487,6 +516,11 @@ struct MoeBuffers final {
   // (ops::DraftSelector::addVerifyRows): its grouping routes each lane's
   // verify rows alone (moe_group_routes_verified). Empty, every row routes.
   metal::MetalBuffer verifyRows;
+  // Latent-MoE only (MoeShape::latentSize): rows of latentSize bf16 values,
+  // the encoder's latent-down projection of `input`. The routed-expert
+  // gather reads these rows instead of `input`; empty at latentSize 0. The
+  // trailing position keeps existing aggregate initializers intact.
+  metal::MetalBuffer expertInput{};
 };
 
 // The streamed routed experts' device state a streamed GGUF expert pass

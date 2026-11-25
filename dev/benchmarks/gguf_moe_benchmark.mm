@@ -14,6 +14,9 @@
 //   af4 throughout by default), with the routes per expert, the rows each routed expert takes on average and the
 //   passes the device's plan picks (ExecutionPlans::moeConfig's gate). The mode arms
 //   RICHENGINE_PREFILL_FAST_INT8 so the gate's model-policy term holds.
+//   gguf-moe-benchmark <metallib> bolt [rounds]
+// - same-graph direct/indirect A/B of two latent routed-layer shapes from
+//   Bolt 74B-A9B 24GB GGUF, with synthetic weights and routing inputs.
 #include "../tests/engine/AffineQ4Fixture.hpp"
 #include "../tests/engine/GgufFormatReference.hpp"
 #include "DispatchReplay.hpp"
@@ -23,16 +26,21 @@
 #include "ops/MoE.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <map>
 #include <numeric>
 #include <random>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -93,6 +101,111 @@ void allocate(MetalBackend &backend, MoeBuffers &m, const MoePlan &plan) {
   const auto &w = plan.workspace();
   for (const MoeScratchField &field : kMoeScratchFields)
     m.scratch.*field.buffer = zeros(backend, w.*field.bytes, "moe-scratch");
+}
+
+int boltTiming(MetalBackend &backend, uint32_t rounds) {
+  if (!rounds)
+    throw std::invalid_argument("bolt rounds must be positive");
+  constexpr uint32_t hidden = 4096, latent = 1024, topK = 9;
+  constexpr uint32_t maxExperts = 496, maxIntermediate = 2560;
+  const MoeShape shape{.hiddenSize = hidden,
+                       .experts = maxExperts,
+                       .expertsPerToken = topK,
+                       .expertIntermediateSize = maxIntermediate,
+                       .weightLayout = WeightLayout::Block32,
+                       .expertFormat = GGUF_FMT_IQ2XXS,
+                       .sharedExpert = false,
+                       .ungatedExperts = true,
+                       .expertWeightScale = 5.0f,
+                       .latentSize = latent};
+  const richengine::ops::ExecutionPlans plans(backend.capabilities());
+  std::mt19937 rng(9);
+  const auto expertPlanes = [&](uint32_t rows, uint32_t width) {
+    auto native = makeNative(IQ2XXS, rows, width, rng, [&] { return f2h(0.001f); });
+    return planeSegment(backend, IQ2XXS, repack(IQ2XXS, native, rows, width, nullptr), rows, width);
+  };
+  const auto median = [](std::vector<double> &samples) {
+    std::sort(samples.begin(), samples.end());
+    const size_t middle = samples.size() / 2;
+    return (samples[middle - 1] + samples[middle]) / 2;
+  };
+  std::printf("%s: Bolt latent routed MoE, IQ2_XXS, %u samples per arm per case\n",
+              backend.capabilities().deviceName.c_str(), 2 * rounds);
+  // These are layers 1 and 48 of the 24GB GGUF. The shared expert and
+  // latent projections run outside MoE::add on Bolt and are not timed.
+  for (const auto [experts, intermediate] :
+       {std::pair{240u, 2048u}, std::pair{496u, 2560u}}) {
+    std::vector<float> router(uint64_t{experts} * hidden), bias(experts);
+    for (uint32_t e = 0; e < experts; ++e)
+      router[uint64_t{e} * hidden + e] = 4.0f;
+    BlockMoeWeights block;
+    block.router = floatSegment(backend, router, experts, hidden);
+    block.expertBias = floatSegment(backend, bias, 1, experts);
+    block.up.routed = expertPlanes(experts * intermediate, latent);
+    block.down.routed = expertPlanes(experts * latent, intermediate);
+    const MoeWeights weights = block;
+    for (const auto [lanes, stride] :
+         {std::pair{1u, 1u}, std::pair{4u, 1u}, std::pair{1u, 8u}}) {
+      const uint32_t rows = lanes * stride;
+      const auto plan = plans.moeDecode(shape, lanes, stride);
+      MoeBuffers b;
+      std::vector<float> x(uint64_t{rows} * hidden, -0.25f),
+          expertInput(uint64_t{rows} * latent);
+      std::uniform_real_distribution<float> value(-1.0f, 1.0f);
+      for (float &v : expertInput) v = value(rng);
+      // Nine routes per token, with overlap inside a packed row group.
+      for (uint32_t r = 0; r < rows; ++r)
+        for (uint32_t k = 0; k < topK; ++k)
+          x[uint64_t{r} * hidden + (r * 3 + k) % experts] = 1.0f - 0.05f * k;
+      b.input = bfloatBuffer(backend, x, "bolt-input");
+      b.expertInput = bfloatBuffer(backend, expertInput, "bolt-latent");
+      b.residual = zeros(backend, uint64_t{rows} * latent * 2, "bolt-residual");
+      b.output = zeros(backend, uint64_t{rows} * latent * 2, "bolt-output");
+      allocate(backend, b, plan);
+      CommandGraph graph;
+      MoE::add(graph, b, weights, plan);
+      std::vector<richengine::metal::ComputeDispatch> direct(graph.dispatches().begin(),
+                                                             graph.dispatches().end());
+      size_t indirectPasses = 0;
+      for (auto &d : direct) {
+        if (!d.indirectGrid) continue;
+        ++indirectPasses;
+        d.indirectGrid = {};
+      }
+      if (indirectPasses != 2)
+        throw std::runtime_error("expected two indirect routed expert passes");
+      const auto check = [&](std::span<const richengine::metal::ComputeDispatch> dispatches,
+                             int sentinel) {
+        for (const auto &buffer : {b.output, b.scratch.expertIntermediate, b.scratch.expertOutput})
+          std::memset(buffer.contents(), sentinel, buffer.sizeBytes());
+        static_cast<void>(backend.submitCommand(dispatches));
+        const auto *bits = static_cast<const uint16_t *>(b.output.contents());
+        return std::vector<uint16_t>(bits, bits + uint64_t{rows} * latent);
+      };
+      const auto reference = check(direct, 0x3c);
+      if (reference != check(graph.dispatches(), 0xa5))
+        throw std::runtime_error("Bolt latent routed output differs between dispatch modes");
+      const auto live = *static_cast<const uint32_t *>(b.scratch.tileCount.contents());
+      if (!live || live > plan.maximumTiles())
+        throw std::runtime_error("invalid Bolt tile count");
+      // Two warmups per arm, then ABBA; use GPU time, not graph encoding.
+      std::array<std::vector<double>, 2> samples;
+      for (uint32_t r = 0; r <= rounds; ++r) {
+        for (const unsigned arm : {0u, 1u, 1u, 0u}) {
+          const auto dispatches = arm ? graph.dispatches()
+              : std::span<const richengine::metal::ComputeDispatch>(direct);
+          const auto ms = backend.submitCommand(dispatches).gpuSeconds * 1000.0;
+          if (r) samples[arm].push_back(ms);
+        }
+      }
+      const double a = median(samples[0]), bms = median(samples[1]);
+      std::printf("  E%u I%u B%u stride%u tiles %u/%u: direct %.5f ms, indirect %.5f ms, "
+                  "latency reduction %+.2f%%, bitwise match\n",
+                  experts, intermediate, lanes, stride, live, plan.maximumTiles(),
+                  a, bms, 100.0 * (1.0 - bms / a));
+    }
+  }
+  return 0;
 }
 
 int timing(MetalBackend &backend, uint32_t rounds, bool int8, Fmt gateUpFormat, Fmt downFormat, Fmt sharedFormat,
@@ -287,9 +400,25 @@ int timing(MetalBackend &backend, uint32_t rounds, bool int8, Fmt gateUpFormat, 
 } // namespace
 
 int main(int argc, const char *argv[]) {
+  if (argc > 2 && std::string_view(argv[2]) == "bolt") {
+    if (argc > 4) {
+      std::cerr << "usage: gguf-moe-benchmark <metallib> bolt [rounds]\n";
+      return 2;
+    }
+    setenv("RICHENGINE_MOE_INDIRECT_DISPATCH", "1", 1);
+    @autoreleasepool {
+      try {
+        MetalBackend backend(argv[1]);
+        return boltTiming(backend, argc == 4 ? std::stoul(argv[3]) : 20);
+      } catch (const std::exception &error) {
+        std::cerr << "gguf-moe-benchmark: " << error.what() << '\n';
+        return 1;
+      }
+    }
+  }
   // `int8` runs the opt-in RICHENGINE_PREFILL_FAST_INT8 passes, whose plan
   // gate reads modelPolicy().prefillFastInt8 — arm it before anything reads
-  // tuning() or modelPolicy(), as gguf-prefill-int8's binary does.
+// tuning() or modelPolicy(), as gguf-prefill-int8's binary does.
   const bool int8 = argc > 2 && std::string_view(argv[2]) == "int8";
   if (int8) setenv("RICHENGINE_PREFILL_FAST_INT8", "1", 1);
   @autoreleasepool {

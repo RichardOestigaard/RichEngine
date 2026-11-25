@@ -176,6 +176,9 @@ inline TargetModelPrefillBuffers prefillBuffers(const PrefillArena &arena,
   buffers.ropeCosAlt = p(PrefillTensor::RopeCosAlt);
   buffers.ropeSinAlt = p(PrefillTensor::RopeSinAlt);
   buffers.zeroResidual = p(PrefillTensor::ZeroResidual);
+  buffers.moeLatentRows = p(PrefillTensor::MoeLatentRows);
+  buffers.moeLatentOutput = p(PrefillTensor::MoeLatentOutput);
+  buffers.moeZeroLatent = p(PrefillTensor::MoeZeroLatent);
   buffers.chunkKeys = p(PrefillTensor::ChunkKeys);
   buffers.chunkValues = p(PrefillTensor::ChunkValues);
   buffers.gdnChunkScratch = p(PrefillTensor::GdnChunkScratch);

@@ -29,8 +29,8 @@ management, and per-device kernel autotuning.
   121.7 → 249.9 tokens/s on the 27B (upstream splash reference: 334.3;
   residual is verify-GEMM tile efficiency, not geometry).
 - `RICHENGINE_VERIFY_NARROW=1` keeps the runtime-stride experiment
-  available; it is NOT output-identical on a 16-compiled build — see
-  REGRESSION_FINDINGS.md.
+  available; it is NOT output-identical on a 16-compiled build (tile-variant
+  numerics diverge), which is why the compiled verify8 variant exists.
 
 ## 1. Gemma 4 model family
 

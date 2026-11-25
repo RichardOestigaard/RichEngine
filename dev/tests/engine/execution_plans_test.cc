@@ -1,4 +1,5 @@
 #include "TestChecks.hpp"
+#include "Tuning.hpp"
 #include "ops/DeviceTuning.hpp"
 #include "ops/ExecutionPlans.hpp"
 
@@ -405,6 +406,65 @@ void invalidLookupsAndContextEdges() {
   ++edge[0];
   rejects([&] { (void)plans.verifyAttention(1, 24, kvLayout, edge); });
 }
+// RICHENGINE_MOE_INDIRECT_DISPATCH (Tuning.hpp): unset/auto arms live-tile
+// dispatch on the measured device/model/checkpoint row alone, 0 keeps it
+// off everywhere, and any other present value forces every eligible plan.
+// The rows>1 gate keeps a one-row step direct — its grid has no live-tile
+// slack — and Bolt's ungated latent block stays opt-in at every width.
+void moeIndirectDispatchPolicy() {
+  const DeviceCapabilities measured{.deviceName = "Apple M5 Pro",
+                                    .appleGpuFamily = 10,
+                                    .chipGeneration = 5,
+                                    .gpuCoreCount = 20};
+  constexpr std::string_view family = "Qwen3.6-35B-A3B",
+                             checkpoint = "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q2_K_XL";
+  MoeShape shape = routedShape;
+  shape.weightLayout = WeightLayout::Block32;
+  shape.expertFormat = GGUF_FMT_IQ2XS;
+  const auto mode = tuning().moeIndirectDispatch;
+  const bool force = mode == MoeIndirectDispatchMode::On;
+  const bool enabled = mode != MoeIndirectDispatchMode::Off;
+  const ExecutionPlans plans(measured, 0, family, checkpoint);
+  require(plans.moeDecode(shape, 1, 8).configuration().indirectDispatch == enabled &&
+              plans.moeDecode(shape, 1, 1).configuration().indirectDispatch == force &&
+              !plans.moePrefill(shape, 64).configuration().indirectDispatch,
+          "the measured row's indirect dispatch policy changed");
+  const auto decode = [](const ExecutionPlans &p, const MoeShape &s) {
+    return p.moeDecode(s, 1, 8).configuration().indirectDispatch;
+  };
+  // Every non-allowlisted combination stays off under auto; a forcing value
+  // arms all of them.
+  const ExecutionPlans q4(measured, 0, family, "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M"),
+                       otherModel(measured, 0, "Nemotron-3.5-Bolt", checkpoint),
+                       bare(measured);
+  DeviceCapabilities noName = measured, noCores = measured;
+  noName.deviceName = "Apple M5";
+  noCores.gpuCoreCount = 0;
+  const ExecutionPlans unnamed(noName, 0, family, checkpoint),
+                       unknownCores(noCores, 0, family, checkpoint);
+  // Bolt's ungated latent experts: indirect dispatch is opt-in only.
+  const MoeShape bolt{320, 16, 4, 192, WeightLayout::Block32, GGUF_FMT_Q80,
+                      /*sharedExpert=*/false, /*ungatedExperts=*/true,
+                      /*sharedExpertUnitWeight=*/false,
+                      /*sharedExpertIntermediateSize=*/0,
+                      /*expertWeightScale=*/1.0f, /*int8Experts=*/false,
+                      /*latentSize=*/128};
+  require(decode(q4, shape) == force && decode(otherModel, shape) == force &&
+              decode(bare, shape) == force && decode(unnamed, shape) == force &&
+              decode(unknownCores, shape) == force && decode(plans, bolt) == force,
+          "a non-measured device/model/checkpoint took the indirect dispatch");
+  // The per-lane bound covers every verify stride and lane count the row
+  // installs, and the tile-count scratch follows the mode.
+  for (uint32_t stride = 1; stride <= RICHENGINE_TARGET_VERIFY_ROWS; ++stride)
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+      covers(plans.moeDecodeWorkspacePerLane(shape),
+             plans.moeDecode(shape, lanes, stride).workspace(), lanes,
+             kMoeWorkspaceFields);
+  require(plans.moeDecode(shape, 1, 8).workspace().tileCountBytes ==
+              (enabled ? uint64_t{kMoeIndirectTileCountBytes} : sizeof(uint32_t)),
+          "the measured row's tile-count scratch did not follow the mode");
+}
+
 } // namespace
 
 int main() {
@@ -416,6 +476,7 @@ int main() {
     unknownCoreCount();
     workspaceBounds();
     invalidLookupsAndContextEdges();
+    moeIndirectDispatchPolicy();
     std::cout << "PASS execution plans: device policies and family carry-forward, "
                  "device MoE tiles, B1-B4 and prefill workspace bounds (CPU only)\n";
     return 0;

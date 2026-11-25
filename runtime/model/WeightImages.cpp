@@ -34,8 +34,26 @@ bool WeightImages::restore() {
   if (!released_) throw std::logic_error("weights are not released");
   if (restored_ < images_.size()) {
     Image &image = images_[restored_];
-    backend_->restoreMemory(image.buffer);
-    image.write(contentsOf(image.buffer), image.buffer);
+    const auto allocate = [&] { backend_->restoreMemory(image.buffer); };
+    if (restoreAdmission_) {
+      const auto result = restoreAdmission_(image.buffer.sizeBytes(), allocate);
+      if (!result)
+        throw metal::MetalAllocationError(
+            "weight restore refused for " + image.component + ": " +
+                metal::allocationFailureName(result.failure),
+            result.failure);
+    } else {
+      allocate();
+    }
+    // A retryable writer failure must not retry an already attached image:
+    // release it again unless the driver rejected the allocation itself.
+    try {
+      image.write(contentsOf(image.buffer), image.buffer);
+    } catch (const metal::MetalAllocationError &error) {
+      if (error.failure() != metal::AllocationFailure::DriverRejected)
+        backend_->releaseMemory(image.buffer);
+      throw;
+    }
     ++restored_;
   }
   released_ = restored_ < images_.size();

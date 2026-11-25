@@ -145,6 +145,26 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
       for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[i];
       break;
     }
+    case GGUF_FMT_NVFP4: {
+      // block_nvfp4 {d[4] ue4m3, qs[32]}: sub-block s of the 64-element block
+      // holds elements 16s..16s+15, byte j of its qs[s*8..] the low nibble of
+      // element 16s+j and the high of 16s+j+8. Group j of the meta unit
+      // (elements 32j..32j+31) reads sub-blocks 2j and 2j+1. The meta unit
+      // keeps the 4 scale bytes once, then the tensor's fp32 global scale.
+      for (uint l = 0; l < 8; ++l) {
+        const uchar qa = blk[4 + 16 * j + l], qb = blk[4 + 16 * j + 8 + l];
+        lo[quant_slot(l)] = qa & 15;
+        lo[quant_slot(8 + l)] = qa >> 4;
+        lo[quant_slot(16 + l)] = qb & 15;
+        lo[quant_slot(24 + l)] = qb >> 4;
+      }
+      gguf_store_bits(lo, 4, out0);
+      if (j == 0) {
+        for (uint i = 0; i < 4; ++i) meta[i] = blk[i];
+        *((device float *)(meta + 4)) = p.scale;
+      }
+      break;
+    }
     case GGUF_FMT_IQ3XXS: case GGUF_FMT_IQ2XXS: case GGUF_FMT_IQ2XS:   // {d, qs[64 | 32], signs and scales[32] | scales[8]}
       gguf_copy_native(blk, j, f, 2, 66, 0, out0, out1, meta);
       break;
