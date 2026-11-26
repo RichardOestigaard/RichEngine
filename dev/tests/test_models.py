@@ -3,6 +3,7 @@ import contextlib
 import copy
 import errno
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -20,7 +21,8 @@ from huggingface_hub.hf_api import RepoSibling
 from huggingface_hub.utils import httpx
 
 from dev.tests.installer_fixtures import http_error
-from install import families, hub, legacy
+from install import assembly, families, hub, legacy, paths
+from install import gc as hub_gc
 from install import models as installer
 
 
@@ -637,9 +639,8 @@ class ModelArtifactTest(unittest.TestCase):
         args = installer.parse_args(["--model", self.MODEL_ID, "prepare"])
         self.assertEqual((args.command, args.model), ("prepare", self.MODEL_ID))
         makefile = (Path(__file__).resolve().parents[2] / "Makefile").read_text()
-        self.assertIn(
-            "MODEL_INSTALL = $(PYTHON) install/models.py $(MODEL_ARGS)", makefile
-        )
+        self.assertIn("MODEL_INSTALL = $(PYTHON) install/models.py", makefile)
+        self.assertIn('$(if $(MODELS_DIR),--models "$(MODELS_DIR)")', makefile)
         self.assertIn('MODEL_ARGS = --model "$(MODEL)"', makefile)
         self.assertIn("\t$(MODEL_INSTALL) prepare\n", makefile)
 
@@ -1053,6 +1054,216 @@ class ModelArtifactTest(unittest.TestCase):
                 installer.fcntl.LOCK_UN,
             ],
         )
+
+
+class ModelsRootTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name) / "checkout"
+        self.data = Path(temporary.name) / "data"
+        self.root.mkdir()
+        patch = mock.patch.dict(os.environ, {}, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def patched_paths(self, *, packaged=False):
+        return mock.patch.multiple(
+            paths, ROOT=self.root, DATA=self.data, PACKAGED=packaged
+        )
+
+    def test_default_keeps_real_or_linked_checkout_store(self):
+        legacy = self.root / "install/models"
+        legacy.mkdir(parents=True)
+        with self.patched_paths():
+            self.assertEqual(paths.default_models_root(), legacy)
+        legacy.rename(self.root / "install/old")
+        target = self.root / "elsewhere"
+        target.mkdir()
+        legacy.symlink_to(target, target_is_directory=True)
+        with self.patched_paths():
+            self.assertEqual(paths.default_models_root(), target.resolve())
+
+    def test_fresh_checkout_defaults_to_user_data(self):
+        with self.patched_paths():
+            self.assertEqual(paths.default_models_root(), self.data / "models")
+
+    def test_resolution_precedence_flag_env_config_default(self):
+        configured = self.root / "configured"
+        self.data.mkdir()
+        with self.patched_paths():
+            default = paths.default_models_root()
+            with mock.patch.object(paths, "MODELS", default):
+                self.assertEqual(paths.models_root(), (default, "default"))
+                (self.data / "config.json").write_text(
+                    json.dumps({"models_dir": str(configured)})
+                )
+                self.assertEqual(paths.models_root(), (configured, "config"))
+                os.environ["RICHENGINE_MODELS_DIR"] = str(self.root / "env")
+                self.assertEqual(
+                    paths.models_root(), (self.root / "env", "env")
+                )
+                self.assertEqual(
+                    paths.models_root(self.root / "flag"),
+                    (self.root / "flag", "flag"),
+                )
+                os.environ.pop("RICHENGINE_MODELS_DIR")
+                self.assertEqual(paths.models_root(), (configured, "config"))
+
+    def test_root_command_prints_path_and_source(self):
+        selected = self.root / "selected"
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = installer.main(["--models", str(selected), "root"])
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue().splitlines(), [str(selected), "source: flag"])
+
+    def test_migrate_rejects_a_destination_inside_the_models_root(self):
+        source = self.root / "source"
+        source.mkdir(parents=True)
+        with self.patched_paths(), mock.patch.object(paths, "MODELS", source):
+            with self.assertRaisesRegex(installer.ModelError, "inside the models root"):
+                installer.migrate_models_root(source / "nested")
+        self.assertFalse((self.data / "config.json").exists())
+
+    def test_migrate_failed_verification_leaves_config_unchanged(self):
+        source = self.root / "source"
+        assembly_dir = source / ".resolved/assembly"
+        assembly_dir.mkdir(parents=True)
+        (assembly_dir / "model.json").write_text("{}")
+        link = source / "owner/repo"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(assembly_dir, target_is_directory=True)
+        with self.patched_paths(), mock.patch.object(paths, "MODELS", source):
+            with self.assertRaisesRegex(installer.ModelError, "failed verification"):
+                installer.migrate_models_root(self.root / "destination")
+            self.assertFalse((self.data / "config.json").exists())
+
+    def test_migrate_hardlinks_rewrites_internal_links_and_writes_config(self):
+        source = self.root / "source"
+        assembly_dir = source / ".resolved/assembly"
+        blob = source / ".blobs/blob"
+        assembly_dir.mkdir(parents=True)
+        blob.parent.mkdir(parents=True)
+        blob.write_bytes(b"weights")
+        (assembly_dir / "weights").symlink_to(blob)
+        record = {
+            "version": 1,
+            "model": "owner/repo",
+            "family": "owner/repo",
+            "target_format": "mlx-affine",
+            "vision_format": "none",
+            "sources": {"target": {"repo": "owner/repo", "revision": None}},
+            "files": {"weights": assembly.file_record(blob)},
+        }
+        (assembly_dir / "model.json").write_bytes(installer.json_bytes(record))
+        selection_link = source / "owner/repo"
+        selection_link.parent.mkdir(parents=True)
+        selection_link.symlink_to(assembly_dir, target_is_directory=True)
+        destination = self.root / "destination"
+        output = io.StringIO()
+        with self.patched_paths(), mock.patch.object(paths, "MODELS", source):
+            with contextlib.redirect_stdout(output):
+                installer.migrate_models_root(destination)
+            self.assertEqual(
+                json.loads((self.data / "config.json").read_text())["models_dir"],
+                str(destination),
+            )
+        migration_output = output.getvalue()
+        self.assertIn("Copying", migration_output)
+        self.assertIn("Verified 1 migrated installation.", migration_output)
+        self.assertIn("previous root was left in place", migration_output)
+        self.assertIn("share inodes", migration_output)
+        copied = destination / ".blobs/blob"
+        self.assertEqual(copied.stat().st_ino, blob.stat().st_ino)
+        moved_record = copy.deepcopy(record)
+        moved_record["files"]["weights"]["path"] = str(copied.resolve())
+        digest = hashlib.sha256(installer.json_bytes(moved_record)).hexdigest()
+        moved_assembly = destination / ".resolved" / digest
+        self.assertEqual(
+            json.loads((moved_assembly / "model.json").read_text()), moved_record
+        )
+        self.assertEqual(
+            (moved_assembly / "weights").readlink().resolve(), copied.resolve()
+        )
+        self.assertEqual(
+            (destination / "owner/repo").readlink().resolve(), moved_assembly.resolve()
+        )
+        self.assertTrue(selection_link.exists())
+
+    def test_remove_installation_preserves_selections_sharing_an_assembly(self):
+        models_root = self.root / "models"
+        assembly_dir = models_root / ".resolved/assembly"
+        blob = models_root / ".blobs/blob"
+        assembly_dir.mkdir(parents=True)
+        blob.parent.mkdir(parents=True)
+        blob.write_bytes(b"weights")
+        (assembly_dir / "weights").symlink_to(blob)
+        record = {
+            "version": 1,
+            "model": "owner/repo",
+            "family": "owner/repo",
+            "target_format": "mlx-affine",
+            "vision_format": "none",
+            "sources": {"target": {"repo": "owner/repo", "revision": None}},
+            "files": {"weights": assembly.file_record(blob)},
+        }
+        (assembly_dir / "model.json").write_bytes(installer.json_bytes(record))
+        plain = models_root / "owner/repo"
+        plain.parent.mkdir(parents=True)
+        plain.symlink_to(assembly_dir, target_is_directory=True)
+        options = models_root / ".selections" / ("a" * 64)
+        options.parent.mkdir()
+        options.symlink_to(assembly_dir, target_is_directory=True)
+
+        installer.remove_installation(models_root, options)
+        self.assertFalse(options.exists())
+        self.assertTrue(plain.is_symlink())
+        self.assertTrue(assembly_dir.is_dir())
+        self.assertTrue(blob.exists())
+        installer.verify_installation(plain)
+
+        installer.remove_installation(models_root, plain)
+        self.assertFalse(plain.exists())
+        self.assertFalse(assembly_dir.exists())
+        self.assertFalse(blob.exists())
+        self.assertFalse((models_root / "owner").exists())
+
+    def test_gc_execute_detailed_reports_freed_bytes_by_category(self):
+        cache = self.root / "cache"
+        cache.mkdir()
+        owned = cache / "owned"
+        owned.write_bytes(b"owned")
+        packed = self.root / "packed/entry"
+        packed.mkdir(parents=True)
+        (packed / "weights").write_bytes(b"packed-cache")
+        incomplete = cache / "file.incomplete"
+        incomplete.write_bytes(b"partial")
+        result = {
+            "info": mock.Mock(),
+            "cache_dir": cache,
+            "dead_revisions": [],
+            "dead_repos": [],
+            "live_revisions": 0,
+            "shared_blobs": {},
+            "incomplete": [incomplete],
+            "owned_blobs": {owned: 5},
+            "packed_cache": {packed.parent: 12},
+        }
+        self.assertEqual(
+            hub_gc.execute_detailed(result),
+            {
+                "owned_blobs": 5,
+                "packed_cache": 12,
+                "revisions": 0,
+                "incomplete": 7,
+                "shared_blobs": 0,
+            },
+        )
+        self.assertFalse(owned.exists())
+        self.assertFalse(packed.parent.exists())
+        self.assertFalse(incomplete.exists())
+        self.assertEqual(hub_gc.execute(result), 0)
 
 
 class ScriptEntryTests(unittest.TestCase):

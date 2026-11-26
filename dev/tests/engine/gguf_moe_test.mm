@@ -129,6 +129,16 @@ size_t dispatchDiffs(const std::vector<uint16_t> &a, const std::vector<uint16_t>
   }
   return diffs;
 }
+
+// Composition-invariant prefill is stricter than decode cross-shape
+// agreement: the shared leading rows must be bit-for-bit identical across
+// chunk sizes. Returns the first mismatching bf16 element, or n.
+size_t bitwisePrefixDiff(const std::vector<uint16_t> &a, const std::vector<uint16_t> &b) {
+  const size_t n = std::min(a.size(), b.size());
+  for (size_t i = 0; i < n; ++i)
+    if (a[i] != b[i]) return i;
+  return n;
+}
 // Where silu has its minimum (silu' = 0).
 constexpr double kSiluArgmin = -1.2784645427610738;
 
@@ -651,6 +661,9 @@ int moe(MetalBackend &backend) {
         }
       }
       // Prefill chunks on the same 8-row tiles (ExecutionPlans::moePrefill).
+      // Forced-staged prefill must be composition-invariant: shorter chunks
+      // reproduce the wide chunk's leading rows bit-for-bit.
+      std::vector<uint16_t> prefillWidest;
       for (const uint32_t chunk : {kMaximumRows, 27u, 9u}) {
         MoeConfig config{MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores), MoeExpertSimdgroups::Eight, tile};
         config.mxfp4Native = backend.capabilities().appleGpuFamily >= 10;
@@ -661,6 +674,16 @@ int moe(MetalBackend &backend) {
         if (const size_t diffs = dispatchDiffs(rows, widest)) {
           printf("  %s: %zu rows differ from the four-lane dispatch FAIL\n", label.c_str(), diffs);
           ++failures;
+        }
+        if (prefillWidest.empty()) {
+          prefillWidest = rows;
+        } else {
+          const size_t shared = std::min(rows.size(), prefillWidest.size());
+          const size_t bit = bitwisePrefixDiff(rows, prefillWidest);
+          if (bit != shared) {
+            printf("  %s: first bitwise prefill mismatch at element %zu FAIL\n", label.c_str(), bit);
+            ++failures;
+          }
         }
       }
       printf("%-20s %s decode B1-4, prefill 263/27/9: gate/up %.2f%% and down %.2f%% of outputs differ from bf16(fp64), "
@@ -685,10 +708,15 @@ int moe(MetalBackend &backend) {
         const std::string label = formats + " prefill rows=" + std::to_string(rows) +
                                   (router == FloatTile::NeuralAccelerator ? " (accelerator router)" : "");
         const std::vector<uint16_t> result = runPlan(backend, m, b, plan, true, products, stats, label);
-        if (widest.empty()) widest = result;
-        else if (const size_t diffs = dispatchDiffs(result, widest)) {
-          printf("  %s: %zu rows differ from the %u-row chunk FAIL\n", label.c_str(), diffs, kMaximumRows);
-          ++failures;
+        if (widest.empty()) {
+          widest = result;
+        } else {
+          const size_t shared = std::min(result.size(), widest.size());
+          const size_t bit = bitwisePrefixDiff(result, widest);
+          if (bit != shared) {
+            printf("  %s: first bitwise prefill mismatch at element %zu FAIL\n", label.c_str(), bit);
+            ++failures;
+          }
         }
       }
       printf("%-20s staged   prefill 263/33/16 (32-row tiles, %s router): gate/up %.2f%% and down %.2f%% of outputs "
@@ -928,6 +956,7 @@ int moeUngated(MetalBackend &backend) {
         ++failures;
       }
     }
+    std::vector<uint16_t> prefillWidest;
     for (const uint32_t chunk : {kMaximumRows, 27u, 9u}) {
       MoeConfig config{MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores), MoeExpertSimdgroups::Eight,
                        MoeGgufTile::Staged};
@@ -938,9 +967,21 @@ int moeUngated(MetalBackend &backend) {
         printf("  %s: %zu rows differ from the four-lane dispatch FAIL\n", label.c_str(), diffs);
         ++failures;
       }
+      if (prefillWidest.empty()) {
+        prefillWidest = rows;
+      } else {
+        const size_t shared = std::min(rows.size(), prefillWidest.size());
+        const size_t bit = bitwisePrefixDiff(rows, prefillWidest);
+        if (bit != shared) {
+          printf("  %s: first bitwise prefill mismatch at element %zu FAIL\n", label.c_str(), bit);
+          ++failures;
+        }
+      }
     }
-    // The 32-row tiles, on both router float tiles.
+    // The 32-row tiles, on both router float tiles. Compare chunks against
+    // the wide prefill chunk, never the numerically distinct decode path.
     for (const FloatTile router : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
+      std::vector<uint16_t> prefillWidest32;
       for (const uint32_t rows : {kMaximumRows, 33u, 16u}) {
         MoeConfig config{MoeExpertTile::M32};
         config.ggufRouterTile = router;
@@ -948,9 +989,16 @@ int moeUngated(MetalBackend &backend) {
         const std::string label = formats + " prefill rows=" + std::to_string(rows) +
                                   (router == FloatTile::NeuralAccelerator ? " (accelerator router)" : "");
         const std::vector<uint16_t> result = runUngated(backend, m, b, plan, stats, label);
-        if (const size_t diffs = dispatchDiffs(result, widest)) {
-          printf("  %s: %zu rows differ from the %u-row chunk FAIL\n", label.c_str(), diffs, kMaximumRows);
-          ++failures;
+        if (prefillWidest32.empty()) {
+          prefillWidest32 = result;
+        } else {
+          const size_t shared = std::min(result.size(), prefillWidest32.size());
+          const size_t bit = bitwisePrefixDiff(result, prefillWidest32);
+          if (bit != shared) {
+            printf("  %s: first bitwise prefill mismatch at element %zu FAIL\n",
+                   label.c_str(), bit);
+            ++failures;
+          }
         }
       }
     }

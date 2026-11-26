@@ -372,15 +372,24 @@ void requireImageableLayout(const TargetLayout &layout) {
 std::shared_ptr<affine::PlannedCheckpoint> plan(const std::filesystem::path &directory,
                                                 const TargetLayout &layout, bool oq = false) {
   requireImageableLayout(layout);
-  auto planned = std::make_shared<affine::PlannedCheckpoint>(directory);
+  bool shards = false;
+  for (const auto &entry : std::filesystem::directory_iterator(directory))
+    shards = shards || entry.path().extension() == ".safetensors";
+  const bool thin = !shards && std::filesystem::exists(directory / "packed-sources");
+  if (thin && oq)
+    throw WeightStoreError("thin oQ sources are not supported");
+  auto planned = std::make_shared<affine::PlannedCheckpoint>(directory, thin);
   const AffineArchHooks *hooks = affineHooksFor(layout);
-  if (hooks && hooks->validateConfiguration)
-    hooks->validateConfiguration(planned->source, layout);
-  const QuantResolver resolve = oq ? oqResolver(planned->source) : QuantResolver{};
+  if (!thin) {
+    if (hooks && hooks->validateConfiguration)
+      hooks->validateConfiguration(*planned->source, layout);
+  }
+  const QuantResolver resolve = oq ? oqResolver(*planned->source) : QuantResolver{};
   planned->images = hooks && hooks->planImages
-                        ? hooks->planImages(&planned->source, layout, resolve)
+                        ? hooks->planImages(thin ? nullptr : planned->source.get(), layout, resolve)
                         : gdnImages(layout, resolve);
-  for (Image &image : planned->images) affine::bind(image, planned->source);
+  if (!thin)
+    for (Image &image : planned->images) affine::bind(image, *planned->source);
   return planned;
 }
 
@@ -417,24 +426,29 @@ ImagePlan AffineTargetLoader::imagePlan(size_t index, std::string_view directory
   const affine::Image &image = planned_->images.at(index);
   // The packed cache is checked once, lazily: the source plan the stamp
   // embeds must exist first.
-  if (packed_ < 0)
-    packed_ = affine::packedCacheUsable(directory_, planned_->images) ? 1 : 0;
+  if (packed_ < 0) {
+    packedDirectory_ = affine::packedReadDirectory(directory_, planned_->images);
+    packed_ = packedDirectory_.empty() ? 0 : 1;
+  }
   if (packed_)
-    return packedImage(directory_ / image.name,
+    return packedImage(packedDirectory_ / image.name,
                        std::string(directory) + "/" + image.name, image.magic,
                        image.layer, image.type);
   ImagePlan result = affine::imagePlan(planned_, index, directory, &images_.backend());
-  const std::filesystem::path cached = directory_ / image.name;
+  const std::filesystem::path cacheDirectory =
+      affine::packedWriteDirectory(directory_, planned_->images);
+  const std::filesystem::path cached = cacheDirectory / image.name;
   const std::vector<Image> *plan_images = &planned_->images;
-  result.write = [write = std::move(result.write), cached, plan_images,
-                  directory = directory_](std::span<uint8_t> destination,
-                                          const metal::MetalBuffer &buffer) {
+  result.write = [write = std::move(result.write), cached, cacheDirectory,
+                  plan_images, directory = directory_](
+                     std::span<uint8_t> destination,
+                     const metal::MetalBuffer &buffer) {
     write(destination, buffer);
-    // Persist the image beside the sources: the next load reads it
-    // verbatim. Cache writes are best effort — an unwritable package
-    // just loads the slow way every time.
+    // Persist the image in the shared packed cache when it is writable,
+    // falling back to the legacy in-package location. Cache writes are best
+    // effort — an unwritable cache just loads the slow way every time.
     affine::cachePackedImage(cached, destination);
-    affine::refreshPackedStamp(directory, *plan_images);
+    affine::refreshPackedStamp(cacheDirectory, directory, *plan_images);
   };
   return result;
 }

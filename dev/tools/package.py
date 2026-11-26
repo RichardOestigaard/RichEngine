@@ -32,6 +32,7 @@ INSTALL_FILES = (
     "pack.py",
     "pack_layouts.py",
     "upstream.py",
+    "gc.py",
     "gguf.py",
     "catalog.py",
     "autotune.py",
@@ -137,7 +138,7 @@ MACOS_SYMBOLS = {"26": "tahoe", "27": "golden_gate"}
 
 
 def formula(version, url, checksum, macos_min):
-    macos_symbol = MACOS_SYMBOLS.get(macos_min)
+    macos_symbol = MACOS_SYMBOLS.get(macos_min.split(".", 1)[0])
     if macos_symbol is None:
         raise ValueError(f"no Homebrew macOS symbol known for {macos_min}")
     # Inputs are encoded as Ruby double-quoted literals with the backslash,

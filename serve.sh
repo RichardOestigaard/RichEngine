@@ -13,7 +13,31 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 PORT="${PORT:-8000}"
 CHAT_MODEL="${CHAT_MODEL:-LiquidAI/LFM3-1.7B-MLX-4bit}"
 DECISION_MODEL="${DECISION_MODEL:-LiquidAI/d1-2B-GGUF:Q8_0}"
-MODELS_DIR="${MODELS_DIR:-$ROOT/install/models}"
+if [ -z "${MODELS_DIR:-}" ]; then
+	# Mirror install/paths.py: explicit environment, config, then the
+	# existing source-checkout store or the per-user default.
+	if [ -n "${RICHENGINE_MODELS_DIR:-}" ]; then
+		MODELS_DIR="$RICHENGINE_MODELS_DIR"
+	else
+		USER_DATA="$HOME/Library/Application Support/RichEngine"
+		if [ -r "$USER_DATA/config.json" ]; then
+			MODELS_DIR=$(sed -n 's/.*"models_dir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+				"$USER_DATA/config.json" | head -1)
+			case $MODELS_DIR in
+				"~"*) MODELS_DIR="$HOME${MODELS_DIR#\~}" ;;
+				""|/*) ;;
+				*) MODELS_DIR="$USER_DATA/$MODELS_DIR" ;;
+			esac
+		fi
+		if [ -z "$MODELS_DIR" ]; then
+			if [ -e "$ROOT/install/models" ] || [ -L "$ROOT/install/models" ]; then
+				MODELS_DIR="$ROOT/install/models"
+			else
+				MODELS_DIR="$USER_DATA/models"
+			fi
+		fi
+	fi
+fi
 ENGINE_BIN="${ENGINE_BIN:-$ROOT/build/richengine}"
 PYTHON="$ROOT/.venv/bin/python"
 LOG="/tmp/richengine.log"

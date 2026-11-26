@@ -3,24 +3,24 @@
 import hashlib
 import json
 import os
+import queue
 import re
 import secrets
 import threading
 from collections import OrderedDict
 from contextlib import contextmanager
-import queue
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from itertools import count
 from pathlib import Path
 
+from . import audio as audio_input
 from . import constraints, decisions, json_codec, judgments, reply_guards
 from . import dfa as dfa_compiler
-from . import audio as audio_input
 from . import images as image_input
-from . import video as video_input
 from . import protocol as wire
 from . import serving as serving_mod
+from . import video as video_input
 from .api_shapes import (
     IMAGE_PAD_TOKEN,
     canonical_responses_input,
@@ -1684,7 +1684,7 @@ class Frontend:
             raise APIError(400, '"session" must be a non-negative integer')
         docs = [text]
         if body.get("emit_variants"):
-            docs.append("".join("+" + l for l in text.splitlines(keepends=True)))
+            docs.append("".join("+" + line for line in text.splitlines(keepends=True)))
             docs.append(json.dumps(text))
         pushed = []
         for doc in docs:

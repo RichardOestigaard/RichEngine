@@ -3,8 +3,9 @@
 A selection link under the models root (paths.MODELS) is OWNER/REPO[:VARIANT],
 or .selections/<hash of the selection> for a selection with source options.
 What it links lives in a dot-directory: an assembly is .resolved/<SHA-256 of
-its record> (assembly.py), metadata derived from a GGUF is .metadata/<key>
-and a locally packed package is .packed/<key> (pack.py). .install.lock
+its record> (assembly.py), metadata derived from a GGUF is .metadata/<key>,
+a locally packed package is .packed/<key> (pack.py) and source content owned
+by the store is .blobs/<content digest>. .install.lock
 serializes every write, and a directory named by a staging prefix beside an
 entry is one an interrupted write left, which garbage collection removes.
 
@@ -20,6 +21,7 @@ from __future__ import annotations
 RESOLVED = ".resolved"
 METADATA = ".metadata"
 PACKED = ".packed"
+BLOBS = ".blobs"
 SELECTIONS = ".selections"
 INSTALL_LOCK = ".install.lock"
 

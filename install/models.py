@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import sys
 import tempfile
@@ -238,7 +239,13 @@ def json_bytes(value) -> bytes:
 
 
 def selection_link(
-    models: Path, model_id: str, *, revision=None, language_only=False, draft_model=None
+    models: Path,
+    model_id: str,
+    *,
+    revision=None,
+    language_only=False,
+    draft_model=None,
+    thin=False,
 ) -> Path:
     """The selection link of model_id with these source options:
     OWNER/REPO[:VARIANT] under models for the model alone, else
@@ -252,13 +259,15 @@ def selection_link(
         revision
         or language_only
         or draft_model
+        or thin
         or local_path is not None
         or Path(model_id).is_absolute()
         or model_id.startswith("local:")
     ):
-        selection = json.dumps(
-            [key_id, revision, language_only, draft_model], separators=(",", ":")
-        )
+        options = [key_id, revision, language_only, draft_model]
+        if thin:
+            options.append(True)
+        selection = json.dumps(options, separators=(",", ":"))
         return (
             models / layout.SELECTIONS / hashlib.sha256(selection.encode()).hexdigest()
         )
@@ -294,11 +303,19 @@ class Selection:
     language_only: bool
     draft_model: str | None
     models_root: Path
+    thin: bool
     link: Path
 
     @classmethod
     def of(
-        cls, models_root, model, *, revision=None, language_only=False, draft_model=None
+        cls,
+        models_root,
+        model,
+        *,
+        revision=None,
+        language_only=False,
+        draft_model=None,
+        thin=False,
     ):
         path = _local_directory(model)
         if path is not None:
@@ -309,13 +326,14 @@ class Selection:
             repo_id, variant = split_model_id(model)
             display, link_key = model, model
         models_root = Path(models_root).resolve()
-        link = selection_link(
-            models_root,
-            link_key,
-            revision=revision,
-            language_only=language_only,
-            draft_model=draft_model,
-        )
+        options = {
+            "revision": revision,
+            "language_only": language_only,
+            "draft_model": draft_model,
+        }
+        if thin:
+            options["thin"] = True
+        link = selection_link(models_root, link_key, **options)
         return cls(
             display,
             repo_id,
@@ -324,6 +342,7 @@ class Selection:
             language_only,
             draft_model,
             models_root,
+            thin,
             link,
         )
 
@@ -336,6 +355,87 @@ def installation_kind(link: Path) -> InstallationKind | None:
     if (link / layout.PACKAGE_MANIFEST).exists():
         return PACKAGE
     return None
+
+
+def _legacy_repo_id(link: Path) -> str:
+    """The Hub repository ID of a legacy package's installed snapshot."""
+    from . import legacy
+
+    snapshot = legacy.installed_snapshot(link)
+    folder = snapshot.parent.parent.name
+    if not folder.startswith("models--"):
+        raise ModelError(
+            f"installed package is not in a Hugging Face model cache: {snapshot}"
+        )
+    return folder.removeprefix("models--").replace("--", "/")
+
+
+def verify_installation(link: Path, *, repo_id=None, full=False):
+    """Verify the assembly or package one installed selection link serves."""
+    from . import assembly, legacy, pack
+
+    kind = installation_kind(link)
+    if kind == ASSEMBLY:
+        return assembly.verify(link, full=full)
+    if kind == PACKAGE:
+        if pack.is_built(link):
+            return pack.verify(link, full=full)
+        return legacy.verify(
+            link, repo_id or _legacy_repo_id(link), full=full
+        )
+    raise ModelError(f"no model is installed at {link}")
+
+
+def _installation_pin_pairs(link: Path):
+    """The (snapshot, repository ID) pairs an installation may have pinned."""
+    from . import assembly, hub, legacy, pack
+
+    kind = installation_kind(link)
+    if kind == ASSEMBLY:
+        return assembly.recorded_pins(link)
+    if kind != PACKAGE:
+        return []
+    if not pack.is_built(link):
+        snapshot = legacy.installed_snapshot(link)
+        return [(snapshot, _legacy_repo_id(link))]
+    pairs = []
+    for source in pack.manifest_of(link).get("sources", {}).values():
+        if not isinstance(source, dict):
+            continue
+        repo, revision = source.get("repo"), source.get("revision")
+        if isinstance(repo, str) and is_hex_digest(revision, 40):
+            pairs.append((hub.snapshot(repo, revision), repo))
+    return pairs
+
+
+def remove_installation(models_root: Path, link: Path):
+    """Remove one selection's installation and collect entries only it used.
+
+    The link itself is the removal boundary: shared assemblies, blobs and Hub
+    snapshots stay until their last selection or pin is gone. A server holding
+    the assembly keeps it valid for that server's lifetime.
+    """
+    from . import assembly, hub
+
+    models_root = Path(models_root)
+    link = Path(link)
+    if link not in selection_links(models_root):
+        raise ModelError(f"{link} is not a selection under {models_root}")
+    if installation_kind(link) is None:
+        raise ModelError(f"no model is installed at {link}")
+    with installation_lock(models_root):
+        pins = [
+            hub.pinned(snapshot, link) for snapshot, _ in _installation_pin_pairs(link)
+        ]
+        link.unlink()
+        parent = link.parent
+        if parent != models_root and parent.name != layout.SELECTIONS:
+            try:
+                parent.rmdir()
+            except OSError:
+                pass
+        hub.retire_other_pins([], pins)
+        assembly.collect_garbage(models_root)
 
 
 @contextmanager
@@ -375,9 +475,268 @@ def link_selection(link: Path, target: Path):
         stage.rmdir()
 
 
+def _rewrite_internal_links(source: Path, destination: Path):
+    """Move copied internal links and assembly file records into destination.
+
+    Assembly records name absolute file paths. Rewriting one changes the
+    record digest, so its .resolved directory is renamed to the new digest and
+    selection links are pointed there in the same pass.
+    """
+    source_real = Path(os.path.realpath(source))
+    destination_real = Path(os.path.realpath(destination))
+    resolved = destination_real / ".resolved"
+    renamed = {}
+
+    def inside_source(path):
+        try:
+            return Path(os.path.realpath(path)).relative_to(source_real)
+        except ValueError:
+            return None
+
+    if resolved.is_dir():
+        for assembly_dir in sorted(resolved.iterdir()):
+            record_path = assembly_dir / "model.json"
+            if not record_path.is_file():
+                continue
+            try:
+                record = json.loads(record_path.read_text())
+            except ValueError:
+                continue
+            changed = False
+            files = record.get("files")
+            if isinstance(files, dict):
+                for entry in files.values():
+                    if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+                        continue
+                    inside = inside_source(entry["path"])
+                    if inside is None:
+                        continue
+                    entry["path"] = str(destination_real / inside)
+                    changed = True
+            if not changed:
+                continue
+            encoded = json_bytes(record)
+            record_path.write_bytes(encoded)
+            digest = hashlib.sha256(encoded).hexdigest()
+            if assembly_dir.name != digest:
+                renamed[assembly_dir.name] = digest
+                os.rename(assembly_dir, resolved / digest)
+
+    for link in destination.rglob("*"):
+        if not link.is_symlink():
+            continue
+        raw = os.readlink(link)
+        if not os.path.isabs(raw):
+            continue
+        inside = inside_source(raw)
+        if inside is None:
+            continue
+        parts = inside.parts
+        if len(parts) >= 2 and parts[0] == ".resolved":
+            assembly_name = renamed.get(parts[1], parts[1])
+            inside = Path(".resolved", assembly_name, *parts[2:])
+        target = destination_real / inside
+        link.unlink()
+        link.symlink_to(target, target_is_directory=target.is_dir())
+
+
+def _write_config(config):
+    """Atomically write DATA/config.json, preserving unrelated keys."""
+    paths.DATA.mkdir(parents=True, exist_ok=True)
+    path = paths.DATA / "config.json"
+    existing = {}
+    try:
+        loaded = json.loads(path.read_text())
+        existing = loaded if isinstance(loaded, dict) else {}
+    except (OSError, ValueError):
+        pass
+    existing.update(config)
+    temporary = tempfile.NamedTemporaryFile(
+        dir=paths.DATA, prefix=".config-", delete=False, mode="w"
+    )
+    try:
+        with temporary:
+            json.dump(existing, temporary, indent=2, sort_keys=True)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary.name, path)
+    except BaseException:
+        Path(temporary.name).unlink(missing_ok=True)
+        raise
+
+
+def _tree_file_totals(root: Path):
+    """Regular-file count and bytes copytree's copy function will process."""
+    files = 0
+    bytes_ = 0
+    for directory, _, names in os.walk(root):
+        for name in names:
+            path = Path(directory) / name
+            try:
+                if path.is_symlink():
+                    continue
+                size = path.stat().st_size
+            except OSError:
+                continue
+            files += 1
+            bytes_ += size
+    return files, bytes_
+
+
+def _tree_bytes(root: Path):
+    """The apparent bytes of a tree, following no symlink."""
+    total = 0
+    for directory, dirs, files in os.walk(root):
+        for name in (*dirs, *files):
+            try:
+                total += (Path(directory) / name).lstat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def _format_bytes(bytes_: int) -> str:
+    value = float(bytes_)
+    for unit in ("B", "K", "M", "G", "T"):
+        if value < 1024 or unit == "T":
+            return f"{value:.1f}{unit}" if unit != "B" else f"{int(value)}B"
+        value /= 1024
+    return f"{bytes_}B"
+
+
+def verify_installations(models_root: Path) -> int:
+    """Quick-verify every installed selection under models_root; return the count."""
+    verified = 0
+    for link in selection_links(Path(models_root)):
+        if installation_kind(link) is not None:
+            verify_installation(link, full=False)
+            verified += 1
+    return verified
+
+
+def migrate_models_root(destination: Path):
+    """Copy the store chosen without --models to destination and configure it.
+
+    Regular files are hardlinked where the filesystem permits, so same-volume
+    migration does not duplicate weights. Symlinks are preserved, except links
+    into the copied store itself, which are rewritten to the new copy. The new
+    copy is verified before config.json starts pointing at it.
+    """
+    source, source_kind = paths.models_root()
+    destination = destination.expanduser().absolute()
+    if not source.is_dir():
+        raise ModelError(f"the current models root does not exist: {source}")
+    source_real = Path(os.path.realpath(source))
+    destination_real = Path(os.path.realpath(destination))
+    if source_real == destination_real:
+        raise ModelError("the migration destination is already the models root")
+    if destination_real.is_relative_to(source_real):
+        raise ModelError("the migration destination cannot be inside the models root")
+    if destination.exists() and any(destination.iterdir()):
+        raise ModelError(f"the migration destination is not empty: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    total_files, total_bytes = _tree_file_totals(source)
+    progress = {"files": 0, "bytes": 0, "next": 0.1}
+    print(
+        f"Copying {source} -> {destination}: {total_files} files, "
+        f"{_format_bytes(total_bytes)} (hardlinked where possible)...",
+        flush=True,
+    )
+
+    def copy_with_progress(file_source, file_destination):
+        file_source = Path(file_source)
+        file_destination = Path(file_destination)
+        try:
+            size = file_source.stat().st_size
+        except OSError:
+            size = 0
+        try:
+            os.link(file_source, file_destination)
+        except FileExistsError:
+            pass
+        except OSError:
+            # Cross-volume copies can sit on one multi-GB weight for minutes:
+            # progress within the file matters more than a file count does.
+            copied_file = 0
+            next_file_report = 256 * 1024 * 1024
+            temporary = tempfile.NamedTemporaryFile(
+                dir=file_destination.parent, prefix=".migrating-", delete=False
+            )
+            temporary_path = Path(temporary.name)
+            try:
+                with temporary as output, file_source.open("rb") as input:
+                    while chunk := input.read(8 * 1024 * 1024):
+                        output.write(chunk)
+                        copied_file += len(chunk)
+                        if copied_file >= next_file_report:
+                            print(
+                                f"migrate: {file_source.name} "
+                                f"{_format_bytes(copied_file)}/{_format_bytes(size)}",
+                                flush=True,
+                            )
+                            next_file_report += 256 * 1024 * 1024
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temporary_path, file_destination)
+                shutil.copystat(file_source, file_destination)
+            except BaseException:
+                temporary_path.unlink(missing_ok=True)
+                raise
+        progress["files"] += 1
+        progress["bytes"] += size
+        complete = progress["files"] == total_files
+        fraction = progress["bytes"] / total_bytes if total_bytes else 1.0
+        if complete or fraction >= progress["next"]:
+            print(
+                f"migrate: {progress['files']}/{total_files} files, "
+                f"{_format_bytes(progress['bytes'])}/{_format_bytes(total_bytes)}",
+                flush=True,
+            )
+            while progress["next"] <= fraction:
+                progress["next"] += 0.1
+        return file_destination
+
+    with installation_lock(source):
+        shutil.copytree(
+            source,
+            destination,
+            symlinks=True,
+            copy_function=copy_with_progress,
+            ignore=shutil.ignore_patterns(".install.lock"),
+            dirs_exist_ok=True,
+        )
+        _rewrite_internal_links(source, destination)
+    try:
+        verified = verify_installations(destination)
+    except (ModelError, OSError) as error:
+        raise ModelError(
+            f"the migrated copy failed verification; config.json was not changed: {error}"
+        ) from error
+    _write_config({"models_dir": str(destination)})
+    print(f"Migrated models root {source} -> {destination}")
+    print(f"Verified {verified} migrated installation{'s' if verified != 1 else ''}.")
+    print(f"Recorded models_dir in {paths.DATA / 'config.json'}")
+    print(
+        f"The previous root was left in place at {source} "
+        f"({_format_bytes(_tree_bytes(source))}, resolved as {source_kind})."
+    )
+    print(
+        "Same-volume migration uses hardlinks: old and new files share inodes, "
+        "so removing the old root frees only data no new-root link still uses. "
+        "After a successful serve from the new root, remove the old root manually "
+        "(for example with rm -rf)."
+    )
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Install RichEngine runtime weights")
-    parser.add_argument("--models", type=Path, default=MODELS)
+    parser.add_argument(
+        "--models",
+        type=Path,
+        default=None,
+        help="models directory (default: RICHENGINE_MODELS_DIR, config.json or the install root's)",
+    )
     parser.add_argument(
         "--model",
         type=parse_model_id,
@@ -394,21 +753,51 @@ def parse_args(argv=None):
         action="store_true",
         help="skip vision preparation and loading",
     )
+    parser.add_argument(
+        "--thin",
+        action="store_true",
+        help=(
+            "experimental, MLX affine targets only: keep serving weights in the "
+            "packed cache and drop target payload links on the start after that "
+            "cache validates; the cache is RICHENGINE_PACKED_CACHE_ROOT or "
+            "~/Library/Caches/RichEngine/packed, and losing it downloads and "
+            "rebuilds the payload"
+        ),
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare")
     commands.add_parser("verify").add_argument("--full", action="store_true")
     commands.add_parser("link", help="print the selection link")
+    commands.add_parser("root", help="print the resolved models root and its source")
+    commands.add_parser(
+        "migrate",
+        help="copy the current models root to --models and record it in config.json",
+    )
     commands.add_parser(
         "local", help="list the models the local caches hold (LM Studio, oMLX)"
     )
     args = parser.parse_args(argv)
-    if args.command != "local" and not args.model:
+    if args.command not in ("local", "root", "migrate") and not args.model:
         parser.error("--model is required")
     return args
 
 
 def main(argv=None):
     args = parse_args(argv)
+    models_root, models_source = paths.models_root(args.models)
+    if args.command == "root":
+        print(models_root)
+        print(f"source: {models_source}")
+        return 0
+    if args.command == "migrate":
+        try:
+            if args.models is None:
+                raise ModelError("migrate requires --models DESTINATION")
+            migrate_models_root(args.models)
+        except (ModelError, OSError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
+        return 0
     if args.command == "local":
         from . import local
 
@@ -426,16 +815,17 @@ def main(argv=None):
             ) + verdict
             print(f"{candidate.name:<{width}}  {candidate.format:<6} {detail} ({size})")
         return 0
-    # The installers import this module, so it imports them once it exists.
-    from . import assembly, legacy, pack, upstream
+    # The installer imports this module, so it imports it once it exists.
+    from . import upstream
 
     try:
         selection = Selection.of(
-            args.models,
+            models_root,
             args.model,
             revision=args.revision,
             language_only=args.language_only,
             draft_model=args.draft_model,
+            thin=args.thin,
         )
         if args.command == "link":
             print(selection.link)
@@ -446,18 +836,11 @@ def main(argv=None):
         if args.command == "prepare":
             upstream.prepare(selection)
         else:
-            kind = installation_kind(selection.link)
-            if kind == ASSEMBLY:
-                assembly.verify(selection.link, full=args.full)
-            elif kind == PACKAGE:
-                # A locally packed package (install/pack.py) verifies against
-                # its own manifest, not a Hub snapshot's.
-                if pack.is_built(selection.link):
-                    pack.verify(selection.link, full=args.full)
-                else:
-                    legacy.verify(selection.link, selection.repo_id, full=args.full)
-            else:
-                raise ModelError(f"{args.model} is not installed in {args.models}")
+            if installation_kind(selection.link) is None:
+                raise ModelError(f"{args.model} is not installed in {models_root}")
+            verify_installation(
+                selection.link, repo_id=selection.repo_id, full=args.full
+            )
             print(
                 f"RichEngine model {args.model} preflight passed "
                 f"({'full' if args.full else 'quick'})."

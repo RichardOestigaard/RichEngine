@@ -319,8 +319,8 @@ class ServedModelNamesTests(unittest.TestCase):
         with (
             mock.patch.object(api, "parse_args", return_value=args),
             mock.patch.object(model_host, "load_thinking_key", return_value=None),
-            mock.patch.object(
-                model_host.AutoTokenizer, "from_pretrained", return_value=object()
+            mock.patch(
+                "transformers.AutoTokenizer.from_pretrained", return_value=object()
             ),
             mock.patch.object(model_host, "validate_tokenizer"),
             mock.patch.object(model_host, "ChatTemplates"),

@@ -315,6 +315,9 @@ public:
               bool sparse = false, uint32_t committedTokens = 0,
               uint32_t int8QueriesFromPages = 0,
               uint32_t prefillPagesPerSplit = 0);
+  [[nodiscard]] static PrefillAttentionPlan
+  prefillWideInt8Plan(const PrefillAttentionPlan &base, uint32_t queryHeads,
+                      kv::Layout layout);
   // The DiffusionGemma canvas splits: same grids and workspace, but every
   // row admits the whole visible range — the read-only encoder prefix (its
   // pages) plus the canvas positions (scratch pages the host appended to

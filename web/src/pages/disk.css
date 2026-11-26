@@ -26,6 +26,20 @@
 .store-search { width: 180px; padding: 5px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); font-size: 13px }
 .store-sort { padding: 5px 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); color: var(--muted); font-size: 13px }
 
+/* Location rows: the path truncates instead of pushing the size off. */
+.location-path {
+  min-width: 0;
+  max-width: 65%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: copy;
+}
+.location-path:hover { color: var(--accent) }
+
+/* GC plan groups reuse the dedupe-group layout. */
+.gc-group .panel-row .badge { flex-shrink: 0 }
+
 /* KV disk cache meter. */
 .kv-meter { padding: 14px 16px 8px }
 .kv-meter .meter > i { transition: width .4s ease }

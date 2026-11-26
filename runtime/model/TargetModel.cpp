@@ -855,18 +855,16 @@ void TargetModel::addPrefillFfn(PrefillStep &step, uint32_t index, const TargetL
   const auto moe = [&](const ops::MoeWeights &weights) {
     ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm,
                              b.normalized, geometry_.hiddenSize, step.rows);
-    // A packed step's grouped expert passes see every sequence's rows: on
-    // the staged GGUF tile a route's summation order depends on how many
-    // rows its expert's tile holds (moe_expert_slab.h,
-    // MOE_GGUF_COLUMN_ROWS), so co-packed routes change a sequence's bits
-    // versus its solo chunk. Run the block per sequence — each on the plan
-    // its own rows would have taken — so a request's output cannot depend
-    // on what it packed with.
+    // Composition-invariant staged GGUF prefill keeps a route on the same
+    // staged summation order however its expert tile is packed, so the
+    // block can batch every sequence together. The tuning escape hatch
+    // restores the old column tiles; with them a packed step's grouped
+    // passes still change solo bits, so keep the per-sequence fallback there.
     const bool stagedGguf =
         geometry_.moeShape().weightLayout == ops::WeightLayout::Block32 &&
         step.moe->configuration().ggufTile == ops::MoeGgufTile::Staged;
-    if (stagedGguf && step.sequences.size() > 1 &&
-        !step.sequences.front().canvas) {
+    if (stagedGguf && tuning().moeInvariantPrefillOff &&
+        step.sequences.size() > 1 && !step.sequences.front().canvas) {
       for (const TargetModelPrefillSequence &sequence : step.sequences) {
         const auto u16 = [&](const metal::MetalBuffer &buffer) {
           return rowsOf<uint16_t>(backend_, buffer, sequence.rowBegin,

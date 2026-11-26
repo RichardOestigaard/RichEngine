@@ -325,7 +325,15 @@ std::string runtimeStatusJson(
       << executorTelemetry.ngramChainLengthsExact[0];
   for (uint32_t i = 1; i < 16; ++i)
     out << "," << executorTelemetry.ngramChainLengthsExact[i];
-  out << "]}"
+  out << "]"
+      << ",\"agreement_queries\":"
+      << executorTelemetry.ngramAgreementQueries
+      << ",\"agreement_labels\":{\"top\":"
+      << executorTelemetry.ngramAgreementLabels[0]
+      << ",\"candidate\":" << executorTelemetry.ngramAgreementLabels[1]
+      << ",\"absent\":" << executorTelemetry.ngramAgreementLabels[2]
+      << ",\"unknown\":" << executorTelemetry.ngramAgreementLabels[3]
+      << "}}"
       << ",\"scheduler\":{\"queued\":" << scheduler.queued
       << ",\"waiting_resources\":" << scheduler.waitingResources
       << ",\"waiting_prefix\":" << scheduler.waitingPrefix

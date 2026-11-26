@@ -177,6 +177,7 @@ ModelDescriptor nemotronDescriptor(std::string name) {
   descriptor.tuning.ngramGpuMix = true;
   descriptor.tuning.ngramGpuMixMinWidth = 2;
   descriptor.tuning.ngramMixCorpusOnly = true;
+  descriptor.tuning.ngramDraftAgreement = true;
   return descriptor;
 }
 

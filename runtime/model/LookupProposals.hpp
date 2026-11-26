@@ -230,7 +230,7 @@ private:
 // A lookup token's agreement with the draft's candidates at its depth: the
 // lane's candidates at each proposal position, RICHENGINE_DRAFT_CANDIDATES a
 // position, most likely first (ops::DraftSelectorBuffers::candidates).
-[[nodiscard]] LookupAgreement lookupAgreement(uint32_t token, uint32_t depth, std::span<const uint32_t> candidates);
+[[nodiscard]] LookupAgreement lookupAgreement(uint32_t token, uint32_t depth, std::span<const uint32_t> candidates, uint32_t candidateStride = RICHENGINE_DRAFT_CANDIDATES);
 
 // What a decode cycle tells of the lookup chain verified on its lane
 // (LookupAcceptance::observe): the agreements of the chain's tokens it
@@ -251,6 +251,7 @@ struct LookupOutcome final {
 // until the first the target did not retain.
 [[nodiscard]] LookupOutcome lookupOutcome(std::span<const uint32_t> chain,
                                           std::span<const uint32_t> retained,
-                                          std::span<const uint32_t> candidates);
+                                          std::span<const uint32_t> candidates,
+                                          uint32_t candidateStride = RICHENGINE_DRAFT_CANDIDATES);
 
 } // namespace richengine::model

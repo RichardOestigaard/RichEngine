@@ -88,6 +88,7 @@ private:
   std::shared_ptr<affine::PlannedCheckpoint> planned_; // layers, head, embedding
   // -1 unchecked, 1 read the cache, 0 write it.
   int8_t packed_ = -1;
+  std::filesystem::path packedDirectory_;
 };
 
 // Every planned image of a layout, its sections at their offsets: the layers,

@@ -80,7 +80,28 @@ async function retryInstall(model?: string) {
 async function autoLoad(model: string) {
   if (!model) return;
   try {
-    await apiPost("/v1/models/load", { model });
+    const body: Record<string, unknown> = { model };
+    /* Optioned installs (thin, revision, draft, language-only) link under
+       .selections/<hash> — unreachable by bare model id. When no plain
+       link for the id exists, load the optioned row instead. */
+    try {
+      const res = await api<{
+        data?: { model?: string; selection?: string }[];
+      }>("/v1/models/available");
+      const rows = (res?.data ?? []).filter((entry) => entry.model === model);
+      const plain = rows.some(
+        (entry) => entry.selection && !entry.selection.startsWith(".selections/")
+      );
+      if (!plain) {
+        const optioned = rows.find((entry) =>
+          entry.selection?.startsWith(".selections/")
+        );
+        if (optioned?.selection) body.selection = optioned.selection;
+      }
+    } catch {
+      /* The load below still tries the plain id. */
+    }
+    await apiPost("/v1/models/load", body);
     storageSet(MODEL_KEY, model);
     window.dispatchEvent(
       new CustomEvent("richengine:model-changed", { detail: model })

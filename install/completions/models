@@ -4,12 +4,38 @@ set -eu
 
 completion_dir=$(CDPATH= cd -P "$(dirname "$0")" && pwd -P)
 root=$(CDPATH= cd -P "$completion_dir/../.." && pwd -P)
+if [ "$(uname -s)" = Darwin ]; then
+    user_data="$HOME/Library/Application Support/RichEngine"
+else
+    user_data="${XDG_DATA_HOME:-$HOME/.local/share}/RichEngine"
+fi
 if [ -f "$root/release.json" ]; then
-    data_dir="$HOME/Library/Application Support/RichEngine"
-    models_dir="$data_dir/models"
+    data_dir="$user_data"
 else
     data_dir="$root/build/runtime"
-    models_dir="$root/install/models"
+fi
+# Mirror install/paths.py's models_root resolution: environment, config,
+# then the existing source-checkout store or the per-user default.
+models_dir=${RICHENGINE_MODELS_DIR:-}
+if [ -z "$models_dir" ] && [ -r "$user_data/config.json" ]; then
+    models_dir=$(sed -n 's/.*"models_dir"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        "$user_data/config.json" | head -1)
+    case $models_dir in
+        "~"*) models_dir="$HOME${models_dir#\~}" ;;
+        ""|/*) ;;
+        *) models_dir="$user_data/$models_dir" ;;
+    esac
+fi
+if [ -z "$models_dir" ]; then
+    legacy="$root/install/models"
+    if [ -L "$legacy" ] && [ ! -f "$root/release.json" ]; then
+        link=$(readlink "$legacy")
+        case $link in /*) models_dir=$link ;; *) models_dir="$root/install/$link" ;; esac
+    elif [ -d "$legacy" ] && [ ! -f "$root/release.json" ]; then
+        models_dir="$legacy"
+    else
+        models_dir="$user_data/models"
+    fi
 fi
 # official-models.txt is generated from the RichEngine collection
 # (dev/tools/update_model_catalog.py); suggested-models.txt names the upstream

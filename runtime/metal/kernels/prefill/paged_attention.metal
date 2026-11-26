@@ -10,7 +10,8 @@
 // (RICHENGINE_ATTENTION_ACC16).
 template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement,
           uint HeadDim = RichKvHeadDimension, uint MPasses = 1,
-          bool Int8Queries = false, typename Accumulator = float>
+          bool Int8Queries = false, typename Accumulator = float,
+          uint RowsPerTile = RichPrefillTileRows>
 inline void richengine_prefill_attention_split_phase(
     device bfloat *queries, device bfloat *partials,
     device float *statistics, device const RichKvPage *page_table,
@@ -24,17 +25,17 @@ inline void richengine_prefill_attention_split_phase(
   uint kv_head = group.x;
   uint split = group.z;
   uint tile = group.y;
-  uint tile_start = tile * RichPrefillTileRows;
+  uint tile_start = tile * RowsPerTile;
   if (!richengine_prefill_attention_contract_valid(params) ||
       kv_head >= KVHeads || split >= params.split_count ||
       tile_start >= params.rows)
     return;
-  uint active_rows = min(RichPrefillTileRows, params.rows - tile_start);
+  uint active_rows = min(RowsPerTile, params.rows - tile_start);
   ulong tile_offset = (ulong(kv_head) * params.chunk_stride + tile_start) *
                       QueryHeadsPerKVHead * D;
   ulong slot = (ulong(tile) * KVHeads + kv_head) * params.split_count + split;
   richengine_paged_attention_tile<KVHeads, QueryHeadsPerKVHead,
-                              RICHENGINE_PREFILL_ATTENTION_TILE_ROWS, CacheElement,
+                              RowsPerTile, CacheElement,
                               HeadDim, MPasses, Int8Queries, Accumulator>(
       queries + tile_offset, page_table, params.kv, kv_head,
       params.committed_tokens + tile_start, active_rows, params.split_count, split,
@@ -44,28 +45,29 @@ inline void richengine_prefill_attention_split_phase(
 }
 
 template <uint KVHeads, uint QueryHeadsPerKVHead,
-          uint HeadDim = RichKvHeadDimension>
+          uint HeadDim = RichKvHeadDimension,
+          uint RowsPerTile = RichPrefillTileRows>
 inline void richengine_prefill_attention_reduce_phase(
     device const bfloat *partials, device const float *statistics,
     device bfloat *output,
     constant RichPrefillAttentionParams &params, uint3 group,
     uint thread_index, threadgroup float *weights,
     threadgroup float *group_values, RichDuoAttentionPolicy duo = {}) {
-  constexpr ushort M = RICHENGINE_PREFILL_ATTENTION_TILE_ROWS * QueryHeadsPerKVHead;
+  constexpr ushort M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr ushort D = HeadDim;
   uint kv_head = group.x;
   uint fused_row = group.y;
   uint tile = group.z;
-  uint tile_start = tile * RichPrefillTileRows;
+  uint tile_start = tile * RowsPerTile;
   if (!richengine_prefill_attention_contract_valid(params) ||
       kv_head >= KVHeads || fused_row >= M || thread_index >= D ||
       tile_start >= params.rows)
     return;
-  uint active_rows = min(RichPrefillTileRows, params.rows - tile_start);
+  uint active_rows = min(RowsPerTile, params.rows - tile_start);
   ulong tile_offset = (ulong(kv_head) * params.chunk_stride + tile_start) *
                       QueryHeadsPerKVHead * D;
   richengine_attention_reduce_row<QueryHeadsPerKVHead,
-                              RICHENGINE_PREFILL_ATTENTION_TILE_ROWS, HeadDim>(
+                              RowsPerTile, HeadDim>(
       partials, statistics, output + tile_offset,
       params.committed_tokens + tile_start, active_rows, params.split_count,
       (ulong(tile) * KVHeads + kv_head) * params.split_count, fused_row,
@@ -130,6 +132,30 @@ PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv4_g4_a16, 4, 4, bfloat, RichK
 PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g8_a16, 2, 8, int8_t, RichKvHeadDimension, 1, false, bfloat)
 PAGED_PREFILL_SPLIT(prefill_attention_int4_split_kv2_g8_a16, 2, 8, RichKvPacked4, RichKvHeadDimension, 1, false, bfloat)
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8_a16, 2, 8, bfloat, RichKvHeadDimension, 1, false, bfloat)
+
+[[max_total_threads_per_threadgroup(256)]] kernel void prefill_attention_q8_split_kv4_g4_m16(
+    device bfloat *queries [[buffer(0)]],
+    device bfloat *partials [[buffer(1)]],
+    device float *statistics [[buffer(2)]],
+    device const RichKvPage *page_table [[buffer(3)]],
+    constant RichPrefillAttentionParams &params [[buffer(4)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  constexpr uint M = 64;
+  constexpr uint N = RichKvPageTokens;
+  alignas(16) threadgroup float scores[M * N];
+  alignas(16) threadgroup bfloat probabilities[2 * M * N];
+  threadgroup float row_max[M];
+  threadgroup float row_sum[M];
+  threadgroup float previous_scale[M];
+  threadgroup atomic<uint, thread_scope_threadgroup> rescale;
+  richengine_prefill_attention_split_phase<4, 4, int8_t,
+                                           RichKvHeadDimension, 1, false,
+                                           float, 16>(
+      queries, partials, statistics, page_table, params, scores,
+      probabilities, row_max, row_sum, previous_scale, &rescale,
+      group, thread_index);
+}
 #undef PAGED_PREFILL_SPLIT
 
 kernel void prefill_attention_reduce(
@@ -156,6 +182,20 @@ kernel void prefill_attention_reduce_kv4_g4(
   threadgroup float weights[RichPrefillMaximumSplits];
   threadgroup float group_values[8];
   richengine_prefill_attention_reduce_phase<4, 4>(
+      partials, statistics, output, params, group, thread_index, weights,
+      group_values);
+}
+
+kernel void prefill_attention_reduce_kv4_g4_m16(
+    device const bfloat *partials [[buffer(0)]],
+    device const float *statistics [[buffer(1)]],
+    device bfloat *output [[buffer(2)]],
+    constant RichPrefillAttentionParams &params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  threadgroup float weights[RichPrefillMaximumSplits];
+  threadgroup float group_values[8];
+  richengine_prefill_attention_reduce_phase<4, 4, RichKvHeadDimension, 16>(
       partials, statistics, output, params, group, thread_index, weights,
       group_values);
 }

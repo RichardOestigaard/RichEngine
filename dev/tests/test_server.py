@@ -25,7 +25,8 @@ from tokenizers import Tokenizer, decoders, models
 from dev.tests.engine import native_peer
 from dev.tests.engine.test_documents import pdf_bytes
 from dev.tests.tool_output import argument_grammar, project, tool_policy
-from install import families, gguf
+from install import families, gguf, launcher
+from install import paths as install_paths
 from server import (
     api_shapes,
     decisions,
@@ -41,6 +42,7 @@ from server import (
 )
 from server import backend as backend_api
 from server import constraints as generation_constraints
+from server import disk as server_disk
 from server import errors as api_errors
 from server import frontend as request_frontend
 from server import model_host as hosting
@@ -582,6 +584,7 @@ def main_args(**overrides):
             "cache_dir": None,
             "decode_share": None,
             "disable_ane": False,
+            "recalibrate_ane": False,
             "moe_union": None,
             "canvas_profile": "paper",
             "shared_prefix_state": True,
@@ -2761,6 +2764,9 @@ class ServerTest(unittest.TestCase):
 
         app.latencies = LatencyMetrics()
         app.max_context = 1024
+        # __init__'s serving-contract fields, defaulted as a towerless
+        # contract serves them: no span markers wrap the widened pad run.
+        app.vision_spec = serving.VisionSpec()
         quoted = "中文 📷 <|vision_start|><|image_pad|><|vision_end|>"
         messages = [
             {"role": "system", "content": "Document: " + api_shapes.IMAGE_PAD_TOKEN},
@@ -4692,8 +4698,9 @@ class ServerTest(unittest.TestCase):
         tokenizer = object()
         with (
             mock.patch.object(hosting, "load_thinking_key", return_value=None),
-            mock.patch.object(
-                hosting.AutoTokenizer, "from_pretrained", return_value=tokenizer
+            # model_host imports AutoTokenizer lazily, while the engine loads.
+            mock.patch(
+                "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer
             ),
             mock.patch.object(hosting, "validate_tokenizer") as validate,
             mock.patch.object(hosting, "ChatTemplates"),
@@ -4722,7 +4729,11 @@ class ServerTest(unittest.TestCase):
             startup_timeout=hosting.NATIVE_START_TIMEOUT,
             pending_limit=1,
             eager_start=False,
-            env=None,
+            env=mock.ANY,
+        )
+        self.assertEqual(
+            runtime_type.call_args.kwargs["env"]["RICHENGINE_PACKED_CACHE_ROOT"],
+            str(install_paths.packed_cache_root()),
         )
         backend_type.assert_called_once_with(
             runtime,
@@ -4749,8 +4760,8 @@ class ServerTest(unittest.TestCase):
         backend = mock.Mock()
         with (
             mock.patch.object(hosting, "load_thinking_key", return_value=None),
-            mock.patch.object(
-                hosting.AutoTokenizer, "from_pretrained", return_value=object()
+            mock.patch(
+                "transformers.AutoTokenizer.from_pretrained", return_value=object()
             ),
             mock.patch.object(hosting, "validate_tokenizer"),
             mock.patch.object(hosting, "ChatTemplates"),
@@ -4783,9 +4794,8 @@ class ServerTest(unittest.TestCase):
                 runtime.readiness = native_wire.ReadyEvent(4, 131072, vision)
                 with (
                     mock.patch.object(hosting, "load_thinking_key", return_value=None),
-                    mock.patch.object(
-                        hosting.AutoTokenizer,
-                        "from_pretrained",
+                    mock.patch(
+                        "transformers.AutoTokenizer.from_pretrained",
                         return_value=object(),
                     ),
                     mock.patch.object(hosting, "validate_tokenizer"),
@@ -4872,12 +4882,11 @@ class ServerTest(unittest.TestCase):
         host.close.assert_called_once_with()
         self.assertIn("Error · late", stderr.getvalue())
 
-    def test_build_rejects_an_unservable_chat_template_before_starting_native(self):
+    def test_build_rejects_an_unservable_chat_template_and_closes_native(self):
         with (
             mock.patch.object(hosting, "load_thinking_key", return_value=None),
-            mock.patch.object(
-                hosting.AutoTokenizer,
-                "from_pretrained",
+            mock.patch(
+                "transformers.AutoTokenizer.from_pretrained",
                 return_value=SimpleNamespace(chat_template=None),
             ),
             mock.patch.object(hosting, "validate_tokenizer"),
@@ -4885,7 +4894,10 @@ class ServerTest(unittest.TestCase):
             self.assertRaises(ChatTemplateError),
         ):
             hosting.ModelHost(main_args()).load_initial()
-        runtime.assert_not_called()
+        # The engine starts beneath the tokenizer's load, so the template's
+        # failure tears it down: nothing serves.
+        runtime.return_value.start.assert_called_once_with()
+        runtime.return_value.close.assert_called_once_with()
 
     def test_main_rejects_port_conflict_before_loading_or_starting_native(self):
         args = main_args(port=8000)
@@ -5026,6 +5038,91 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(host.state, "loaded")
         # The previous model's engine was freed before the new one started.
         self.assertIs(host.backend, new_backend)
+
+    def test_available_passes_thin_status_through(self):
+        harness = self.harness(FakeRuntime())
+        self.loaded_host(harness)
+        with (
+            mock.patch.object(
+                launcher,
+                "_installed_details",
+                return_value=[{"model": "owner/repo", "thin": True}],
+            ),
+            mock.patch.object(launcher, "_suggested_models", return_value=[]),
+        ):
+            status, _, payload = harness.request("GET", "/v1/models/available")
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(payload)["data"][0]["thin"])
+
+    def test_load_threads_thin_and_exact_selection_to_the_host(self):
+        harness = self.harness(FakeRuntime())
+        host = self.loaded_host(harness)
+        new_app = mock.Mock(
+            model="owner/repo",
+            max_context=131072,
+            vision=False,
+            input_modalities=["text"],
+            latencies=harness.app.latencies,
+            request_timeout=FOREVER,
+        )
+        with (
+            mock.patch.object(host, "_hold", return_value=(Path("/tmp/repo"), None)) as hold,
+            mock.patch.object(
+                host,
+                "_build",
+                return_value=(mock.Mock(), mock.MagicMock(), new_app, 131072, False),
+            ),
+            mock.patch.object(hosting, "print_status"),
+        ):
+            status, _, payload = harness.request(
+                "POST",
+                "/v1/models/load",
+                {
+                    "model": "owner/repo",
+                    "thin": True,
+                    "selection": ".selections/" + "a" * 64,
+                },
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["status"], "loaded")
+        self.assertTrue(hold.call_args.kwargs["thin"])
+        self.assertEqual(hold.call_args.kwargs["selection"], ".selections/" + "a" * 64)
+        for field, value in (("thin", "yes"), ("selection", 1)):
+            with self.subTest(field=field):
+                status, _, _ = harness.request(
+                    "POST", "/v1/models/load", {"model": "owner/repo", field: value}
+                )
+                self.assertEqual(status, 400)
+
+    def test_hold_resolves_exact_selections_and_thin_option_links(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            assembly = root / ".resolved/assembly"
+            assembly.mkdir(parents=True)
+            (assembly / "model.json").write_text("{}")
+            default_link = root / "owner/repo"
+            default_link.parent.mkdir(parents=True)
+            default_link.symlink_to(assembly, target_is_directory=True)
+            thin_link = launcher.model_artifacts.Selection.of(
+                root, "owner/repo", thin=True
+            ).link
+            thin_link.parent.mkdir(parents=True)
+            thin_link.symlink_to(assembly, target_is_directory=True)
+            with mock.patch.object(hosting, "load_thinking_key", return_value=None):
+                host = hosting.ModelHost(main_args(models_dir=str(root)))
+            selection_name = str(thin_link.relative_to(root))
+            held, record = host._hold("owner/repo", selection=selection_name)
+            if record is not None:
+                record.close()
+            self.assertEqual(held, assembly)
+            held, record = host._hold("owner/repo", thin=True)
+            if record is not None:
+                record.close()
+            self.assertEqual(held, assembly)
+            for escape in ("../owner/repo", "/tmp/outside"):
+                with self.subTest(escape=escape), self.assertRaises(api_errors.APIError) as error:
+                    host._hold("owner/repo", selection=escape)
+                self.assertEqual(error.exception.status, 400)
 
     def test_load_refuses_a_model_that_is_not_installed(self):
         harness = self.harness(FakeRuntime())
@@ -8740,6 +8837,36 @@ class ServerTest(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(runtime.cancel_count, 1)
 
+    def test_client_disconnect_polls_concurrently_across_lane_threads(self):
+        # The sibling lanes of an n > 1 completion gather on parallel threads
+        # sharing one handler. Concurrent poll() on one poller raises
+        # RuntimeError, so each thread must hold a poller of its own.
+        handler = object.__new__(api.FrontendHandler)
+        handler.connection, peer = socket.socketpair()
+        self.addCleanup(handler.connection.close)
+        self.addCleanup(peer.close)
+        lanes = 4
+        barrier = threading.Barrier(lanes)
+        errors = []
+
+        def poll_lane():
+            try:
+                barrier.wait(5)
+                for _ in range(200):
+                    handler._client_disconnected()
+            except BaseException as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=poll_lane) for _ in range(lanes)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        self.assertEqual(errors, [])
+        self.assertFalse(handler._client_disconnected())
+        peer.close()
+        self.assertTrue(handler._client_disconnected())
+
     def test_runtime_error_does_not_poison_next_request(self):
         runtime = FakeRuntime(Plan(error="broken"), Plan([[4]]))
         harness = self.harness(runtime)
@@ -10833,6 +10960,144 @@ class WebSearchEndpointTest(unittest.TestCase):
             "POST", "/v1/tools/search", {"query": "q", "provider": "altavista"}
         )
         self.assertEqual(status, 400)
+
+
+class DiskGcEndpointTest(unittest.TestCase):
+    """POST /v1/disk/gc: the plan scan is read-only; apply deletes behind
+    the confirmation guard, like wipe and dedupe."""
+
+    def setUp(self):
+        self.harness = Harness(FakeRuntime())
+        self.addCleanup(self.harness.close)
+
+    def test_plan_returns_the_plan_shape(self):
+        plan = {
+            "cache_dir": "/cache",
+            "repos": 3,
+            "live_revisions": 2,
+            "preserved": 5,
+            "dead_repos": ["owner/dead"],
+            "dead_revisions": ["a" * 40],
+            "incomplete": ["/cache/x.incomplete"],
+            "shared_blobs": {"/cache/blobs/ab": 100},
+            "owned_blobs": {"/models/.blobs/cd": 200},
+            "packed_cache": {"/packed/entry": 300},
+        }
+        with mock.patch.object(
+            server_disk, "gc_plan", return_value=plan
+        ) as gc_plan:
+            status, _, payload = self.harness.request(
+                "POST", "/v1/disk/gc", {"apply": False}
+            )
+        gc_plan.assert_called_once()
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload), plan)
+
+    def test_plan_is_the_default_without_apply(self):
+        with mock.patch.object(
+            server_disk, "gc_plan", return_value={}
+        ) as gc_plan:
+            status, _, _payload = self.harness.request("POST", "/v1/disk/gc", {})
+        gc_plan.assert_called_once()
+        self.assertEqual(status, 200)
+
+    def test_apply_requires_confirmation(self):
+        with mock.patch.object(server_disk, "gc_apply") as gc_apply:
+            for body in ({"apply": True}, {"apply": True, "confirm": False}):
+                with self.subTest(body=body):
+                    status, _, payload = self.harness.request(
+                        "POST", "/v1/disk/gc", body
+                    )
+                    self.assertEqual(status, 400)
+                    self.assertEqual(
+                        json.loads(payload)["error"]["code"],
+                        "confirmation_required",
+                    )
+        gc_apply.assert_not_called()
+
+    def test_apply_collects_and_reports_freed_bytes(self):
+        result = {"freed": 600, "detail": {"owned_blobs": 600}}
+        with mock.patch.object(
+            server_disk, "gc_apply", return_value=result
+        ) as gc_apply:
+            status, _, payload = self.harness.request(
+                "POST", "/v1/disk/gc", {"apply": True, "confirm": True}
+            )
+        gc_apply.assert_called_once()
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(payload)["freed"], 600)
+
+    def test_apply_refuses_while_an_install_runs(self):
+        installer = mock.Mock()
+        installer.status.return_value = {"running": True}
+        self.harness.server.installer = installer
+        with mock.patch.object(server_disk, "gc_apply") as gc_apply:
+            status, _, payload = self.harness.request(
+                "POST", "/v1/disk/gc", {"apply": True, "confirm": True}
+            )
+        self.assertEqual(status, 409)
+        self.assertEqual(json.loads(payload)["error"]["code"], "engine_busy")
+        gc_apply.assert_not_called()
+
+    def test_apply_must_be_a_boolean(self):
+        status, _, payload = self.harness.request(
+            "POST", "/v1/disk/gc", {"apply": "yes"}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("apply", json.loads(payload)["error"]["message"])
+
+
+class DiskGcTest(unittest.TestCase):
+    """disk.gc_plan/gc_apply against a synthetic store: orphaned owned
+    blobs and packed-cache entries are planned, then freed."""
+
+    def fixture(self, temporary):
+        # owned_blob_plan resolves the .blobs root before listing it, so
+        # fixture paths must spell the canonical /private prefix too.
+        temporary = os.path.realpath(temporary)
+        root = Path(temporary) / "models"
+        (root / ".blobs").mkdir(parents=True)
+        orphan = root / ".blobs" / ("ab" * 20)
+        orphan.write_bytes(b"x" * 100)
+        packed = Path(temporary) / "packed"
+        entry = packed / "entry"
+        entry.mkdir(parents=True)
+        (entry / "weights").write_bytes(b"y" * 50)
+        cache = Path(temporary) / "hf-cache"
+        cache.mkdir()
+        return root, orphan, packed, entry, cache
+
+    def patched_cache(self, packed, cache):
+        from install import gc as hub_gc
+
+        return (
+            mock.patch.dict(
+                os.environ, {"RICHENGINE_PACKED_CACHE_ROOT": str(packed)}
+            ),
+            mock.patch.object(hub_gc, "hf_cache_dir", return_value=cache),
+        )
+
+    def test_plan_reports_orphaned_blobs_and_packed_entries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root, orphan, packed, entry, cache = self.fixture(temporary)
+            env_patch, cache_patch = self.patched_cache(packed, cache)
+            with env_patch, cache_patch:
+                plan = server_disk.gc_plan(root)
+            self.assertEqual(plan["owned_blobs"], {str(orphan): 100})
+            self.assertEqual(plan["packed_cache"], {str(entry): 50})
+            self.assertEqual(plan["dead_repos"], [])
+            self.assertEqual(plan["dead_revisions"], [])
+            self.assertEqual(plan["incomplete"], [])
+
+    def test_apply_deletes_the_plan_and_reports_freed_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root, orphan, packed, entry, cache = self.fixture(temporary)
+            env_patch, cache_patch = self.patched_cache(packed, cache)
+            with env_patch, cache_patch:
+                result = server_disk.gc_apply(root)
+            self.assertEqual(result["freed"], 150)
+            self.assertFalse(orphan.exists())
+            self.assertFalse(entry.exists())
 
 
 class DiagnosticsTests(unittest.TestCase):

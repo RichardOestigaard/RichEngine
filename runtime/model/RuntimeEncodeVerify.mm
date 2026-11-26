@@ -16,12 +16,14 @@ constexpr uint32_t kQsaVerifyLaneRecords =
                                       std::span<Request *const> entries,
                                       std::span<const ModelBatchItem> items,
                                       bool tree,
-                                      std::span<const uint32_t> liveRows) {
+                                      std::span<const uint32_t> liveRows,
+                                      uint32_t targetStride) {
     if (entries.empty() || entries.size() > kLaneCount ||
         entries.size() != items.size() ||
         (tree && entries.size() > kLaneCount / 2)) {
       throw std::invalid_argument("invalid target verify batch");
     }
+    const uint32_t stride = targetStride ? targetStride : geometry.draft.verifyRows();
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
     const uint32_t storage =
         targetModel.decodeStorageLanes(tree ? 2 * lanes : lanes);
@@ -124,17 +126,17 @@ constexpr uint32_t kQsaVerifyLaneRecords =
         affine48 ? (perLaneHead ? coverableMask != 0 : !logitsLaneMask)
                  : ggufHead && !logitsLaneMask;
     buffers.fusedHead = !headFusedOff && !tree && fusedShape &&
-        uint64_t{lanes} * geometry.draft.verifyRows() <=
+        uint64_t{lanes} * stride <=
             (affine48 ? affineBound : 32);
     // The K-split 64-row head cannot write logits for a lane that needs them;
     // without m64h's *_logits tile that batch keeps the ordinary projection.
     if (buffers.fusedHead && affine48 && !headM64 &&
-        uint64_t{lanes} * geometry.draft.verifyRows() > 48 && logitsLaneMask)
+        uint64_t{lanes} * stride > 48 && logitsLaneMask)
       buffers.fusedHead = false;
     buffers.headArgs.output_size = geometry.target.vocabularySize;
     buffers.headArgs.output_stride = geometry.target.paddedVocabularySize;
     buffers.headArgs.input_size = geometry.target.hiddenSize;
-    buffers.headArgs.rows = geometry.draft.verifyRows();
+    buffers.headArgs.rows = stride;
     buffers.headArgs.stop_token_0 = geometry.target.stopTokens[0];
     buffers.headArgs.stop_token_1 = geometry.target.stopTokens[1];
     buffers.headArgs.logits_lane_mask =
@@ -147,8 +149,8 @@ constexpr uint32_t kQsaVerifyLaneRecords =
         buffers.headArgs.live_rows[lane] =
             lane < liveRows.size()
                 ? std::clamp(liveRows[lane], uint32_t{1},
-                             geometry.draft.verifyRows())
-                : geometry.draft.verifyRows();
+                             stride)
+                : stride;
       }
       buffers.headArgmaxValues = d(DecodeTensor::HeadArgmaxValues);
       buffers.headArgmaxIndices = d(DecodeTensor::HeadArgmaxIndices);
@@ -187,7 +189,7 @@ constexpr uint32_t kQsaVerifyLaneRecords =
                : ops::PagedAttention::verifyParams(
                      items[lane].logicalPosition,
                      static_cast<uint32_t>(items[lane].pageTable.size()),
-                     geometry.draft.verifyRows());
+                     stride);
     bindPageTables(entries, buffers.pageTables);
     bindIndexTables(entries, buffers.indexTables);
     // Each lane's QSA block records (upstream prepareVerifyLane's
@@ -200,7 +202,7 @@ constexpr uint32_t kQsaVerifyLaneRecords =
         const uint64_t position = items[lane].logicalPosition;
         uint32_t count = 0;
         for (uint64_t last = position;
-             last < position + geometry.draft.verifyRows(); ++last) {
+             last < position + stride; ++last) {
           if (last % BLOCK_INDEXER_BLOCK != BLOCK_INDEXER_BLOCK - 1)
             continue;
           const uint64_t first = last - (BLOCK_INDEXER_BLOCK - 1);
@@ -256,7 +258,7 @@ constexpr uint32_t kQsaVerifyLaneRecords =
     }
     targetModel.addVerify(graph, std::move(buffers), kvPages.layers(),
                           std::span(chunks).first(lanes), lanes, tree,
-                          liveRows, liveNodes, geometry.draft.verifyRows(),
+                          liveRows, liveNodes, stride,
                           tape);
   }
 
@@ -278,9 +280,11 @@ constexpr uint32_t kQsaVerifyLaneRecords =
                                      std::span<Request *const> entries,
                                      bool tree,
                                      std::span<const uint32_t> liveRows,
-                                     uint32_t dfaLaneSkip) {
+                                     uint32_t dfaLaneSkip,
+                                     uint32_t targetStride) {
     if (entries.empty() || entries.size() > kLaneCount)
       throw std::invalid_argument("invalid target policy batch");
+    const uint32_t stride = targetStride ? targetStride : geometry.draft.verifyRows();
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
     std::array<ops::SamplingPolicy, kLaneCount> policies{};
     std::array<uint32_t, kLaneCount> stateLanes{};
@@ -312,7 +316,7 @@ constexpr uint32_t kQsaVerifyLaneRecords =
     // Affine heads fuse up to 48 rows (the m48 argmax tile), GGUF heads up
     // to 32 (their amax kernels stop at m32); the t256 variant additionally
     // wants a 256-divisible vocabulary.
-    const uint32_t headRows = lanes * geometry.draft.verifyRows();
+    const uint32_t headRows = lanes * stride;
     const bool affineHead =
         headShape.layout() == ops::WeightLayout::Affine64 &&
         headShape.outputSize % 128 == 0 && headShape.inputSize % 64 == 0;
@@ -388,7 +392,7 @@ constexpr uint32_t kQsaVerifyLaneRecords =
                        vBuffers, geometry.target.stopTokens[0],
                        geometry.target.stopTokens[1],
                        {penaltyTable, std::span(stateLanes).first(lanes)},
-                       liveRows, fusedHead, geometry.draft.verifyRows(),
+                       liveRows, fusedHead, stride,
                        fusedLaneMask);
   }
 

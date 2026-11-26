@@ -212,6 +212,9 @@ interface AvailableModel {
   requires_reload?: boolean;
   /* False when the family's knob table is unknown — Tune would only fail. */
   tunable?: boolean;
+  /* Thin install: source weights dropped once the packed cache validated.
+     Absent on servers that predate thin exposure — treat as false. */
+  thin?: boolean;
 }
 
 /* ---- /v1/models/available + /v1/models/install payload shapes ---- */
@@ -345,6 +348,7 @@ export default function Models() {
   const [suggested, setSuggested] = createSignal<string[]>([]);
   const [modelBusy, setModelBusy] = createSignal(false);
   const [confirmUnload, setConfirmUnload] = createSignal<AvailableModel | null>(null);
+  const [confirmUninstall, setConfirmUninstall] = createSignal<AvailableModel | null>(null);
   const [confirmTune, setConfirmTune] = createSignal<AvailableModel | null>(null);
   const [samplingEntry, setSamplingEntry] = createSignal<AvailableModel | null>(null);
   /* One open row action menu at a time, keyed by model id. */
@@ -361,6 +365,7 @@ export default function Models() {
   const [installRevision, setInstallRevision] = createSignal("");
   const [installDraft, setInstallDraft] = createSignal("");
   const [installLanguageOnly, setInstallLanguageOnly] = createSignal(false);
+  const [installThin, setInstallThin] = createSignal(false);
   const { markOk, updatedAgo, stale } = useFreshness();
   const { copied, copy } = useCopied();
   let logEl: HTMLPreElement | undefined;
@@ -456,11 +461,31 @@ export default function Models() {
       .catch((e) => setAvailableError(errorText(e)));
   }
 
-  async function loadModel(model: string) {
+  async function loadModel(model: string, selection?: string) {
     if (modelBusy()) return;
     setModelBusy(true);
     try {
-      await apiPost("/v1/models/load", { model });
+      const body: Record<string, unknown> = { model };
+      /* Optioned installs (.selections/<hash> links) aren't reachable by
+         model id — the server resolves the link directly. Older servers
+         ignore the extra key and load the default selection. */
+      if (selection?.startsWith(".selections/")) {
+        body.selection = selection;
+      } else {
+        /* Callers that know only the id (the install panel's Load it) still
+           reach an optioned-only install through the available list. */
+        const rows = (available() ?? []).filter((entry) => entry.model === model);
+        const plain = rows.some(
+          (entry) => entry.selection && !entry.selection.startsWith(".selections/")
+        );
+        if (!plain) {
+          const optioned = rows.find((entry) =>
+            entry.selection?.startsWith(".selections/")
+          );
+          if (optioned?.selection) body.selection = optioned.selection;
+        }
+      }
+      await apiPost("/v1/models/load", body);
       pushToast("ok", `Loaded ${model}`);
       // Point the chat composer at the newly served id.
       storageSet(MODEL_KEY, model);
@@ -500,6 +525,34 @@ export default function Models() {
     void pollStatus();
   }
 
+  /* Uninstall deletes the selection link and whatever storage no other
+     selection shares — unlike Delete on the Disk page, which the serving
+     lock blocks, this is the one removal that works while the server runs. */
+  async function uninstallModel(entry: AvailableModel) {
+    if (modelBusy()) return;
+    setConfirmUninstall(null);
+    setModelBusy(true);
+    try {
+      const result = await apiPost<{ bytes?: number }>(
+        "/v1/models/uninstall",
+        {
+          selection: entry.selection ?? entry.model,
+          confirm: true,
+        }
+      );
+      pushToast(
+        "ok",
+        `Uninstalled ${entry.model ?? "model"}: freed ${fmtBytes(result.bytes ?? null)}.`
+      );
+    } catch (e) {
+      pushToast("error", errorText(e));
+    }
+    setModelBusy(false);
+    loadModelsList();
+    loadAvailable();
+    void pollStatus();
+  }
+
   /* Install progress polling and its toasts live in ../install — the job
      runs as a server-side subprocess and outlives this page. */
   /* Start an install from the current form state. Retry reuses it — the
@@ -517,6 +570,9 @@ export default function Models() {
       const draft = installDraft().trim();
       if (revision) body.revision = revision;
       if (draft) body.draft_model = draft;
+      /* Servers predating thin support ignore the extra key and install
+         the full weights. */
+      if (installThin()) body.thin = true;
       logPinned = true;
       setInstallJob(await apiPost<InstallJob>("/v1/models/install", body));
     } catch (e) {
@@ -1019,6 +1075,14 @@ export default function Models() {
                     <Show when={entry.vision_format}>
                       <span class="badge">{entry.vision_format}</span>
                     </Show>
+                    <Show when={entry.thin}>
+                      <span
+                        class="badge"
+                        title="Thin install — source weights were dropped once the packed cache validated; losing the cache reinstalls the model"
+                      >
+                        thin
+                      </span>
+                    </Show>
                     <Show
                       when={
                         (entry.tuned_knobs ?? 0) > 0 && entry.tuning === "tuned"
@@ -1108,7 +1172,9 @@ export default function Models() {
                           class="btn small"
                           disabled={modelWorking()}
                           title={`Swap the served model to ${entry.model}`}
-                          onClick={() => void loadModel(entry.model ?? "")}
+                          onClick={() =>
+                            void loadModel(entry.model ?? "", entry.selection)
+                          }
                         >
                           {modelWorking() ? "Working…" : "Load"}
                         </button>
@@ -1200,6 +1266,23 @@ export default function Models() {
                               Unload
                             </button>
                           </Show>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            class="danger"
+                            disabled={modelWorking() || !!entry.serving}
+                            title={
+                              entry.serving
+                                ? "Unload the model before uninstalling it"
+                                : `Uninstall ${entry.model} — deletes its files from disk; using it again means reinstalling`
+                            }
+                            onClick={() => {
+                              setRowMenu(null);
+                              setConfirmUninstall(entry);
+                            }}
+                          >
+                            Uninstall…
+                          </button>
                         </div>
                       </Show>
                     </div>
@@ -1478,7 +1561,7 @@ export default function Models() {
           {/* Rare knobs hide behind a nested fold — most users never open
               it. */}
           <details class="install-options">
-            <summary>Options — revision · draft · language-only</summary>
+            <summary>Options — revision · draft · language-only · thin</summary>
             <div class="panel-row">
               <span class="grow">
                 Revision <span class="muted">— optional</span>
@@ -1517,6 +1600,22 @@ export default function Models() {
                   }
                 />
                 language only — skip vision weights (no image input)
+              </label>
+            </div>
+            <div class="panel-row">
+              <label
+                class="install-check grow muted"
+                title="Experimental, MLX-affine models only: once the packed weight cache validates, the source weights are dropped — the model serves from the cache alone, so losing the cache reinstalls it"
+              >
+                <input
+                  type="checkbox"
+                  checked={installThin()}
+                  onChange={(event) =>
+                    setInstallThin(event.currentTarget.checked)
+                  }
+                />
+                thin install — drop source weights after validation
+                (experimental, MLX-affine only; a cache loss reinstalls)
               </label>
             </div>
           </details>
@@ -2114,6 +2213,19 @@ export default function Models() {
         This resident is freed and requests naming it fail until it's loaded
         again; other residents keep serving. In-flight requests may be
         interrupted.
+      </Confirm>
+
+      <Confirm
+        open={confirmUninstall() !== null}
+        title={`Uninstall ${confirmUninstall()?.model ?? "model"}?`}
+        confirmLabel="Uninstall"
+        busy={modelBusy()}
+        onConfirm={() => void uninstallModel(confirmUninstall() ?? {})}
+        onClose={() => setConfirmUninstall(null)}
+      >
+        This permanently deletes the model's files from disk —{" "}
+        {fmtBytes(confirmUninstall()?.bytes ?? null)} reclaimed. Using it
+        again means reinstalling. This cannot be undone.
       </Confirm>
 
       <SamplingDialog

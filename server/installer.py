@@ -17,7 +17,7 @@ STATUS_LINES = 60
 
 
 def _command(
-    models_root, model, *, revision=None, draft_model=None, language_only=False
+    models_root, model, *, revision=None, draft_model=None, language_only=False, thin=False
 ):
     """The installer's own CLI, as the launcher spells it: the install
     package's interpreter so huggingface_hub resolves, and the repository
@@ -40,6 +40,8 @@ def _command(
         command += ["--draft-model", draft_model]
     if language_only:
         command.append("--language-only")
+    if thin:
+        command.append("--thin")
     command.append("prepare")
     return command, paths.ROOT
 
@@ -59,6 +61,7 @@ class Installer:
         revision=None,
         draft_model=None,
         language_only=False,
+        thin=False,
     ):
         """Validate the selection and spawn the installer; the job outlives
         the request and is polled over GET /v1/models/install."""
@@ -86,6 +89,7 @@ class Installer:
                 revision=revision,
                 draft_model=draft_model,
                 language_only=language_only,
+                thin=thin,
             )
             try:
                 process = subprocess.Popen(

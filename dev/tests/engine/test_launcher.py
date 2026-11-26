@@ -13,6 +13,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from install import launcher
@@ -78,6 +79,7 @@ class LauncherTests(unittest.TestCase):
             "RICHENGINE_PORT",
             "RICHENGINE_API_KEY",
             "RICHENGINE_DEFAULT_REASONING_EFFORT",
+            "RICHENGINE_MODELS_DIR",
         ):
             os.environ.pop(name, None)
         keep_stop_signals(self)
@@ -143,6 +145,10 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(launcher.parse_args(["status"]).command, "status")
         self.assertEqual(launcher.parse_args(["flags"]).command, "flags")
         self.assertEqual(launcher.parse_args(["doctor"]).command, "doctor")
+        self.assertEqual(
+            launcher.parse_args(["doctor", "--models", "/tmp/models"]).models,
+            "/tmp/models",
+        )
         args = launcher.parse_args(
             [
                 "serve",
@@ -157,6 +163,238 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(args.model, MODEL_ID)
         self.assertEqual(args.max_memory, 28 * 1024**3)
         self.assertEqual(args.max_context, 102400)
+        self.assertEqual(
+            launcher.parse_args(["models", "verify", MODEL_ID]).models_command, "verify"
+        )
+        wiped = launcher.parse_args(
+            ["disk", "wipe", "richengine", ".selections/" + "a" * 64, "--yes"]
+        )
+        self.assertEqual(wiped.store, "richengine")
+        migrate = launcher.parse_args(
+            ["models", "--models", "/tmp/source", "migrate", "/tmp/destination"]
+        )
+        with self.assertRaisesRegex(launcher.LauncherError, "omit --models"):
+            launcher.list_models(migrate)
+
+    def test_installed_details_and_verbose_models_expose_thin_installs(self):
+        from install import autotune
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            assembly = root / ".resolved/assembly"
+            assembly.mkdir(parents=True)
+            (assembly / "model.json").write_text(
+                json.dumps(
+                    {
+                        "family": "family",
+                        "target_format": "mlx-affine",
+                        "vision_format": "none",
+                        "thin": True,
+                        "files": {"target/model.mlx": {"bytes": 42}},
+                        "sources": {"target": {"repo": MODEL_ID}},
+                    }
+                )
+            )
+            link = root / "owner/repo"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(assembly, target_is_directory=True)
+            with mock.patch.object(
+                autotune, "detect_chip", return_value=("chip", 0, 0)
+            ):
+                entries = launcher._installed_details(root)
+            self.assertEqual(entries[0]["thin"], True)
+            args = launcher.parse_args(["models", "--models", str(root), "-v"])
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    launcher.paths, "models_root", return_value=(root, "flag")
+                ),
+                mock.patch.object(launcher.catalog, "official_ids", return_value=[]),
+                mock.patch.object(launcher, "_suggested_models", return_value=[]),
+                mock.patch.object(
+                    autotune, "detect_chip", return_value=("chip", 0, 0)
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(launcher.list_models(args), 0)
+            listing = output.getvalue()
+            self.assertIn("THIN", listing)
+            self.assertIn("yes", listing)
+
+    def test_disk_lists_option_selections_and_their_exact_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            link = root / ".selections" / ("a" * 64)
+            target = root / ".resolved/assembly"
+            target.mkdir(parents=True)
+            link.parent.mkdir()
+            (target / "model.json").write_text(
+                json.dumps({"sources": {"target": {"repo": MODEL_ID}}})
+            )
+            link.symlink_to(target, target_is_directory=True)
+            with mock.patch.object(
+                launcher.paths, "models_root", return_value=(root, "default")
+            ):
+                row = next(row for row in launcher._store_rows(calc=False) if row["name"] == "splash")
+            entry = next(
+                entry for entry in row["models"] if entry.get("selection") == ".selections/" + "a" * 64
+            )
+            self.assertEqual(entry["name"], MODEL_ID + " (options)")
+            self.assertEqual(entry["dedupe"], MODEL_ID)
+            self.assertEqual(
+                launcher._model_paths("splash", row, entry["selection"]), [link]
+            )
+            self.assertEqual(launcher._model_paths("splash", row, ".selections/../repo"), [])
+
+    def test_dead_gc_rows_carry_repo_and_revision_sizes(self):
+        small = mock.Mock(commit_hash="b" * 40, size_on_disk=10)
+        large = mock.Mock(commit_hash="a" * 40, size_on_disk=30)
+        repo = mock.Mock(repo_id="owner/dead", size_on_disk=40, revisions=[small, large])
+        rows, revisions = launcher._dead_gc_rows(
+            {
+                "info": mock.Mock(repos=[repo]),
+                "dead_repos": ["owner/dead"],
+                "dead_revisions": ["a" * 40, "b" * 40],
+            }
+        )
+        self.assertEqual(rows, [(40, "owner/dead")])
+        self.assertEqual(
+            revisions,
+            [(30, "owner/dead@" + "a" * 12), (10, "owner/dead@" + "b" * 12)],
+        )
+
+    def test_packed_cache_usage_counts_entries_and_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            entry = root / "entry"
+            entry.mkdir()
+            (entry / "weights").write_bytes(b"weights")
+            (root / "loose-file").write_bytes(b"not an entry")
+            with mock.patch.dict(
+                os.environ, {"RICHENGINE_PACKED_CACHE_ROOT": str(root)}
+            ):
+                self.assertEqual(launcher._packed_cache_usage(), (root, 1, 7))
+
+    def test_serve_dry_run_reports_root_layout_and_packed_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "models"
+            packed = Path(temporary) / "packed"
+            args = launcher.parse_args(
+                ["serve", "--model", MODEL_ID, "--models-dir", str(root), "--dry-run"]
+            )
+            output = io.StringIO()
+            with (
+                mock.patch.dict(
+                    os.environ, {"RICHENGINE_PACKED_CACHE_ROOT": str(packed)}
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(launcher.serve(args), 0)
+            plan = output.getvalue()
+            self.assertIn("root", plan)
+            self.assertIn(str(root), plan)
+            self.assertIn("layout", plan)
+            self.assertIn(".resolved assemblies", plan)
+            self.assertIn(f"packed cache {packed}", plan)
+
+    def test_models_verify_and_rm_manage_one_installation(self):
+        from install import assembly as assembly_module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            assembly = root / ".resolved/assembly"
+            blob = root / ".blobs/blob"
+            assembly.mkdir(parents=True)
+            blob.parent.mkdir(parents=True)
+            blob.write_bytes(b"weights")
+            (assembly / "weights").symlink_to(blob)
+            record = {
+                "version": 1,
+                "model": "owner/repo",
+                "family": "owner/repo",
+                "target_format": "mlx-affine",
+                "vision_format": "none",
+                "sources": {"target": {"repo": "owner/repo", "revision": None}},
+                "files": {"weights": assembly_module.file_record(blob)},
+            }
+            (assembly / "model.json").write_text(json.dumps(record))
+            link = root / "owner/repo"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(assembly, target_is_directory=True)
+            verify = launcher.parse_args(
+                ["models", "--models", str(root), "verify", "owner/repo"]
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(launcher.list_models(verify), 0)
+            self.assertIn("preflight passed", output.getvalue())
+            remove = launcher.parse_args(
+                ["models", "--models", str(root), "rm", "owner/repo"]
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(launcher.list_models(remove), 0)
+            self.assertFalse(link.exists())
+            self.assertFalse(assembly.exists())
+            self.assertFalse(blob.exists())
+
+    def test_disk_wipe_selection_removes_only_that_install_link(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            assembly = root / ".resolved/assembly"
+            assembly.mkdir(parents=True)
+            (assembly / "model.json").write_text("{}")
+            plain = root / "owner/repo"
+            plain.parent.mkdir(parents=True)
+            plain.symlink_to(assembly, target_is_directory=True)
+            option = root / ".selections" / ("a" * 64)
+            option.parent.mkdir()
+            option.symlink_to(assembly, target_is_directory=True)
+            row = {
+                "name": "splash",
+                "title": "Splash/RichEngine",
+                "paths": [str(root)],
+                "models": [],
+                "exists": True,
+                "bytes": 0,
+            }
+            args = SimpleNamespace(
+                store="richengine",
+                model=".selections/" + "a" * 64,
+                yes=True,
+                json=True,
+                port=8000,
+            )
+            output = io.StringIO()
+            with (
+                mock.patch.object(launcher, "_store_rows", return_value=[row]),
+                mock.patch.object(launcher, "_serve_owner", return_value=None),
+                mock.patch.object(
+                    launcher.paths, "models_root", return_value=(root, "default")
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(launcher._disk_wipe(args), 0)
+            self.assertFalse(option.exists())
+            self.assertTrue(plain.is_symlink())
+            self.assertTrue(assembly.is_dir())
+            self.assertEqual(json.loads(output.getvalue())["wiped"], "splash")
+
+    def test_flags_list_nested_storage_commands(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            launcher.list_flags(launcher.parse_args(["flags"]))
+        listing = output.getvalue()
+        for heading in (
+            "richengine tune",
+            "richengine models verify",
+            "richengine models migrate",
+            "richengine models rm",
+            "richengine disk dedupe",
+            "richengine disk wipe",
+            "richengine disk gc",
+        ):
+            with self.subTest(heading=heading):
+                self.assertIn(heading, listing)
 
     def test_host_controls_probe_and_server_independently_of_allowed_host(self):
         for host in (None, "0.0.0.0", "192.0.2.10", "localhost"):

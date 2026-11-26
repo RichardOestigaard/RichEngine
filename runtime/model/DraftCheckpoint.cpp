@@ -286,7 +286,7 @@ DFlash2CheckpointLoader::DFlash2CheckpointLoader(WeightImages &images, const std
                                              const DFlashDraftLayout &layout)
     : images_(images), planned_(std::make_shared<affine::PlannedCheckpoint>(directory)) {
   planned_->images = affine::blockImages(draftCheckpointImages(layout));
-  for (Image &image : planned_->images) affine::bind(image, planned_->source);
+  for (Image &image : planned_->images) affine::bind(image, *planned_->source);
 }
 DFlash2CheckpointLoader::~DFlash2CheckpointLoader() = default;
 WeightFile DFlash2CheckpointLoader::layer(uint32_t index) {
@@ -310,7 +310,7 @@ DFlashV1DraftCheckpointLoader::DFlashV1DraftCheckpointLoader(WeightImages &image
                                                      const DFlashDraftLayout &layout)
     : images_(images), planned_(std::make_shared<affine::PlannedCheckpoint>(directory)) {
   planned_->images = affine::blockImages(dflashV1DraftCheckpointImages(layout));
-  for (Image &image : planned_->images) affine::bind(image, planned_->source);
+  for (Image &image : planned_->images) affine::bind(image, *planned_->source);
 }
 DFlashV1DraftCheckpointLoader::~DFlashV1DraftCheckpointLoader() = default;
 WeightFile DFlashV1DraftCheckpointLoader::layer(uint32_t index) {
@@ -344,7 +344,7 @@ DSparkCheckpointLoader::DSparkCheckpointLoader(WeightImages &images, const std::
                                                const DFlashDraftLayout &layout)
     : images_(images), planned_(std::make_shared<affine::PlannedCheckpoint>(directory)) {
   planned_->images = affine::blockImages(dsparkDraftCheckpointImages(layout));
-  for (Image &image : planned_->images) affine::bind(image, planned_->source);
+  for (Image &image : planned_->images) affine::bind(image, *planned_->source);
 }
 DSparkCheckpointLoader::~DSparkCheckpointLoader() = default;
 WeightFile DSparkCheckpointLoader::layer(uint32_t index) {
@@ -370,7 +370,7 @@ DSplineCheckpointLoader::DSplineCheckpointLoader(WeightImages &images, const std
                                                const DFlashDraftLayout &layout)
     : images_(images), planned_(std::make_shared<affine::PlannedCheckpoint>(directory)) {
   planned_->images = affine::blockImages(dsplineDraftCheckpointImages(layout));
-  for (Image &image : planned_->images) affine::bind(image, planned_->source);
+  for (Image &image : planned_->images) affine::bind(image, *planned_->source);
 }
 DSplineCheckpointLoader::~DSplineCheckpointLoader() = default;
 WeightFile DSplineCheckpointLoader::layer(uint32_t index) {
@@ -391,7 +391,7 @@ NemotronMtpCheckpointLoader::NemotronMtpCheckpointLoader(WeightImages &images, c
                                              const DFlashDraftLayout &layout)
     : images_(images), planned_(std::make_shared<affine::PlannedCheckpoint>(directory)) {
   planned_->images = nemotronMtpDraftCheckpointImages(layout);
-  for (Image &image : planned_->images) affine::bind(image, planned_->source);
+  for (Image &image : planned_->images) affine::bind(image, *planned_->source);
 }
 NemotronMtpCheckpointLoader::~NemotronMtpCheckpointLoader() = default;
 WeightFile NemotronMtpCheckpointLoader::mtp() {

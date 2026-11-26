@@ -747,8 +747,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
             "/v1/systemone",
             "/v1/disk/wipe",
             "/v1/disk/dedupe",
+            "/v1/disk/gc",
             "/v1/models/load",
             "/v1/models/unload",
+            "/v1/models/uninstall",
             "/v1/models/install",
             "/v1/models/install/cancel",
             "/v1/models/tune",
@@ -1068,6 +1070,25 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 )
                 self._json(200, {"status": "unloaded", "model": model})
                 return
+            if path == "/v1/models/uninstall":
+                selection = body.get("selection") or body.get("model")
+                if not isinstance(selection, str) or not selection:
+                    raise APIError(400, '"selection" must be a selection name string')
+                if body.get("confirm") is not True:
+                    raise APIError(
+                        400, "confirmation required", "confirmation_required"
+                    )
+                host = self.server.host
+                served = (
+                    {self.app.model}
+                    if self.app is not None and host is None
+                    else set() if host is None else set(host.models())
+                )
+                self._json(
+                    200,
+                    disk.uninstall(self._models_root(), selection, served),
+                )
+                return
             if path == "/v1/disk/wipe":
                 store = body.get("store")
                 model = body.get("model")
@@ -1081,6 +1102,28 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     )
                 self._json(200, disk.wipe(store, model, self.server.server_port))
                 return
+            if path == "/v1/disk/gc":
+                apply = body.get("apply", False)
+                if not isinstance(apply, bool):
+                    raise APIError(400, '"apply" must be a boolean')
+                if not apply:
+                    self._json(200, disk.gc_plan(self._models_root()))
+                    return
+                if body.get("confirm") is not True:
+                    raise APIError(
+                        400, "confirmation required", "confirmation_required"
+                    )
+                if self._installer().status().get("running"):
+                    # The download's partial files read as collectible
+                    # incomplete entries; deleting them mid-install would
+                    # corrupt it.
+                    raise APIError(
+                        409,
+                        "an install is running; wait for it to finish",
+                        "engine_busy",
+                    )
+                self._json(200, disk.gc_apply(self._models_root()))
+                return
             if path == "/v1/models/install":
                 model = body.get("model")
                 if not isinstance(model, str) or not model:
@@ -1088,12 +1131,15 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 revision = body.get("revision")
                 draft_model = body.get("draft_model")
                 language_only = body.get("language_only", False)
+                thin = body.get("thin", False)
                 if revision is not None and not isinstance(revision, str):
                     raise APIError(400, '"revision" must be a string or null')
                 if draft_model is not None and not isinstance(draft_model, str):
                     raise APIError(400, '"draft_model" must be a string or null')
                 if not isinstance(language_only, bool):
                     raise APIError(400, '"language_only" must be a boolean')
+                if not isinstance(thin, bool):
+                    raise APIError(400, '"thin" must be a boolean')
                 if self._tuner().status().get("running"):
                     # The sweep's measurements would bake the install's
                     # engine noise into the tuning record — and the install
@@ -1111,6 +1157,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         revision=revision,
                         draft_model=draft_model,
                         language_only=language_only,
+                        thin=thin,
                     ),
                 )
                 return
@@ -1244,7 +1291,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             raise APIError(
                 503, "this server cannot install models", "unsupported"
             ) from None
-        return paths.MODELS
+        return paths.models_root()[0]
 
     def _model_load(self, body):
         """POST /v1/models/load: swap the served model to an installed one."""
@@ -1254,18 +1301,26 @@ class FrontendHandler(BaseHTTPRequestHandler):
         revision = body.get("revision")
         draft_model = body.get("draft_model")
         language_only = body.get("language_only", False)
+        thin = body.get("thin", False)
+        selection = body.get("selection")
         if revision is not None and not isinstance(revision, str):
             raise APIError(400, '"revision" must be a string or null')
         if draft_model is not None and not isinstance(draft_model, str):
             raise APIError(400, '"draft_model" must be a string or null')
         if not isinstance(language_only, bool):
             raise APIError(400, '"language_only" must be a boolean')
+        if not isinstance(thin, bool):
+            raise APIError(400, '"thin" must be a boolean')
+        if selection is not None and not isinstance(selection, str):
+            raise APIError(400, '"selection" must be a string or null')
         app = self.server.host.load(
             model,
             force=body.get("force") is True,
             revision=revision,
             draft_model=draft_model,
             language_only=language_only,
+            thin=thin,
+            selection=selection,
         )
         self._json(
             200,
@@ -1410,11 +1465,18 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _client_disconnected(self):
         # A poll object holds no descriptor: running out of descriptors
-        # must not read as a disconnect. One poller per handler — poll()
-        # allocates under the hood, so it is made once, not per event.
-        poller = getattr(self, "_disconnect_poller", None)
+        # must not read as a disconnect. One poller per calling thread —
+        # poll() allocates under the hood, so it is made once, not per
+        # event — because the sibling lanes of an n > 1 completion gather
+        # on parallel threads, and concurrent poll() on one poller raises.
+        # Losing a race to create the storage costs one spare poller, never
+        # a shared one: threading.local isolates every thread's slot.
+        local = getattr(self, "_disconnect_local", None)
+        if local is None:
+            local = self._disconnect_local = threading.local()
+        poller = getattr(local, "poller", None)
         if poller is None:
-            poller = self._disconnect_poller = select.poll()
+            poller = local.poller = select.poll()
             poller.register(self.connection, select.POLLIN)
         try:
             # The body is already consumed and every response closes the

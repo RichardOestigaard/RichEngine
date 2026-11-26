@@ -426,6 +426,7 @@ inline constexpr std::string_view kMoeRouteCap = "moe_route_cap";
 inline constexpr std::string_view kMoeRouteGroupSigmoid = "moe_route_group_sigmoid";
 inline constexpr std::string_view kMoeGroupRoutes = "moe_group_routes";
 inline constexpr std::string_view kMoeGroupRoutesVerified = "moe_group_routes_verified";
+inline constexpr std::string_view kMoePadRows = "moe_pad_rows";
 inline constexpr std::string_view kMoeGatherTable16 = "moe_gather_table16";
 inline constexpr std::string_view kMoeGatherPacked = "moe_gather_packed";
 inline constexpr std::string_view kMoeGatherRows = "moe_gather_rows";

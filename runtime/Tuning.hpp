@@ -48,6 +48,10 @@ struct Tuning {
   // fused `_gu` tile (measured −7% at a 512-row GGUF prefill chunk, bitwise
   // outputs on the gguf-moe suite) — default on, opt-out for A/B.
   bool moeGgufFused = true;       // RICHENGINE_MOE_GGUF_FUSED_OFF (presence)
+  // Composition-invariant staged GGUF prefill: column tiles stay off and
+  // ragged dense shared blocks run zero-padded. Default on; OFF restores
+  // the old row-count-dependent tiles for A/B measurement.
+  bool moeInvariantPrefillOff = false; // RICHENGINE_MOE_INVARIANT_PREFILL_OFF (presence)
   std::string_view moeGgufTile;   // RICHENGINE_MOE_GGUF_TILE=register|staged
   // ops/ExecutionPlans.cpp: GGUF decode plans take 32-row expert tiles
   // (wideGgufDecode) so a hot expert's weights stream once, for A/Bs.
@@ -402,6 +406,7 @@ inline Tuning makeTuning() {
   t.moeSharedDense = envFlag("RICHENGINE_MOE_SHARED_DENSE");
   t.mixedDecodePack = !envFlag("RICHENGINE_MIXED_DECODE_PACK_OFF");
   t.moeGgufFused = !envFlag("RICHENGINE_MOE_GGUF_FUSED_OFF");
+  t.moeInvariantPrefillOff = envFlag("RICHENGINE_MOE_INVARIANT_PREFILL_OFF");
   t.moeGgufTile = stringOrEmpty("RICHENGINE_MOE_GGUF_TILE");
   t.moeDecodeM32 = envFlag("RICHENGINE_MOE_DECODE_M32");
   t.moeSg4 = envFlag("RICHENGINE_MOE_SG4");

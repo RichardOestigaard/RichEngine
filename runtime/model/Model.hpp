@@ -632,6 +632,10 @@ struct ModelTelemetry final {
   uint64_t ngramChainLength4To7 = 0;
   uint64_t ngramChainLength8To15 = 0;
   uint64_t ngramChainLengthsExact[16] = {};
+  // Draft-agreement scoring evidence: scoring queries using valid candidate
+  // rows, and their token labels in LookupAgreement order.
+  uint64_t ngramAgreementQueries = 0;
+  uint64_t ngramAgreementLabels[4] = {};
 };
 
 // One warmup lane's observable outcome: its step result, the anchor the step

@@ -639,6 +639,13 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     const uint32_t gpuMixMinWidth_ = modelPolicy().ngramGpuMixMinWidth;
     const bool mixCorpusOnly_ = modelPolicy().ngramMixCorpusOnly;
     const bool chainClip_ = modelPolicy().ngramChainClip;
+    // Adaptive chain clipping (RICHENGINE_NGRAM_CLIP_SURVIVAL, 0 off): rows
+    // whose cumulative acceptance survival — the LookupAcceptance prior's
+    // Unknown-agreement product down the chain — falls below this share are
+    // dead verify width. Trace replay: clipping by match-length tiers cut
+    // rows/round 37% for 2.8% of tokens/step; the survival rule is the same
+    // tradeoff computed from the fitted table instead of fixed tiers.
+    const double clipSurvival_ = envDouble("RICHENGINE_NGRAM_CLIP_SURVIVAL", 0.35);
     const bool budgetIsolation_ = modelPolicy().ngramBudgetIsolation;
     const bool pseudoConf_ = modelPolicy().ngramPseudoConf;
     const bool skipGpuPredraft_ = modelPolicy().ngramSkipGpuPredraft;
@@ -2459,7 +2466,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                                       std::span<Request *const> entries,
                                       std::span<const ModelBatchItem> items,
                                       bool tree = false,
-                                      std::span<const uint32_t> liveRows = {});
+                                      std::span<const uint32_t> liveRows = {},
+                                      uint32_t targetStride = 0);
   // The sampling buffers of a tree batch: lane-semantic tensors keep their
   // lanes' strides, while the row-indexed logits and the argmax output take
   // the tree's RICHENGINE_TREE_VERIFY_NODES stride.
@@ -2468,7 +2476,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                                      std::span<Request *const> entries,
                                      bool tree = false,
                                      std::span<const uint32_t> liveRows = {},
-                                     uint32_t dfaLaneSkip = 0);
+                                     uint32_t dfaLaneSkip = 0,
+                                     uint32_t targetStride = 0);
   void encodeDraftStateCommitBatch(CommandGraph &graph,
                                    std::span<Request *const> entries,
                                    std::span<const ModelBatchItem> items,
@@ -4117,6 +4126,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         entry.ngramInFlight = false;
         const double observed =
             std::min(laneResult.accepted, laneResult.retained - 1);
+        const std::span<const uint32_t> agreementCandidates =
+            ngramMixedStep && ngram_.draftAgreement_
+                ? draftCandidateRow(lane, static_cast<uint32_t>(items.size()))
+                : std::span<const uint32_t>{};
+        const uint32_t agreementStride = draftCandidateStride();
         if (entry.lookupInFlight) {
           // A lookup-sourced round trains its own EWMA and the shared
           // acceptance model — the 3-gram's stays untouched, so a source
@@ -4130,7 +4144,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           if (entry.lookupMatchLength >= LookupIndex::kMinimumMatch) {
             const LookupOutcome outcome = lookupOutcome(
                 {entry.lookupChain.data(), entry.lookupChainLength},
-                {targetTokens, laneResult.retained}, {});
+                {targetTokens, laneResult.retained}, agreementCandidates,
+                agreementStride);
             ngram_.lookupAcceptance_.observe(
                 samplingEnabled(entry), entry.lookupMatchLength,
                 outcome.verified, outcome.accepted);
@@ -4153,6 +4168,15 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                                               0.25 * observed
                                         : observed;
           ++entry.corpusRounds;
+          if (entry.corpusMatchLength >= LookupIndex::kMinimumMatch) {
+            const LookupOutcome outcome = lookupOutcome(
+                {entry.corpusChain.data(), entry.corpusChainLength},
+                {targetTokens, laneResult.retained}, agreementCandidates,
+                agreementStride);
+            ngram_.lookupAcceptance_.observe(
+                samplingEnabled(entry), entry.corpusMatchLength,
+                outcome.verified, outcome.accepted);
+          }
         }
       }
       commitSelected(entry, {targetTokens, laneResult.retained});

@@ -198,9 +198,18 @@ class ModelHost:
                 "the models directory is unknown; restart with --models-dir",
                 "invalid_request_error",
             ) from None
-        return paths.MODELS
+        return paths.models_root()[0]
 
-    def _hold(self, model_id, *, revision=None, draft_model=None, language_only=False):
+    def _hold(
+        self,
+        model_id,
+        *,
+        revision=None,
+        draft_model=None,
+        language_only=False,
+        thin=False,
+        selection=None,
+    ):
         """The installed selection's held assembly directory and record fd."""
         from install import assembly
         from install import models as model_artifacts
@@ -209,17 +218,27 @@ class ModelHost:
             model_artifacts.parse_model_id(model_id)
         except argparse.ArgumentTypeError as error:
             raise APIError(400, str(error)) from None
-        try:
-            selection = model_artifacts.Selection.of(
-                self._models_root(),
-                model_id,
-                revision=revision,
-                language_only=language_only,
-                draft_model=draft_model,
-            )
-        except model_artifacts.ModelError as error:
-            raise APIError(400, str(error)) from None
-        if model_artifacts.installation_kind(selection.link) is None:
+        models_root = self._models_root()
+        if selection is not None:
+            # As the tuner API resolves it: exact membership in the root's
+            # selection links both validates the install and blocks escapes.
+            link = Path(models_root) / selection
+            if link not in model_artifacts.selection_links(Path(models_root)):
+                raise APIError(400, f"unknown selection: {selection}", "invalid_request")
+        else:
+            try:
+                resolved = model_artifacts.Selection.of(
+                    models_root,
+                    model_id,
+                    revision=revision,
+                    language_only=language_only,
+                    draft_model=draft_model,
+                    thin=thin,
+                )
+            except model_artifacts.ModelError as error:
+                raise APIError(400, str(error)) from None
+            link = resolved.link
+        if model_artifacts.installation_kind(link) is None:
             raise APIError(
                 404,
                 f"{model_id} is not installed; install it with "
@@ -227,7 +246,7 @@ class ModelHost:
                 "model_not_found",
             )
         try:
-            return assembly.hold(selection.link, selection.models_root)
+            return assembly.hold(link, Path(models_root))
         except model_artifacts.ModelError as error:
             raise APIError(400, str(error)) from None
 
@@ -293,6 +312,17 @@ class ModelHost:
             env = tuned_env if tuned_env is not None else dict(os.environ)
             env["RICHENGINE_CACHED_STATES"] = cached_states
             tuned_env = env
+        # The packed weight cache is outside the models root. The native
+        # engine has the same default, but exporting it here keeps one
+        # platform-policy implementation authoritative and lets users move it
+        # with RICHENGINE_PACKED_CACHE_ROOT.
+        from install import paths as install_paths
+
+        env = tuned_env if tuned_env is not None else dict(os.environ)
+        env.setdefault(
+            "RICHENGINE_PACKED_CACHE_ROOT", str(install_paths.packed_cache_root())
+        )
+        tuned_env = env
         runtime = engine_runtime.MultiplexedRuntime(
             _native_command(native_args),
             startup_timeout=NATIVE_START_TIMEOUT,
@@ -519,6 +549,8 @@ class ModelHost:
         revision=None,
         draft_model=None,
         language_only=False,
+        thin=False,
+        selection=None,
     ):
         """Swap to an installed model. The old engine is freed before the new
         one's weights map; a busy engine refuses unless forced."""
@@ -538,6 +570,8 @@ class ModelHost:
                 revision=revision,
                 draft_model=draft_model,
                 language_only=language_only,
+                thin=thin,
+                selection=selection,
             )
             with self.lock:
                 if self.closed:
@@ -844,6 +878,8 @@ class HostPool:
         revision=None,
         draft_model=None,
         language_only=False,
+        thin=False,
+        selection=None,
     ):
         """Load model_id as a resident: a free slot, a new one under
         max_residents, or — at one resident — the host's own swap."""
@@ -881,6 +917,8 @@ class HostPool:
             revision=revision,
             draft_model=draft_model,
             language_only=language_only,
+            thin=thin,
+            selection=selection,
         )
 
     def unload(self, model_id=None, *, force=False):

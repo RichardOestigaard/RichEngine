@@ -366,7 +366,7 @@ class GgufMetadataTests(unittest.TestCase):
             # not the user-defined <think>.
             ("tokenizer.ggml.eos_token_id", 0),
             ("tokenizer.ggml.eos_token_id", 259),
-            ("tokenizer.ggml.add_bos_token", True),
+            # gpt2/gemma4 BOS addition is supported and covered below.
             ("tokenizer.ggml.add_eos_token", True),
             ("tokenizer.chat_template", ""),
         ):

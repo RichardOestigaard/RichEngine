@@ -229,6 +229,13 @@ constexpr uint64_t int8ScaleBytes(uint32_t width, uint64_t rows) {
   return uint64_t{width} / GGUF_PREFILL_INT8_GROUP * rows * sizeof(float) * 2;
 }
 
+// Staged GGUF prefill's composition-invariant mode. The escape hatch keeps
+// the old row-count-dependent column tiles for performance A/Bs; decode is
+// never affected.
+bool invariantPrefill(const MoePlan &plan) {
+  return plan.phase() == MoePhase::Prefill && !tuning().moeInvariantPrefillOff;
+}
+
 MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows,
                           bool splitExperts, MoeGgufTile ggufTile,
                           bool packedPlane, bool int8Passes,
@@ -283,6 +290,11 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows,
   // live rows alone, so neither holds a row more.
   const uint64_t i8codes = int8Passes ? int8TableBytes(shape.hiddenSize, rows) : 0;
   const uint64_t i8scales = int8Passes ? int8ScaleBytes(shape.hiddenSize, rows) : 0;
+  const uint64_t sharedInputBytes =
+      shape.sharedExpertUnitWeight && shape.weightLayout == WeightLayout::Block32
+          ? uint64_t{tileRows} * std::max(shape.hiddenSize, shape.sharedIntermediate()) *
+                sizeof(uint16_t)
+          : 0;
   return {routes * sizeof(uint32_t), routes * sizeof(float),
           uint64_t{tiles} * sizeof(MoeTileDescriptor),
           statsEnabled() ? kMoeStatsLogOffset +
@@ -296,7 +308,8 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows,
           groupedRows * outputWidth * sizeof(uint16_t), sumsBytes, packedBytes,
           partialBytes, counterBytes, i8codes, i8scales,
           int8Passes ? int8TableBytes(widest, groupedRows) : 0,
-          int8Passes ? int8ScaleBytes(widest, groupedRows) : 0};
+          int8Passes ? int8ScaleBytes(widest, groupedRows) : 0,
+          sharedInputBytes};
 }
 
 // Pipelines, column tiles and threadgroup width of a decode plan's fused
@@ -520,7 +533,8 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeBuffers &buffers,
     const uint32_t columns = n / GGUF_TILE_COLUMNS;
     dispatch(kernel + epilogue + suffix + precision, std::move(bindings),
              MoeGgufExpertParams{k, n, geometry.experts, projection.routed.formatId,
-                                 shared.formatId, splits, ggufTileMajor},
+                                 shared.formatId, splits, ggufTileMajor,
+                                 invariantPrefill(plan) ? 1u : 0u},
              ggufTileMajor ? metal::DispatchSize{tiles * splits, columns, 1}
                            : metal::DispatchSize{columns, tiles * splits, 1},
              {table16 ? GGUF_REGISTER_THREADS : GGUF_STAGED_THREADS, 1, 1},
@@ -554,18 +568,34 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeBuffers &buffers,
       const uint32_t sharedRowBlocks = (rows + tileRows - 1) / tileRows;
       const QuantizedSegment &up = weights.up.shared;
       const QuantizedSegment &down = weights.down.shared;
+      const bool invariant = invariantPrefill(plan);
+      const bool ragged = rows % tileRows != 0;
+      const auto padRows = [&](const metal::MetalBuffer &input, uint32_t width,
+                               uint32_t inputRegion) {
+        if (invariant && ragged)
+          graph.add(std::string(kMoePadRows),
+                    {input, scratch.sharedInput, scratch.tileCount},
+                    MoePadRowsParams{rows, width, tileRows, inputRegion},
+                    {(width + 255) / 256, tileRows, 1}, {256, 1, 1});
+      };
+      padRows(buffers.input, hidden, 0);
       graph.add(kernel,
-                {buffers.input, scratch.tileCount, up.plane0, up.plane1Slot(),
-                 up.meta, scratch.expertIntermediate},
+                {buffers.input, scratch.sharedInput, scratch.tileCount,
+                 up.plane0, up.plane1Slot(), up.meta,
+                 scratch.expertIntermediate},
                 MoeGgufSharedParams{rows, hidden, sharedInter, tileRows,
-                                    up.formatId, 0, intermediate, 1},
+                                    up.formatId, 0, intermediate, 1,
+                                    invariant ? 1u : 0u},
                 {sharedInter / GGUF_TILE_COLUMNS, sharedRowBlocks, 1},
                 {GGUF_STAGED_THREADS, 1, 1});
+      padRows(scratch.expertIntermediate, sharedInter, intermediate);
       graph.add(kernel,
-                {scratch.expertIntermediate, scratch.tileCount, down.plane0,
-                 down.plane1Slot(), down.meta, scratch.expertOutput},
+                {scratch.expertIntermediate, scratch.sharedInput,
+                 scratch.tileCount, down.plane0, down.plane1Slot(), down.meta,
+                 scratch.expertOutput},
                 MoeGgufSharedParams{rows, sharedInter, hidden, tileRows,
-                                    down.formatId, intermediate, hidden, 0},
+                                    down.formatId, intermediate, hidden, 0,
+                                    invariant ? 1u : 0u},
                 {hidden / GGUF_TILE_COLUMNS, sharedRowBlocks, 1},
                 {GGUF_STAGED_THREADS, 1, 1});
     }
@@ -602,7 +632,8 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeBuffers &buffers,
         inputWidth, intermediate, geometry.experts,
         weights.gate.routed.formatId, gateShared.formatId,
         weights.up.routed.formatId, upShared.formatId,
-        ggufTileMajor, shape.routesPerToken()};
+        ggufTileMajor, invariantPrefill(plan) ? 1u : 0u,
+        shape.routesPerToken()};
     const metal::DispatchSize grid =
         ggufTileMajor ? metal::DispatchSize{tiles, intermediate / GGUF_TILE_COLUMNS, 1}
                       : metal::DispatchSize{intermediate / GGUF_TILE_COLUMNS, tiles, 1};
@@ -766,7 +797,8 @@ void addStreamedGgufExperts(metal::CommandGraph &graph,
               MoeGgufStreamParams{k, n, geometry.experts,
                                   projection.routed.formatId, shared.formatId,
                                   streamed.floorSlots, streamed.chunkSlots,
-                                  projectionIndex, 0},
+                                  projectionIndex, 0,
+                                  invariantPrefill(plan) ? 1u : 0u},
               {n / GGUF_TILE_COLUMNS, tiles, 1},
               {GGUF_STAGED_THREADS, 1, 1});
   };

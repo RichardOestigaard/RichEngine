@@ -608,6 +608,27 @@ PrefillAttentionPlan PagedAttention::prefillPlan(uint32_t rows, uint32_t queryHe
           layout.format, layout.scoreScale, layout.windowTokens, sparse, duo};
 }
 
+PrefillAttentionPlan PagedAttention::prefillWideInt8Plan(
+    const PrefillAttentionPlan &base, uint32_t queryHeads, kv::Layout layout) {
+  if (base.splitPipeline != "prefill_attention_q8_split_kv4_g4" ||
+      base.format != kv::Format::Int8 || queryHeads != 16 ||
+      layout.kvHeads != 4 || layout.headDimension != 256)
+    throw std::invalid_argument(
+        "wide prefill requires ordinary INT8 KV4 group-4 attention");
+  const uint32_t tiles = (base.rows + 15) / 16;
+  return {base.rows,
+          base.splits,
+          attentionWorkspace(uint64_t{tiles} * base.splits * 16 * queryHeads,
+                             256),
+          "prefill_attention_q8_split_kv4_g4_m16",
+          "prefill_attention_reduce_kv4_g4_m16",
+          {4, tiles, base.splits},
+          {4, 64, tiles},
+          base.reduceThreads,
+          base.format,
+          base.scoreScale};
+}
+
 PrefillAttentionPlan
 PagedAttention::prefillCanvasPlan(uint32_t rows, uint32_t queryHeads,
                                   kv::Layout layout) {

@@ -31,6 +31,8 @@ template <class F> ScopeExit<F> scopeExit(F action) {
     entry.corpusRounds = 0;
     entry.corpusAcceptedAvg = 0;
     entry.corpusInFlight = false;
+    entry.corpusMatchLength = 0;
+    entry.corpusChainLength = 0;
     entry.corpusSession = ngram::sessionKey(prompt);
     if (!ngramPredraftEnabled() && !std::holds_alternative<NullDraft>(draftModel))
       return;
@@ -250,36 +252,49 @@ template <class F> ScopeExit<F> scopeExit(F action) {
     double mixExpect = 0;
     bool sampledLane = false;
     const auto acceptanceSum = [&](const Request &entry, uint32_t matchLength,
-                                   uint32_t chainLength) {
+                                   uint32_t chainLength, uint32_t lane,
+                                   std::span<const uint32_t> chain) {
       double survival = 1.0;
       double total = 0;
+      // An overlapped predraft may still be writing its candidate rows.
+      // Read them only once the ticket signals completion; an already
+      // settled adoption carries no submitted ticket. Queue ordering makes
+      // the rows correct for verification either way, but the host may not
+      // race the GPU for its scoring evidence.
+      const bool candidatesReady =
+          !gpuPredraft_.submitted || gpuPredraft_.ticket.ready();
+      const std::span<const uint32_t> candidates =
+          ngram_.draftAgreement_ && mixOnly && candidatesReady
+              ? draftCandidateRow(lane, width)
+              : std::span<const uint32_t>{};
+      const uint32_t stride = draftCandidateStride();
+      if (!candidates.empty())
+        ++counters.ngramAgreementQueries;
       for (uint32_t depth = 0; depth < chainLength; ++depth) {
+        const LookupAgreement agreement =
+            depth < chain.size()
+                ? lookupAgreement(chain[depth], depth, candidates, stride)
+                : LookupAgreement::Unknown;
+        if (!candidates.empty())
+          ++counters.ngramAgreementLabels[static_cast<uint32_t>(agreement)];
         survival *= ngram_.lookupAcceptance_.rate(
-            samplingEnabled(entry), matchLength, depth,
-            LookupAgreement::Unknown);
+            samplingEnabled(entry), matchLength, depth, agreement);
         total += survival;
       }
       return total;
     };
     // O6: blend the lane's residual EWMA with this step's match-depth prior.
     // scoreBlend is the prior's weight; 0.5 halves stale-EWMA domination.
+    // Draft agreement sharpens the same prior when an adopted GPU predraft's
+    // candidate rows are already available.
     const auto blendLaneScore = [&](const Request &entry, double base,
                                     uint32_t matchLength,
-                                    uint32_t chainLength) {
-      if (!ngram_.stepScore_ || !chainLength)
+                                    uint32_t chainLength, uint32_t lane,
+                                    std::span<const uint32_t> chain) {
+      if (!(ngram_.stepScore_ || ngram_.draftAgreement_) || !chainLength)
         return base;
-      // The prior is a cumulative-survival sum: rate() is conditional on
-      // the parent surviving, so depth d contributes only after every
-      // earlier conditional acceptance. Summing the conditionals would
-      // overestimate deep chains.
-      double survival = 1.0;
-      double prior = 0.0;
-      for (uint32_t depth = 0; depth < chainLength; ++depth) {
-        survival *= ngram_.lookupAcceptance_.rate(
-            samplingEnabled(entry), matchLength, depth,
-            LookupAgreement::Unknown);
-        prior += survival;
-      }
+      const double prior =
+          acceptanceSum(entry, matchLength, chainLength, lane, chain);
       if (base <= 0)
         return prior;
       const double blend = std::clamp(ngram_.scoreBlend_, 0.0, 1.0);
@@ -413,6 +428,9 @@ template <class F> ScopeExit<F> scopeExit(F action) {
           corpusPatterns[lane] = corpusPattern;
           ngram_.chainSources_[lane] = NgramPredraft::ChainSource::Corpus;
           ngram_.chainPatterns_[lane] = corpusPattern;
+          entry.corpusMatchLength = corpusPattern;
+          entry.corpusChainLength = corpusFound;
+          std::copy(corpus.begin(), corpus.end(), entry.corpusChain.begin());
           if (ngramDebug_)
             fprintf(stderr, "  corpus-displaced lane=%u cfound=%u cext=%u\n",
                     lane, corpusFound, corpusExtension);
@@ -441,15 +459,18 @@ template <class F> ScopeExit<F> scopeExit(F action) {
           const double lookupBase =
               entry.lookupRounds >= ngram_.ngramWarmup_
                   ? entry.lookupAcceptedAvg
-                  : acceptanceSum(entry, lookupMatch.length, lookupDepth);
+                  : acceptanceSum(entry, lookupMatch.length, lookupDepth, lane,
+                            lookupTokens);
           lookupLaneScore = blendLaneScore(
-              entry, lookupBase, lookupMatch.length, lookupDepth);
+              entry, lookupBase, lookupMatch.length, lookupDepth, lane,
+              lookupTokens);
           double selfCompare =
               ngramLaneScore(entry, found != 0, !nullDraft);
           if (ngram_.chainSources_[lane] == NgramPredraft::ChainSource::Self)
             selfCompare = blendLaneScore(
                 entry, selfCompare, ngram_.chainPatterns_[lane],
-                ngramScoringDepth(entry, found));
+                ngramScoringDepth(entry, found), lane,
+                {proposals[lane].data(), size_t{found}});
           if (lookupLaneScore > selfCompare) {
             found = static_cast<uint32_t>(lookupTokens.size());
             std::copy(lookupTokens.begin(), lookupTokens.end(),
@@ -495,13 +516,14 @@ template <class F> ScopeExit<F> scopeExit(F action) {
       if (!entry.lookupSourced &&
           ngram_.chainSources_[lane] == NgramPredraft::ChainSource::Self)
         nScore = blendLaneScore(entry, nScore, ngram_.chainPatterns_[lane],
-                                ngramScoringDepth(entry, found));
+                                ngramScoringDepth(entry, found), lane,
+                                {proposals[lane].data(), size_t{found}});
       // A corpus-displaced chain carries its own evidence — the pattern
       // length that won the margin is a direct measurement, not an EWMA
       // estimate — so it scores itself instead of waiting on a prior the
       // draft-blind content could never clear.
       if (corpusLanes[lane]) {
-        if (ngram_.stepScore_) {
+        if (ngram_.stepScore_ || ngram_.draftAgreement_) {
           // O6 prices corpus chains by the same conditional-survival
           // evidence as lookup chains. The legacy pattern-length score is
           // nearly always fifteen for a long hit, so it displaces a strong
@@ -511,9 +533,11 @@ template <class F> ScopeExit<F> scopeExit(F action) {
           const double corpusBase =
               entry.corpusRounds
                   ? entry.corpusAcceptedAvg
-                  : acceptanceSum(entry, corpusPatterns[lane], corpusDepth);
+                  : acceptanceSum(entry, corpusPatterns[lane], corpusDepth, lane,
+                                     {proposals[lane].data(), size_t{found}});
           nScore = blendLaneScore(entry, corpusBase, corpusPatterns[lane],
-                                  corpusDepth);
+                                  corpusDepth, lane,
+                                  {proposals[lane].data(), size_t{found}});
         } else {
           nScore = std::max(
               nScore, std::min<double>(corpusPatterns[lane],

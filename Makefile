@@ -26,7 +26,9 @@ LANGUAGE_ONLY ?=
 MODEL_ARGS = --model "$(MODEL)" $(if $(REVISION),--revision "$(REVISION)") \
 	$(if $(DRAFT_MODEL),--draft-model "$(DRAFT_MODEL)") \
 	$(if $(filter 1,$(LANGUAGE_ONLY)),--language-only)
-MODEL_INSTALL = $(PYTHON) install/models.py $(MODEL_ARGS)
+MODELS_DIR ?=
+MODEL_INSTALL = $(PYTHON) install/models.py \
+	$(if $(MODELS_DIR),--models "$(MODELS_DIR)") $(MODEL_ARGS)
 # The installation's selection link, as the installer names it.
 MODEL_ROOT = $(if $(MODEL),$(shell $(MODEL_INSTALL) link))
 # Where the release targets record the model's results. No ':' in the name:

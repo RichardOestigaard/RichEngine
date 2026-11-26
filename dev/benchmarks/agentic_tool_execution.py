@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import py_compile
+import subprocess
 import sys
 import tempfile
 import time
@@ -79,6 +80,19 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_python_tests",
+            "description": "Run unittest discovery below a workspace directory with a ten-second timeout.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
 
@@ -111,6 +125,7 @@ def safe_path(root: Path, value: str) -> Path:
 
 
 def execute_tool(root: Path, name: str, arguments: str) -> str:
+    root = root.resolve()
     try:
         args = json.loads(arguments or "{}")
         if name == "write_file":
@@ -131,6 +146,30 @@ def execute_tool(root: Path, name: str, arguments: str) -> str:
                 return json.dumps({"ok": True, "path": args["path"], "valid": True})
             except py_compile.PyCompileError as error:
                 return json.dumps({"ok": True, "path": args["path"], "valid": False, "error": str(error)})
+        if name == "run_python_tests":
+            path = safe_path(root, args.get("path", "."))
+            env = dict(os.environ)
+            env.update({
+                "PYTHONPATH": str(root),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "HOME": str(root),
+            })
+            proc = subprocess.run(
+                [sys.executable, "-m", "unittest", "discover", "-s", str(path), "-t", str(root), "-p", "test*.py"],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            output = (proc.stdout + proc.stderr)[-3000:]
+            return json.dumps({
+                "ok": True,
+                "path": args.get("path", "."),
+                "passed": proc.returncode == 0,
+                "returncode": proc.returncode,
+                "output": output,
+            })
         return json.dumps({"ok": False, "error": f"unknown tool {name}"})
     except Exception as error:  # tool errors are observations, not harness failures
         return json.dumps({"ok": False, "error": str(error)[:500]})

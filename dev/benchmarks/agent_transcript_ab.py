@@ -31,7 +31,9 @@ DEFAULT_MODEL = "ornith-ai/Ornith-1.5-35B-A3B-MLX-4bit"
 
 ARMS = {
     "neural": {
+        "RICHENGINE_NGRAM_PREDRAFT": "0",
         "RICHENGINE_NGRAM_GPU_MIX": "0",
+        "RICHENGINE_NGRAM_MIX": "0",
     },
     "corpus_mix": {
         "RICHENGINE_NGRAM_GPU_MIX": "1",
@@ -120,6 +122,11 @@ def scalar_metrics(payload: dict) -> dict:
         "chain_tokens": ngram.get("chain_tokens") or 0,
         "verify_rows_total": ngram.get("verify_rows_total") or 0,
         "host_microseconds": ngram.get("host_microseconds") or 0,
+        "agreement_queries": ngram.get("agreement_queries") or 0,
+        "agreement_top": (ngram.get("agreement_labels") or {}).get("top") or 0,
+        "agreement_candidate": (ngram.get("agreement_labels") or {}).get("candidate") or 0,
+        "agreement_absent": (ngram.get("agreement_labels") or {}).get("absent") or 0,
+        "agreement_unknown": (ngram.get("agreement_labels") or {}).get("unknown") or 0,
     }
 
 
@@ -143,17 +150,19 @@ def ratio(numerator: float, denominator: float) -> float:
 
 
 def compare(rows: list[dict]) -> dict:
-    neural = [row["metrics"]["wall_tok_s"] for row in rows if row["arm"] == "neural"]
-    mixed = [row["metrics"]["wall_tok_s"] for row in rows if row["arm"] == "corpus_mix"]
-    decode_neural = [row["metrics"]["decode_tok_s_median"] for row in rows if row["arm"] == "neural"]
-    decode_mixed = [row["metrics"]["decode_tok_s_median"] for row in rows if row["arm"] == "corpus_mix"]
+    names = list(ARMS)
+    control, treatment = names[0], names[1]
+    neural = [row["metrics"]["wall_tok_s"] for row in rows if row["arm"] == control]
+    mixed = [row["metrics"]["wall_tok_s"] for row in rows if row["arm"] == treatment]
+    decode_neural = [row["metrics"]["decode_tok_s_median"] for row in rows if row["arm"] == control]
+    decode_mixed = [row["metrics"]["decode_tok_s_median"] for row in rows if row["arm"] == treatment]
     mean_ratio = ratio(statistics.mean(mixed), statistics.mean(neural)) if neural and mixed else 0
     decode_ratio = ratio(statistics.mean(decode_mixed), statistics.mean(decode_neural)) if decode_neural and decode_mixed else 0
     paired = []
     reps = sorted({row["repetition"] for row in rows})
     for rep in reps:
-        base = [row["metrics"]["wall_tok_s"] for row in rows if row["repetition"] == rep and row["arm"] == "neural"]
-        test = [row["metrics"]["wall_tok_s"] for row in rows if row["repetition"] == rep and row["arm"] == "corpus_mix"]
+        base = [row["metrics"]["wall_tok_s"] for row in rows if row["repetition"] == rep and row["arm"] == control]
+        test = [row["metrics"]["wall_tok_s"] for row in rows if row["repetition"] == rep and row["arm"] == treatment]
         if base and test and base[0]:
             paired.append(test[0] / base[0])
     return {
@@ -178,6 +187,7 @@ def main() -> int:
     parser.add_argument("--max-memory", default="30G")
     parser.add_argument("--max-message-chars", type=int, default=6000)
     parser.add_argument("--mode", choices=("shadow", "live"), default="shadow")
+    parser.add_argument("--experiment", choices=("neural-vs-mix", "agreement"), default="neural-vs-mix")
     parser.add_argument("--fixed-width", action="store_true", help="pin sessions to lanes, synchronize turns, and ignore EOS")
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--order", choices=("abba", "ab"), default="abba")
@@ -185,6 +195,18 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=ROOT / "scratch/agent-transcripts/transcript-ab.json")
     parser.add_argument("--keep-going", action="store_true")
     args = parser.parse_args()
+
+    if args.experiment == "agreement":
+        base = {
+            "RICHENGINE_NGRAM_GPU_MIX": "1",
+            "RICHENGINE_NGRAM_GPU_MIX_MIN_WIDTH": "2",
+            "RICHENGINE_NGRAM_MIX_CORPUS_ONLY": "1",
+        }
+        ARMS.clear()
+        ARMS.update({
+            "legacy_mix": dict(base),
+            "agreement_mix": {**base, "RICHENGINE_NGRAM_DRAFT_AGREEMENT": "1"},
+        })
 
     binary = Path(args.binary).resolve()
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -217,6 +239,7 @@ def main() -> int:
             "sessions": args.sessions,
             "lanes": args.lanes,
             "mode": args.mode,
+            "experiment": args.experiment,
             "repeat": args.repeat,
             "order": args.order,
             "runs": rows,

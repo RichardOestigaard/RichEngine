@@ -202,9 +202,17 @@ class LocalTest(unittest.TestCase):
             record["sources"]["target"],
             {"repo": str(directory.resolve()), "revision": None},
         )
-        # Its weights link into the LM Studio directory, not the Hub cache.
+        # Its weights adopt into the store's content-addressed blobs as
+        # zero-copy hardlinks of the LM Studio file, never copies.
         linked = (chosen.link / "target" / "model.safetensors").resolve()
-        self.assertEqual(linked, directory.resolve() / "model.safetensors")
+        source = directory.resolve() / "model.safetensors"
+        self.assertEqual(
+            linked.parent, (self.root / "models" / ".blobs").resolve()
+        )
+        self.assertEqual(
+            (linked.stat().st_dev, linked.stat().st_ino),
+            (source.stat().st_dev, source.stat().st_ino),
+        )
         # Starting it again keeps the installed assembly.
         upstream.prepare(chosen)
 

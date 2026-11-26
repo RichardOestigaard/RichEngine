@@ -4,6 +4,7 @@ import errno
 import fcntl
 import io
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -31,6 +32,7 @@ from dev.tests.installer_fixtures import (
     text_config,
 )
 from install import assembly, families, hub, legacy, models, upstream
+from install import gc as hub_gc
 
 
 class UpstreamTest(unittest.TestCase):
@@ -612,8 +614,9 @@ class UpstreamTest(unittest.TestCase):
                 },
             ),
             ("mxfp4", {"quantization": {"mode": "mxfp4", "bits": 4, "group_size": 64}}),
-            # Outside the oQ affine matrix (4-8 bits, groups of 64 or 128).
-            ("q3", {"quantization": {"bits": 3, "group_size": 64}}),
+            # Outside the oQ affine matrix (2, 3, 4, 5, 6 or 8 bits,
+            # groups of 64 or 128).
+            ("q7", {"quantization": {"bits": 7, "group_size": 64}}),
             ("g32", {"quantization": {"bits": 4, "group_size": 32}}),
             ("g256", {"quantization": {"bits": 4, "group_size": 256}}),
         ):
@@ -754,18 +757,168 @@ class UpstreamTest(unittest.TestCase):
         self.assertFalse((chosen.link / "vision").exists())
         snapshot = fake.snapshot(chosen.model, "a" * 40)
         for name in ("tokenizer.json", "tokenizer_config.json"):
-            self.assertEqual(
-                (chosen.link / "tokenizer" / name).readlink(), snapshot / name
-            )
+            link = (chosen.link / "tokenizer" / name).readlink()
+            self.assertEqual(link.parent.name, ".blobs")
+            self.assertEqual(link.read_bytes(), (snapshot / name).read_bytes())
         # The paths the native loaders and the tokenizer read (assembly.py).
         for name in ("config.json", "target/config.json", "tokenizer/config.json"):
-            self.assertEqual((chosen.link / name).readlink(), snapshot / "config.json")
+            link = (chosen.link / name).readlink()
+            self.assertEqual(link.parent.name, ".blobs")
+            self.assertEqual(link.read_bytes(), (snapshot / "config.json").read_bytes())
         self.assertEqual(
             (chosen.link / "draft/model.safetensors").read_bytes(), b"draft"
         )
         (snapshot / "tokenizer.json").write_text("changed size")
         with self.assertRaises(models.ModelError):
             assembly.verify(chosen.link)
+
+    def test_owned_blobs_hardlink_survive_sources_and_gc_prunes_orphans(self):
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        link = chosen.link / "target/config.json"
+        blob = link.readlink()
+        source = (
+            self.cache / hub.folder_name(MODEL) / "snapshots" / ("a" * 40) / "config.json"
+        )
+        self.assertEqual(
+            blob.parent.resolve(), (self.root / "models/.blobs").resolve()
+        )
+        self.assertEqual(
+            (blob.stat().st_dev, blob.stat().st_ino),
+            (source.stat().st_dev, source.stat().st_ino),
+        )
+        source.unlink()
+        self.assertEqual(assembly.verify(chosen.link)["model"], MODEL)
+        orphan = blob.parent / "orphan"
+        orphan.write_bytes(b"orphan")
+        orphans = hub_gc.owned_blob_plan(self.root / "models")
+        self.assertIn(orphan.resolve(), [path.resolve() for path in orphans])
+        self.assertNotIn(blob.resolve(), [path.resolve() for path in orphans])
+        with models.installation_lock(self.root / "models"):
+            assembly.collect_garbage(self.root / "models")
+        self.assertTrue(blob.exists())
+        self.assertFalse(orphan.exists())
+
+    def test_packed_cache_gc_keeps_live_assembly_entries(self):
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        live_name = chosen.link.resolve().name
+        cache_root = self.root / "packed-cache"
+        live = cache_root / "live"
+        orphan = cache_root / "orphan"
+        for entry in (live, orphan):
+            (entry / ".owners").mkdir(parents=True)
+            (entry / "layer-0.bin").write_bytes(b"weights")
+        (live / ".owners" / live_name).write_text(str(chosen.link.resolve()))
+        (orphan / ".owners" / ("d" * 64)).write_text("retired")
+        plan = hub_gc.packed_cache_plan(chosen.models_root, cache_root)
+        self.assertNotIn(live, plan)
+        self.assertIn(orphan, plan)
+        freed = hub_gc.execute(
+            {
+                "info": None,
+                "owned_blobs": {},
+                "packed_cache": plan,
+                "dead_revisions": [],
+                "incomplete": [],
+                "shared_blobs": {},
+                "cache_dir": self.cache,
+            }
+        )
+        self.assertEqual(freed, plan[orphan])
+        self.assertTrue(live.is_dir())
+        self.assertFalse(orphan.exists())
+
+    def test_thin_mlx_install_drops_sources_after_cache_validation(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root, thin=True)
+        output, _ = self.prepare(chosen)
+        self.assertIn("Installing", output)
+        self.assertIn("thin: payload links stay until the first successful serve", output)
+        self.assertIn("Linking weights into the model store", output)
+        record = assembly.verify(chosen.link)
+        self.assertIs(record["thin"], True)
+        self.assertTrue((chosen.link / "target/packed-manifest.json").is_file())
+        self.assertTrue((chosen.link / "target/packed-sources").is_file())
+        payload = chosen.link / "target/model.safetensors"
+        blob = payload.readlink()
+        self.assertEqual(blob.parent.name, ".blobs")
+
+        # Missing payload is corruption until the runtime has validated a
+        # complete packed cache for this exact assembly.
+        payload.unlink()
+        cache_root = self.root / "packed-cache"
+        with (
+            mock.patch.dict(
+                os.environ, {"RICHENGINE_PACKED_CACHE_ROOT": str(cache_root)}
+            ),
+            mock.patch.object(
+                assembly, "_engine_fingerprint_text", return_value="fingerprint"
+            ),
+        ):
+            with self.assertRaisesRegex(models.ModelError, "file missing"):
+                assembly.verify(chosen.link)
+        os.symlink(blob, payload)
+
+        entry = cache_root / "cache-key"
+        (entry / ".validated").mkdir(parents=True)
+        (entry / "layer-0.bin").write_bytes(b"weights")
+        (entry / ".packed").write_text("layer-0.bin 0 0 0 7\n")
+        (entry / ".validated" / chosen.link.resolve().name).write_text("assembly\nfingerprint\n")
+        target_ref = hub.pinned(fake.snapshot(MODEL, "a" * 40), chosen.link)
+        self.assertTrue(target_ref.is_file())
+        with (
+            mock.patch.dict(
+                os.environ, {"RICHENGINE_PACKED_CACHE_ROOT": str(cache_root)}
+            ),
+            mock.patch.object(
+                assembly, "_engine_fingerprint_text", return_value="fingerprint"
+            ),
+        ):
+            with contextlib.redirect_stdout(io.StringIO()) as notice:
+                self.assertIsNone(upstream._retain_installed(chosen))
+            self.assertIn("thin: dropped 1 payload links", notice.getvalue())
+            self.assertIn(str(cache_root), notice.getvalue())
+            record = assembly.verify(chosen.link)
+            self.assertTrue(assembly.thin_cache_valid(chosen.link))
+        with mock.patch.object(
+            assembly, "_engine_fingerprint_text", return_value="rebuilt"
+        ):
+            self.assertFalse(assembly.thin_cache_valid(chosen.link))
+        self.assertFalse(payload.exists())
+        self.assertFalse(blob.exists())
+        self.assertFalse(target_ref.exists())
+        self.assertIs(record["thin"], True)
+
+        # Losing the packed cache makes verification fail again; the next
+        # prepare redownloads/rebuilds the source-backed assembly, after
+        # which the runtime can pack and validate a new cache.
+        shutil.rmtree(cache_root)
+        with mock.patch.dict(
+            os.environ, {"RICHENGINE_PACKED_CACHE_ROOT": str(cache_root)}
+        ):
+            self.prepare(chosen)
+            assembly.verify(chosen.link)
+        self.assertTrue(payload.is_file())
+
+    def test_thin_rejects_mixed_quantization_sources(self):
+        fake = FakeHub(self, self.cache)
+        def oq_target(path):
+            mlx_target(path, DENSE)
+            config = json.loads((path / "config.json").read_text())
+            config["quantization"] = {
+                "bits": 4,
+                "group_size": 64,
+                "model.embed_tokens": {"bits": 8, "group_size": 64},
+            }
+            (path / "config.json").write_text(json.dumps(config))
+
+        fake.publish("someone/oq", "e" * 40, oq_target)
+        fake.publish(DENSE.draft.repo, DRAFT_COMMIT, lambda path: draft_dir(path, DENSE))
+        with self.assertRaisesRegex(models.ModelError, "mixed-quantization"):
+            self.prepare(selection(self.root, "someone/oq", thin=True))
 
     def test_mlx_vision_links_only_the_shards_holding_the_tower(self):
         shards = {

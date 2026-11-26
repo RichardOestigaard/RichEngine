@@ -1477,6 +1477,29 @@ kernel void moe_route_group_sigmoid(
                        simd_group, threads);
 }
 
+// Copies the final dense row block into one zero-padded tile. The GGUF
+// shared expert's composition-invariant prefill runs that ragged block on
+// the full staged matmul; rows past `rows` must exist and read as zero.
+kernel void moe_pad_rows(device const bfloat *input [[buffer(0)]],
+                         device bfloat *padded [[buffer(1)]],
+                         device const uint *tile_count [[buffer(2)]],
+                         constant MoePadRowsParams &params [[buffer(3)]],
+                         uint2 group [[threadgroup_position_in_grid]],
+                         uint thread_index [[thread_index_in_threadgroup]]) {
+  const uint column = group.x * 256 + thread_index;
+  if (column >= params.input_size)
+    return;
+  const uint blocks = (params.rows + params.tile_rows - 1) / params.tile_rows;
+  const uint row = (blocks - 1) * params.tile_rows + group.y;
+  const ulong tiles = ulong(*tile_count) * params.tile_rows;
+  device const bfloat *source = input +
+      (params.input_region ? tiles * params.input_region : 0ul);
+  padded[ulong(group.y) * params.input_size + column] =
+      row < params.rows
+          ? source[ulong(row) * params.input_size + column]
+          : bfloat(0.0f);
+}
+
 // Copies each grouped row's input so every expert tile is a dense matrix,
 // over the rows its matmul reads (moe_matmul_rows): padding rows among them
 // are zero and their outputs are never read.

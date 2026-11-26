@@ -153,7 +153,7 @@ class ThinkingKeyTests(unittest.TestCase):
                 "load_thinking_key",
                 side_effect=ThinkingKeyError("invalid key file"),
             ),
-            mock.patch.object(model_host.AutoTokenizer, "from_pretrained") as tokenizer,
+            mock.patch("transformers.AutoTokenizer.from_pretrained") as tokenizer,
             mock.patch.object(
                 model_host.engine_runtime, "MultiplexedRuntime"
             ) as runtime,

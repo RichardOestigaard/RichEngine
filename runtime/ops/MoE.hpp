@@ -258,6 +258,9 @@ struct MoeWorkspace final {
   uint64_t inputScalesBytes = 0;
   uint64_t groupedCodesBytes = 0;
   uint64_t groupedScalesBytes = 0;
+  // One tile of zero-padded dense shared-expert input rows, used only by
+  // composition-invariant GGUF prefill's ragged row block.
+  uint64_t sharedInputBytes = 0;
   bool operator==(const MoeWorkspace &) const = default;
 };
 
@@ -296,6 +299,8 @@ struct MoeScratch final {
   metal::MetalBuffer inputScales;
   metal::MetalBuffer groupedCodes;
   metal::MetalBuffer groupedScales;
+  // One tile of padded dense shared-expert input rows (moe_pad_rows).
+  metal::MetalBuffer sharedInput;
 };
 
 // Each scratch buffer with the workspace field that sizes it, in field order.
@@ -303,7 +308,7 @@ struct MoeScratchField final {
   metal::MetalBuffer MoeScratch::*buffer;
   uint64_t MoeWorkspace::*bytes;
 };
-inline constexpr std::array<MoeScratchField, 17> kMoeScratchFields{{
+inline constexpr std::array<MoeScratchField, 18> kMoeScratchFields{{
     {&MoeScratch::selectedExperts, &MoeWorkspace::selectedExpertsBytes},
     {&MoeScratch::routingWeights, &MoeWorkspace::routingWeightsBytes},
     {&MoeScratch::tileDescriptors, &MoeWorkspace::tileDescriptorsBytes},
@@ -321,6 +326,7 @@ inline constexpr std::array<MoeScratchField, 17> kMoeScratchFields{{
     {&MoeScratch::inputScales, &MoeWorkspace::inputScalesBytes},
     {&MoeScratch::groupedCodes, &MoeWorkspace::groupedCodesBytes},
     {&MoeScratch::groupedScales, &MoeWorkspace::groupedScalesBytes},
+    {&MoeScratch::sharedInput, &MoeWorkspace::sharedInputBytes},
 }};
 static_assert(sizeof(MoeWorkspace) == kMoeScratchFields.size() * sizeof(uint64_t) &&
               sizeof(MoeScratch) == kMoeScratchFields.size() * sizeof(metal::MetalBuffer),

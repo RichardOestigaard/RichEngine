@@ -3,14 +3,17 @@ the affine quantization and the section order readLayer reads, exercised on
 a synthetic safetensors checkpoint at a shrunken layout."""
 
 import json
+import os
 import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
-from install import pack, pack_layouts
+from install import families, hub, pack, pack_layouts
 
 
 def bf16(values):
@@ -487,6 +490,67 @@ class PackTests(unittest.TestCase):
             struct.pack("<8sII", b"GEMM0001", 1, 1),
         )
         pack.verify(stage)
+
+    def test_install_retires_source_pins_unless_keep_sources_is_set(self):
+        family = families.named("Gemma4-26B-A4B")
+        commit = "a" * 40
+        snapshot = (
+            self.root
+            / "hub/models--owner--gemma4-test/snapshots"
+            / commit
+        )
+        snapshot.mkdir(parents=True)
+        shard = snapshot / "model.safetensors"
+        shard.write_bytes(b"weights")
+        selection = SimpleNamespace(
+            models_root=self.root / "models",
+            link=self.root / "models/owner/gemma4-test",
+            model="owner/gemma4-test",
+        )
+        repo = SimpleNamespace(
+            name="owner/gemma4-test",
+            revision=commit,
+            identity=lambda: {"repo": "owner/gemma4-test", "revision": commit},
+        )
+        target_files = {"model.safetensors": shard}
+        pin = hub.pinned(snapshot, selection.link)
+
+        def install():
+            with (
+                mock.patch.object(pack, "build_package", return_value={"packed": True}),
+                mock.patch.object(pack, "verify", return_value={"packed": True}),
+            ):
+                pack.install(
+                    selection,
+                    family,
+                    {"text_config": {"model_type": "gemma4_text"}},
+                    repo,
+                    target_files,
+                    None,
+                    {},
+                )
+
+        pin.parent.mkdir(parents=True, exist_ok=True)
+        pin.write_text(commit)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("RICHENGINE_PACK_KEEP_SOURCES", None)
+            install()
+        self.assertFalse(pin.exists())
+
+        selection.link.unlink()
+        with mock.patch.dict(os.environ, {"RICHENGINE_PACK_KEEP_SOURCES": "1"}):
+            install()
+        self.assertTrue(pin.exists())
+        with (
+            mock.patch.dict(os.environ, {}, clear=False),
+            mock.patch("huggingface_hub.constants.HF_HUB_CACHE", str(self.root / "hub")),
+        ):
+            os.environ.pop("RICHENGINE_PACK_KEEP_SOURCES", None)
+            pack.retire_source_pins(
+                selection.link,
+                {"sources": {"target": {"repo": repo.name, "revision": commit}}},
+            )
+        self.assertFalse(pin.exists())
 
     def test_diffusion_checkpoint_is_packable(self):
         self.assertTrue(pack.packable(DIFFUSION_CONFIG))

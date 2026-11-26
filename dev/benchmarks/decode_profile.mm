@@ -242,7 +242,7 @@ int main(int argc, char **argv) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "--memory-cap-mib MIB "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
-                     "[--prompt-file PATH] [--dump-tokens PATH] "
+                     "[--prompt-file PATH] [--dump-tokens PATH] [--fused-only 1] [--max-width N] "
                      "[--weight-layout auto|affine|block] "
                      "[--ane-ffn-share SHARE|auto] "
                      "[--ane-ffn-minimum-rows N]\n";
@@ -262,6 +262,8 @@ int main(int argc, char **argv) {
       std::optional<double> aneFfnShare;
       std::optional<uint32_t> aneFfnMinimumRows;
       bool aneFfnCalibrate = false;
+      bool fusedOnly = false;
+      uint32_t maxWidth = 4;
       for (int index = 3; index < argc; index += 2) {
         const std::string_view option(argv[index]);
         if (index + 1 >= argc)
@@ -274,6 +276,14 @@ int main(int argc, char **argv) {
           dumpTokens = argv[index + 1];
         else if (option == "--cycles")
           cycles = parseCount(argv[index + 1], "--cycles");
+        else if (option == "--max-width") {
+          maxWidth = parseCount(argv[index + 1], "--max-width");
+          if (maxWidth > 4) throw std::invalid_argument("--max-width exceeds 4");
+        } else if (option == "--fused-only") {
+          if (std::string_view(argv[index + 1]) != "1")
+            throw std::invalid_argument("--fused-only takes 1");
+          fusedOnly = true;
+        }
         else if (option == "--kv-format") {
           const std::string_view value(argv[index + 1]);
           if (value != "int8" && value != "bf16")
@@ -351,7 +361,7 @@ int main(int argc, char **argv) {
 
       const std::vector<uint32_t> prompt =
           promptFile ? filePrompt(promptFile) : chatPrompt(promptTokens);
-      // Enough Page32 pages for four lanes of prompt plus generated rows.
+      // Enough Page32 pages for measured lanes and their generated rows.
       const uint32_t pagesPerLane =
           (static_cast<uint32_t>(prompt.size()) + 256 +
            model::ExecutionLimits::targetVerifyRows) /
@@ -362,7 +372,7 @@ int main(int argc, char **argv) {
       const kv::Layout kvLayout = model.targetKvLayout(format);
       const uint32_t extentPages = kvLayout.maximumExtentPages();
       const uint32_t pageCount =
-          (pagesPerLane * 4 + extentPages - 1) / extentPages * extentPages;
+          (pagesPerLane * maxWidth + extentPages - 1) / extentPages * extentPages;
       MemoryGovernor governor(backend, cap, hostReserve,
                               queryHostAvailableMemory, 0);
       kv::PageStorage pages(backend, governor.allocationAdmission(), kvLayout,
@@ -446,13 +456,15 @@ int main(int argc, char **argv) {
                   cycles);
 
       std::array<Lane, 4> lanes;
-      for (uint32_t index = 0; index < lanes.size(); ++index) {
+      for (uint32_t index = 0; index < maxWidth; ++index) {
         lanes[index] = {index + 1, index, 0,
                         pageRange(index * pagesPerLane, pagesPerLane), 1, {}};
       }
       // Warm prefill and B1 decode with real work before measuring.
       admission(0);
-      prefill(executor, lanes[0], prompt);
+      const std::span<const uint32_t> warmPrompt(prompt);
+      prefill(executor, lanes[0], fusedOnly ? warmPrompt.first(std::min<size_t>(
+          warmPrompt.size(), model::ExecutionLimits::prefillTokenBudget)) : warmPrompt);
       admission(0);
       static_cast<void>(decodeCycle(backend, executor, std::span<Lane>(&lanes[0], 1)));
       executor.end(lanes[0].id);
@@ -471,8 +483,8 @@ int main(int argc, char **argv) {
           executor.telemetry().totalPrefillGpuSeconds - prefillBefore;
       std::printf("prefill %u rows: fused gpu %.2f ms, wall %.2f ms\n",
                   promptTokens, prefillFused * 1e3, prefillWall * 1e3);
-      executor.end(lanes[0].id);
-      if (aneFfn && aneFfn->splits(std::min<uint32_t>(
+      if (!fusedOnly) executor.end(lanes[0].id);
+      if (!fusedOnly && aneFfn && aneFfn->splits(std::min<uint32_t>(
               prompt.size(), model::ExecutionLimits::prefillTokenBudget))) {
         // A chunk the Neural Engine split takes encodes event steps, which
         // dispatch profiling cannot replay — the fused time above is the
@@ -482,7 +494,7 @@ int main(int argc, char **argv) {
                     promptTokens);
         admission(0);
         prefill(executor, lanes[0], prompt);
-      } else {
+      } else if (!fusedOnly) {
         BackendInstrumentation::setDispatchProfiling(backend, true);
         admission(0);
         prefill(executor, lanes[0], prompt);
@@ -517,6 +529,7 @@ int main(int argc, char **argv) {
                     title, median.gpuSeconds * 1e3, median.wallSeconds * 1e3,
                     static_cast<unsigned long long>(median.commands),
                     tokens / gpuTotal, tokens / wallTotal);
+        if (fusedOnly) return;
         BackendInstrumentation::setDispatchProfiling(backend, true);
         for (uint32_t cycle = 0; cycle < cycles; ++cycle) {
           admission(0);
@@ -530,7 +543,7 @@ int main(int argc, char **argv) {
       };
       profileWidth("B1 decode cycle", std::span<Lane>(&lanes[0], 1));
       // Add one lane at a time so M16 and M24 paths are measured too.
-      for (uint32_t index = 1; index < lanes.size(); ++index) {
+      for (uint32_t index = 1; index < maxWidth; ++index) {
         admission(0);
         prefill(executor, lanes[index], prompt);
         const std::string title = "B" + std::to_string(index + 1) + " decode cycle";
@@ -538,7 +551,7 @@ int main(int argc, char **argv) {
       }
 
       admission(0);
-      for (Lane &lane : lanes)
+      for (Lane &lane : std::span(lanes).first(maxWidth))
         executor.end(lane.id);
       if (dumpTokens) {
         FILE *file = std::fopen(dumpTokens, "wb");

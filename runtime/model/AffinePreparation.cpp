@@ -5,15 +5,22 @@
 #include "model/OqWrite.hpp"
 #include "model/WeightImages.hpp"
 #include "model/WeightLayout.hpp"
+#include "model/WeightStore.hpp"
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <fstream>
 #include <functional>
+#include <sys/stat.h>
+#ifdef __APPLE__
+#include <libproc.h>
+#include <unistd.h>
+#endif
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -404,6 +411,34 @@ void writeAffineImage(metal::MetalBackend &backend, const metal::MetalBuffer &bu
   writeImage(contentsOf(buffer), image, &backend, &buffer);
 }
 
+namespace {
+
+bool digestName(const std::string &name) {
+  if (name.size() != 40 && name.size() != 64) return false;
+  for (const unsigned char c : name)
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+  return true;
+}
+
+// One shard's contribution to the stamp. Owned assemblies link each shard
+// to .blobs/<content digest>, whose basename is the digest the store
+// already verified; a legacy or direct source, whose filename is not that
+// digest, keeps the size-and-mtime identity it always had.
+std::string shardStamp(const std::filesystem::path &path) {
+  std::error_code error;
+  const std::filesystem::path link = std::filesystem::read_symlink(path, error);
+  if (!error && digestName(link.filename().string()))
+    return path.filename().string() + " digest " + link.filename().string() + "\n";
+  error.clear();
+  return path.filename().string() + " stat " +
+         std::to_string(std::filesystem::file_size(path, error)) + " " +
+         std::to_string(static_cast<long long>(
+             std::filesystem::last_write_time(path, error).time_since_epoch().count())) +
+         "\n";
+}
+
+} // namespace
+
 std::string packedStamp(const std::filesystem::path &directory,
                         const std::vector<Image> &images) {
   std::string stamp;
@@ -412,13 +447,16 @@ std::string packedStamp(const std::filesystem::path &directory,
     if (entry.path().extension() == ".safetensors")
       shards.push_back(entry.path());
   std::sort(shards.begin(), shards.end());
-  for (const std::filesystem::path &path : shards) {
-    std::error_code error;
-    stamp += path.filename().string() + " " +
-             std::to_string(std::filesystem::file_size(path, error)) + " " +
-             std::to_string(static_cast<long long>(
-                 std::filesystem::last_write_time(path, error).time_since_epoch().count())) +
-             "\n";
+  // A thin assembly's shard list persists when the payload symlinks are
+  // dropped. The installer writes the exact shard stamp lines, so the key is
+  // identical before and after the drop.
+  std::ifstream persisted(directory / "packed-sources");
+  if (persisted) {
+    std::ostringstream lines;
+    lines << persisted.rdbuf();
+    stamp += lines.str();
+  } else {
+    for (const std::filesystem::path &path : shards) stamp += shardStamp(path);
   }
   for (const Image &image : images) {
     stamp += image.name + " " + image.magic + " " + std::to_string(image.layer) +
@@ -431,19 +469,144 @@ std::string packedStamp(const std::filesystem::path &directory,
   return stamp;
 }
 
-bool packedCacheUsable(const std::filesystem::path &directory,
-                       const std::vector<Image> &images) {
-  std::ifstream stamp(directory / ".packed");
+namespace {
+
+std::filesystem::path sharedPackedCacheRoot() {
+  // The server exports RICHENGINE_PACKED_CACHE_ROOT so its configured cache
+  // location reaches the engine. Direct engine invocations use the same
+  // per-user default; an explicitly empty value keeps the legacy in-package
+  // behavior only for writes, while old in-package caches remain readable.
+  if (const char *configured = std::getenv("RICHENGINE_PACKED_CACHE_ROOT"))
+    return *configured ? std::filesystem::path(configured) : std::filesystem::path();
+  const char *home = std::getenv("HOME");
+  if (!home || !*home) return {};
+  const std::filesystem::path user(home);
+#ifdef __APPLE__
+  return user / "Library/Caches/RichEngine/packed";
+#else
+  if (const char *xdg = std::getenv("XDG_CACHE_HOME"); xdg && *xdg)
+    return std::filesystem::path(xdg) / "RichEngine/packed";
+  return user / ".cache/RichEngine/packed";
+#endif
+}
+
+std::filesystem::path sharedPackedCacheDirectory(
+    const std::filesystem::path &sourceDirectory,
+    const std::vector<Image> &images) {
+  const std::filesystem::path root = sharedPackedCacheRoot();
+  if (root.empty()) return {};
+  return root / weightDigest(packedStamp(sourceDirectory, images));
+}
+
+// The assembly using a shared cache entry, when sourceDirectory is one
+// assembly's target directory. The packed-cache garbage collector keeps an
+// entry while one of these markers names a live assembly.
+std::string packedOwnerName(const std::filesystem::path &sourceDirectory) {
+  const std::filesystem::path assembly = sourceDirectory.parent_path();
+  if (assembly.parent_path().filename() != ".resolved") return {};
+  const std::string name = assembly.filename().string();
+  return digestName(name) && name.size() == 64 ? name : std::string();
+}
+
+std::string engineFingerprint() {
+#ifdef __APPLE__
+  char executable[PROC_PIDPATHINFO_MAXSIZE];
+  if (proc_pidpath(getpid(), executable, sizeof(executable)) <= 0) return {};
+  struct stat binary {};
+  if (stat(executable, &binary)) return {};
+  const uint64_t binaryNs = uint64_t(binary.st_mtimespec.tv_sec) * 1000000000ull +
+                            uint64_t(binary.st_mtimespec.tv_nsec);
+  std::string fingerprint = std::to_string(binary.st_size) + ":" + std::to_string(binaryNs) + ":";
+  struct stat metallib {};
+  const std::filesystem::path metal = std::filesystem::path(executable).parent_path() / "richengine.metallib";
+  if (!stat(metal.c_str(), &metallib)) {
+    const uint64_t metalNs = uint64_t(metallib.st_mtimespec.tv_sec) * 1000000000ull +
+                             uint64_t(metallib.st_mtimespec.tv_nsec);
+    fingerprint += std::to_string(metallib.st_size) + ":" + std::to_string(metalNs);
+  }
+  return fingerprint;
+#else
+  return {};
+#endif
+}
+
+void registerPackedMarker(const std::filesystem::path &cacheDirectory,
+                          const std::filesystem::path &sourceDirectory,
+                          const char *kind) {
+  const std::string owner = packedOwnerName(sourceDirectory);
+  if (owner.empty()) return;
+  std::error_code error;
+  const std::filesystem::path markers = cacheDirectory / kind;
+  std::filesystem::create_directories(markers, error);
+  if (error) return;
+  const std::filesystem::path marker = markers / owner;
+  if (std::filesystem::exists(marker, error)) return;
+  const std::filesystem::path tmp = markers / (owner + ".tmp");
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    if (out) out << sourceDirectory.parent_path().string() << "\n" << engineFingerprint() << "\n";
+    if (!out) {
+      std::filesystem::remove(tmp, error);
+      return;
+    }
+  }
+  std::filesystem::rename(tmp, marker, error);
+  std::filesystem::remove(tmp, error);
+}
+
+void registerPackedOwner(const std::filesystem::path &cacheDirectory,
+                         const std::filesystem::path &sourceDirectory) {
+  registerPackedMarker(cacheDirectory, sourceDirectory, ".owners");
+}
+
+void registerPackedValidation(const std::filesystem::path &cacheDirectory,
+                              const std::filesystem::path &sourceDirectory) {
+  if (cacheDirectory != sourceDirectory)
+    registerPackedMarker(cacheDirectory, sourceDirectory, ".validated");
+}
+
+bool packedCacheUsableAt(const std::filesystem::path &cacheDirectory,
+                         const std::filesystem::path &sourceDirectory,
+                         const std::vector<Image> &images) {
+  std::ifstream stamp(cacheDirectory / ".packed");
   std::ostringstream contents;
   contents << stamp.rdbuf();
-  if (contents.str() != packedStamp(directory, images)) return false;
+  if (contents.str() != packedStamp(sourceDirectory, images)) return false;
   for (const Image &image : images) {
     std::error_code error;
-    if (std::filesystem::file_size(directory / image.name, error) != image.bytes ||
+    if (std::filesystem::file_size(cacheDirectory / image.name, error) != image.bytes ||
         error)
       return false;
   }
   return true;
+}
+
+} // namespace
+
+std::filesystem::path packedReadDirectory(const std::filesystem::path &directory,
+                                          const std::vector<Image> &images) {
+  const std::filesystem::path shared = sharedPackedCacheDirectory(directory, images);
+  if (!shared.empty() && packedCacheUsableAt(shared, directory, images)) {
+    registerPackedOwner(shared, directory);
+    registerPackedValidation(shared, directory);
+    return shared;
+  }
+  if (packedCacheUsableAt(directory, directory, images)) return directory;
+  return {};
+}
+
+std::filesystem::path packedWriteDirectory(const std::filesystem::path &directory,
+                                           const std::vector<Image> &images) {
+  const std::filesystem::path shared = sharedPackedCacheDirectory(directory, images);
+  if (!shared.empty()) {
+    std::error_code error;
+    std::filesystem::create_directories(shared, error);
+    if (!error) {
+      registerPackedOwner(shared, directory);
+      return shared;
+    }
+  }
+  return directory;
 }
 
 void cachePackedImage(const std::filesystem::path &path,
@@ -464,15 +627,16 @@ void cachePackedImage(const std::filesystem::path &path,
   std::filesystem::rename(tmp, path, error);
 }
 
-void refreshPackedStamp(const std::filesystem::path &directory,
+void refreshPackedStamp(const std::filesystem::path &cacheDirectory,
+                        const std::filesystem::path &sourceDirectory,
                         const std::vector<Image> &images) {
   std::error_code error;
   for (const Image &image : images)
-    if (std::filesystem::file_size(directory / image.name, error) != image.bytes ||
+    if (std::filesystem::file_size(cacheDirectory / image.name, error) != image.bytes ||
         error)
       return;
-  const std::string stamp = packedStamp(directory, images);
-  const std::filesystem::path tmp = directory / ".packed.tmp";
+  const std::string stamp = packedStamp(sourceDirectory, images);
+  const std::filesystem::path tmp = cacheDirectory / ".packed.tmp";
   {
     std::ofstream out(tmp, std::ios::trunc);
     if (out) out << stamp;
@@ -481,7 +645,8 @@ void refreshPackedStamp(const std::filesystem::path &directory,
       return;
     }
   }
-  std::filesystem::rename(tmp, directory / ".packed", error);
+  std::filesystem::rename(tmp, cacheDirectory / ".packed", error);
+  if (!error) registerPackedValidation(cacheDirectory, sourceDirectory);
 }
 
 } // namespace richengine::model::affine

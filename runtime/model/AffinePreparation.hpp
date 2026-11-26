@@ -117,22 +117,33 @@ void writeAffineImage(std::span<uint8_t> destination, const Image &image);
 void writeAffineImage(metal::MetalBackend &backend, const metal::MetalBuffer &buffer,
                       const Image &image);
 
-// The packed cache of a safetensors load: every image written verbatim to
-// directory/<name>.bin, and .packed listing the safetensors shards it came
-// from and the plan that produced it ("name size mtime-ns" per shard, then
-// "name magic layer type bytes" per image). A matching stamp with every
+// The packed cache of a safetensors load: every image written verbatim as
+// <name>.bin, and .packed listing the safetensors shards it came from and
+// the plan that produced it ("name digest <content digest>" for a shard
+// linked into the owned blob store, or "name stat <size> <mtime-ns>" for a
+// legacy source, then "name magic layer type bytes" per image). A matching
 // image file present lets later loads read the images as packed files —
 // identical bytes, no transpose, no quantize.
 std::string packedStamp(const std::filesystem::path &directory,
                         const std::vector<Image> &images);
-bool packedCacheUsable(const std::filesystem::path &directory,
-                       const std::vector<Image> &images);
+// The cache directory a load may read: first the shared cache entry keyed by
+// this source/plan stamp, then the legacy in-package cache. Empty when
+// neither is complete.
+std::filesystem::path packedReadDirectory(const std::filesystem::path &directory,
+                                          const std::vector<Image> &images);
+// The cache directory a load writes: the shared cache entry when its root
+// can be created, otherwise the legacy in-package location.
+std::filesystem::path packedWriteDirectory(const std::filesystem::path &directory,
+                                           const std::vector<Image> &images);
 // Writes destination to path (a tmp file, then rename) unless it already
 // holds the bytes' size — best effort: the cache only speeds later loads.
 void cachePackedImage(const std::filesystem::path &path, std::span<const uint8_t> bytes);
 // The stamp lands once every image file is present; a partial cache keeps
-// failing the check and fills in on later loads.
-void refreshPackedStamp(const std::filesystem::path &directory,
+// failing the check and fills in on later loads. sourceDirectory is the
+// safetensors directory whose shards the stamp names; cacheDirectory is
+// where the stamp and images live.
+void refreshPackedStamp(const std::filesystem::path &cacheDirectory,
+                        const std::filesystem::path &sourceDirectory,
                         const std::vector<Image> &images);
 
 } // namespace richengine::model::affine

@@ -10,6 +10,7 @@ no assembly links to — and only on `disk gc --yes`.
 """
 
 import os
+import shutil
 from pathlib import Path
 
 
@@ -79,6 +80,117 @@ def _live_shared_paths(preserved, cache_dir):
     return live
 
 
+def _live_assemblies(models_root):
+    """Selection-linked or server-held assemblies under models_root."""
+    from . import assembly, layout, models
+
+    root = Path(models_root)
+    resolved = root / layout.RESOLVED
+    linked = {link.resolve() for link in models.selection_links(root)}
+    if not resolved.is_dir():
+        return []
+    return [
+        entry
+        for entry in sorted(resolved.iterdir())
+        if entry.resolve() in linked or assembly.is_held(entry)
+    ]
+
+
+def owned_blob_plan(models_root):
+    """Unreferenced files of the model store's content-addressed .blobs root.
+
+    A blob is live when a selection-linked or server-held assembly records it.
+    assembly.collect_garbage uses the same ownership rule after installations;
+    exposing it here lets `disk gc` account for orphans interrupted installs
+    left behind.
+    """
+    from . import assembly, layout, models
+
+    root = Path(models_root)
+    blobs = (root / layout.BLOBS).resolve()
+    if not blobs.is_dir():
+        return {}
+    referenced = set()
+    for entry in _live_assemblies(root):
+        try:
+            assembly_record = models.read_json(entry / layout.ASSEMBLY_RECORD)
+            files = assembly_record.get("files")
+        except models.ModelError:
+            continue
+        thin_valid = assembly_record.get("thin") is True and assembly.thin_cache_valid(entry)
+        for name, record in files.items() if isinstance(files, dict) else ():
+            if assembly.thin_payload_name(name) and thin_valid:
+                continue
+            if not isinstance(record, dict) or not isinstance(record.get("path"), str):
+                continue
+            path = Path(record["path"])
+            try:
+                if path.parent.resolve() == blobs:
+                    referenced.add(path.name)
+            except OSError:
+                pass
+    orphans = {}
+    for blob in blobs.iterdir():
+        if not blob.is_file() or blob.name in referenced:
+            continue
+        try:
+            orphans[blob] = blob.stat().st_size
+        except OSError:
+            pass
+    return orphans
+
+
+def packed_cache_dir():
+    """The shared packed weight-image cache root, or None when disabled."""
+    configured = os.environ.get("RICHENGINE_PACKED_CACHE_ROOT")
+    if configured is not None:
+        return Path(configured).expanduser() if configured.strip() else None
+    from . import paths
+
+    return paths.packed_cache_root()
+
+
+def _entry_bytes(entry):
+    total = 0
+    for path in entry.rglob("*"):
+        try:
+            if path.is_file() and not path.is_symlink():
+                total += path.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def packed_cache_plan(models_root, cache_root=None):
+    """Shared packed-cache entries no live assembly's owner marker references.
+
+    The native loader registers each use as .owners/<assembly digest> inside
+    the cache entry. Entries from retired assemblies, interrupted direct
+    loads and earlier keying schemes have no live owner and are collectible;
+    the cache is derived data, so deletion never invalidates an install.
+    """
+    root = Path(cache_root) if cache_root is not None else packed_cache_dir()
+    if root is None or not root.is_dir():
+        return {}
+    live = {entry.name for entry in _live_assemblies(Path(models_root))}
+    orphans = {}
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir():
+            continue
+        owners = entry / ".owners"
+        try:
+            referenced = any(
+                marker.name in live
+                for marker in owners.iterdir()
+                if marker.is_file() and not marker.name.endswith(".tmp")
+            ) if owners.is_dir() else False
+        except OSError:
+            referenced = False
+        if not referenced:
+            orphans[entry] = _entry_bytes(entry)
+    return orphans
+
+
 def plan(models_root=None, cache_dir=None):
     """What `disk gc` would free. Reads only; nothing is deleted.
 
@@ -92,12 +204,24 @@ def plan(models_root=None, cache_dir=None):
     if models_root is None:
         from . import paths
 
-        models_root = paths.MODELS
+        models_root = paths.models_root()[0]
     if cache_dir is None:
         cache_dir = hf_cache_dir()
     cache_dir = Path(cache_dir)
     if not cache_dir.is_dir():
-        return None
+        return {
+            "cache_dir": cache_dir,
+            "info": None,
+            "preserved": 0,
+            "dead_revisions": [],
+            "dead_repos": [],
+            "live_revisions": 0,
+            "shared_blobs": {},
+            "incomplete": [],
+            "repos": 0,
+            "owned_blobs": owned_blob_plan(models_root),
+            "packed_cache": packed_cache_plan(models_root),
+        }
     # scan_cache_dir reports resolved paths; match them so preserved links
     # compare equal even when HF_HOME sits under a symlink.
     cache_dir = cache_dir.resolve()
@@ -163,34 +287,59 @@ def plan(models_root=None, cache_dir=None):
         "shared_blobs": shared_blobs,
         "incomplete": incomplete,
         "repos": len(info.repos),
+        "owned_blobs": owned_blob_plan(models_root),
+        "packed_cache": packed_cache_plan(models_root),
     }
 
 
-def execute(result):
-    """Delete everything plan() marked dead; returns bytes freed."""
+def execute_detailed(result):
+    """Delete everything plan() marked dead; returns bytes freed by category."""
     info = result["info"]
-    freed = 0
+    freed = {
+        "owned_blobs": 0,
+        "packed_cache": 0,
+        "revisions": 0,
+        "incomplete": 0,
+        "shared_blobs": 0,
+    }
+    for path, size in result.get("owned_blobs", {}).items():
+        try:
+            Path(path).unlink()
+            freed["owned_blobs"] += size
+        except OSError:
+            pass
+    for path, size in result.get("packed_cache", {}).items():
+        try:
+            shutil.rmtree(path)
+            freed["packed_cache"] += size
+        except OSError:
+            pass
     if result["dead_revisions"]:
         strategy = info.delete_revisions(*sorted(set(result["dead_revisions"])))
-        freed += strategy.expected_freed_size
+        freed["revisions"] += strategy.expected_freed_size
         strategy.execute()
     for path in result["incomplete"]:
         try:
             size = Path(path).stat().st_size
             Path(path).unlink()
-            freed += size
+            freed["incomplete"] += size
         except OSError:
             pass
     try:
         from huggingface_hub.utils import _shared_blobs
 
         for store_path in result["shared_blobs"]:
-            freed += _shared_blobs.sweep_shared_blob(
+            freed["shared_blobs"] += _shared_blobs.sweep_shared_blob(
                 Path(store_path), cache_dir=result["cache_dir"]
             )
     except Exception:
         pass
     return freed
+
+
+def execute(result):
+    """Delete everything plan() marked dead; returns bytes freed."""
+    return sum(execute_detailed(result).values())
 
 
 def reclaimable_hint(models_root=None):

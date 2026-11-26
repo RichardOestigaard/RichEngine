@@ -12,21 +12,26 @@ OqTargetLoader::OqTargetLoader(WeightImages &images, const std::filesystem::path
 OqTargetLoader::~OqTargetLoader() = default;
 ImagePlan OqTargetLoader::imagePlan(size_t index, std::string_view directory) {
   const affine::Image &image = planned_->images.at(index);
-  if (packed_ < 0)
-    packed_ = affine::packedCacheUsable(directory_, planned_->images) ? 1 : 0;
+  if (packed_ < 0) {
+    packedDirectory_ = affine::packedReadDirectory(directory_, planned_->images);
+    packed_ = packedDirectory_.empty() ? 0 : 1;
+  }
   if (packed_)
-    return packedImage(directory_ / image.name,
+    return packedImage(packedDirectory_ / image.name,
                        std::string(directory) + "/" + image.name, image.magic,
                        image.layer, image.type);
   ImagePlan result = affine::imagePlan(planned_, index, directory, &images_.backend());
-  const std::filesystem::path cached = directory_ / image.name;
+  const std::filesystem::path cacheDirectory =
+      affine::packedWriteDirectory(directory_, planned_->images);
+  const std::filesystem::path cached = cacheDirectory / image.name;
   const std::vector<affine::Image> *plan_images = &planned_->images;
-  result.write = [write = std::move(result.write), cached, plan_images,
-                  directory = directory_](std::span<uint8_t> destination,
-                                          const metal::MetalBuffer &buffer) {
+  result.write = [write = std::move(result.write), cached, cacheDirectory,
+                  plan_images, directory = directory_](
+                     std::span<uint8_t> destination,
+                     const metal::MetalBuffer &buffer) {
     write(destination, buffer);
     affine::cachePackedImage(cached, destination);
-    affine::refreshPackedStamp(directory, *plan_images);
+    affine::refreshPackedStamp(cacheDirectory, directory, *plan_images);
   };
   return result;
 }

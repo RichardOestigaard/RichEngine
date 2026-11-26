@@ -497,6 +497,7 @@ def _prepare_packed(selection, installed):
         except (models.ModelError, OSError) as error:
             print(f"Repacking {models.accent(selection.model)}: {error}", flush=True)
         else:
+            pack.retire_source_pins(selection.link, installed)
             print(
                 f"RichEngine model {models.accent(selection.model)} is already "
                 f"installed in {models.dim(selection.link)}",
@@ -623,7 +624,17 @@ def _retain_installed(selection):
             installed = assembly.verify(selection.link)
         except (models.ModelError, OSError) as error:
             return error
-        hub.repair_pins(selection.link, assembly.pins(installed))
+        dropped = assembly.drop_thin_sources(selection.link, selection.models_root)
+        if dropped:
+            from . import gc as hub_gc
+
+            print(
+                f"thin: dropped {dropped} payload links, packed cache at "
+                f"{hub_gc.packed_cache_dir()}",
+                flush=True,
+            )
+        assembly.retire_thin_source_pin(selection.link, installed)
+        hub.repair_pins(selection.link, assembly.pins(installed, selection.link))
     return None
 
 
@@ -660,6 +671,14 @@ def _install(selection, repo, installed, draft=None):
             flush=True,
         )
         downloaded = repo.download(set(target.files.values()))
+    if selection.thin and target.format != "mlx-affine":
+        raise models.ModelError("--thin requires an MLX affine target")
+    if selection.thin and any(
+        isinstance(value, dict)
+        for key, value in target.config.get("quantization", {}).items()
+        if key not in {"bits", "group_size", "mode"}
+    ):
+        raise models.ModelError("--thin does not support mixed-quantization oQ targets")
     if target.format in pack.TARGET_FORMATS:
         # The packed-only target: quantize and write the package the
         # runtime loads, under the lock as every models-root write is.
@@ -693,7 +712,15 @@ def _install(selection, repo, installed, draft=None):
     models_root = selection.models_root
     models_root.mkdir(parents=True, exist_ok=True)
     # Everything written under the models root is written under the lock.
+    print(
+        models.dim("Linking weights into the model store (may copy across volumes)…"),
+        flush=True,
+    )
     with models.installation_lock(models_root):
+        files = assembly.materialize_files(models_root, files)
+        if selection.thin and target.format == "mlx-affine":
+            record["thin"] = True
+            files = assembly.add_thin_documents(models_root, files)
         if target.format == "gguf":
             record["metadata"], derived = assembly.derived_metadata(models_root, files)
             files |= derived
@@ -716,6 +743,12 @@ def _install(selection, repo, installed, draft=None):
         )
         hub.retire_other_pins(pins, replaced)
         assembly.collect_garbage(models_root)
+    if record.get("thin") is True:
+        print(
+            "thin: payload links stay until the first successful serve validates "
+            "the packed cache; the next start drops them.",
+            flush=True,
+        )
     _gc_hint(models_root)
 
 

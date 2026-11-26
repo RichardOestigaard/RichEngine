@@ -92,8 +92,10 @@ inline void bind(Image &image, const SafetensorsCheckpoint &source) {
 // A checkpoint and the images planned from it, which their writers share:
 // each image's inputs point into the checkpoint's tensors.
 struct PlannedCheckpoint final {
-  explicit PlannedCheckpoint(const std::filesystem::path &directory) : source(directory) {}
-  SafetensorsCheckpoint source;
+  explicit PlannedCheckpoint(const std::filesystem::path &directory, bool metadataOnly = false) {
+    if (!metadataOnly) source = std::make_unique<SafetensorsCheckpoint>(directory);
+  }
+  std::unique_ptr<SafetensorsCheckpoint> source;
   std::vector<Image> images;
 };
 
@@ -106,11 +108,12 @@ struct PlannedCheckpoint final {
   const Image &image = planned->images.at(index);
   return {std::string(directory) + "/" + image.name, image.magic, image.layer, image.type, image.bytes,
           [planned, index, backend](std::span<uint8_t> bytes, const metal::MetalBuffer &buffer) {
+            if (!planned->source) throw WeightStoreError("thin source is absent and its packed cache missed");
             if (backend)
               writeAffineImage(*backend, buffer, planned->images[index]);
             else
               writeAffineImage(bytes, planned->images[index]);
-            planned->source.checkUnchanged();
+            planned->source->checkUnchanged();
           }};
 }
 

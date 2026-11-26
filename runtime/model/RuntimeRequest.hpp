@@ -236,6 +236,11 @@ struct RuntimeRequest final {
   uint32_t corpusRounds = 0;
   double corpusAcceptedAvg = 0;
   bool corpusInFlight = false;
+  // The corpus chain offered this round, retained until verification teaches
+  // the shared exact-copy acceptance model its draft-agreement labels.
+  uint32_t corpusMatchLength = 0;
+  uint32_t corpusChainLength = 0;
+  std::array<uint32_t, kDraftProposalTokens> corpusChain{};
   // Weak session key (opening-prompt hash) and, on corpus docs this lane
   // committed, self-exclusion: origin skips the lane's own pushed stream,
   // session prefers same-conversation docs on ties.

@@ -199,10 +199,26 @@ struct MoeGgufSharedParams {
   // Nonzero applies relu(v)^2 to the bf16-rounded sum (the up pass); zero
   // stores it plain (the down pass).
   uint32_t relu2;
+  // Nonzero reads a zero-padded copy of a ragged final row block and keeps
+  // it on the full staged tile, preserving prefill's composition-invariant
+  // summation shape. Zero keeps the sparse column tile.
+  uint32_t force_staged;
 };
 
-static_assert(sizeof(MoeGgufSharedParams) == 32,
-              "MoE GGUF shared-expert parameters are 32 bytes on both sides");
+static_assert(sizeof(MoeGgufSharedParams) == 36,
+              "MoE GGUF shared-expert parameters are 36 bytes on both sides");
+
+struct MoePadRowsParams {
+  uint32_t rows;
+  uint32_t input_size;
+  uint32_t tile_rows;
+  // Element width of the routed region preceding the dense shared rows;
+  // zero means the source rows start at the input buffer's first row.
+  uint32_t input_region;
+};
+
+static_assert(sizeof(MoePadRowsParams) == 16,
+              "MoE row-padding parameters are 16 bytes on both sides");
 
 struct MoeGatherParams {
   uint32_t tile_rows;
@@ -251,10 +267,14 @@ struct MoeGgufExpertParams {
   // (RICHENGINE_MOE_TILE_MAJOR): the row index (tile * splits + split)
   // arrives on group.x and the column block on group.y.
   uint32_t tile_major;
+  // Nonzero forces the staged matmul where a sparse tile would otherwise
+  // take the column-dot path. Prefill uses this for composition-invariant
+  // summation order; decode keeps the faster column tiles.
+  uint32_t force_staged;
 };
 
-static_assert(sizeof(MoeGgufExpertParams) == 28,
-              "MoE GGUF expert parameters are 28 bytes on both sides");
+static_assert(sizeof(MoeGgufExpertParams) == 32,
+              "MoE GGUF expert parameters are 32 bytes on both sides");
 
 // The streamed GGUF expert pass (moe_expert_gguf_streamed_*): the routed
 // experts' weights are not resident — the tile's expert resolves through
@@ -279,10 +299,13 @@ struct MoeGgufStreamParams {
   uint32_t chunk_slots;
   uint32_t projection;
   uint32_t reserved;
+  // Matches MoeGgufExpertParams: nonzero keeps sparse prefill tiles on the
+  // staged matmul instead of the row-count-dependent column-dot path.
+  uint32_t force_staged;
 };
 
-static_assert(sizeof(MoeGgufStreamParams) == 36,
-              "MoE GGUF streamed expert parameters are 36 bytes on both sides");
+static_assert(sizeof(MoeGgufStreamParams) == 40,
+              "MoE GGUF streamed expert parameters are 40 bytes on both sides");
 
 // The fused gate+up pass (moe_expert_gguf_*_gu): one dispatch computes both
 // projections of a tile and stores silu(gate) * up — the split passes'
@@ -297,14 +320,17 @@ struct MoeGgufFusedParams {
   uint32_t up_routed_format;
   uint32_t up_shared_format;
   uint32_t reserved;
+  // Nonzero forces the staged matmul where a sparse tile would otherwise
+  // take the column-dot path, matching prefill's composition-invariant mode.
+  uint32_t force_staged;
   // Source row divisor for the indirect column tiles
   // (moe_expert_gguf_*_gu_i): grouped route values are row * routes_per_row +
   // slot. Unused by the gathered kernels.
   uint32_t routes_per_row;
 };
 
-static_assert(sizeof(MoeGgufFusedParams) == 36,
-              "MoE GGUF fused parameters are 36 bytes on both sides");
+static_assert(sizeof(MoeGgufFusedParams) == 40,
+              "MoE GGUF fused parameters are 40 bytes on both sides");
 
 struct MoeCombineParams {
   uint32_t rows;

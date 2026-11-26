@@ -21,7 +21,6 @@ import math
 import shutil
 import struct
 import subprocess
-import tempfile
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -317,7 +316,6 @@ def prepare(payload: bytes, spec: VideoSpec, *, soundtrack: bool = False):
         len(indices), source.height, source.width, spec
     )
     frames = _decode_frames(payload, indices, (width, height), spec)
-    frame_bytes = height * width * 3
     pair_pixels, pair_digests = [], []
     for first in range(0, len(frames), temporal):
         second = first + 1 if first + 1 < len(frames) else len(frames) - 1

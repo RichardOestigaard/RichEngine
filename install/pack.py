@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import struct
 import tempfile
@@ -2061,6 +2062,38 @@ def _package_key(sources) -> str:
     return hashlib.sha256(models.json_bytes(identity)).hexdigest()
 
 
+def keep_source_pins() -> bool:
+    """Whether locally packed installs retain their source snapshots for repair."""
+    return os.environ.get("RICHENGINE_PACK_KEEP_SOURCES", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def retire_source_pins(link: Path, manifest):
+    """Retire this selection's packed-package source pins in the current cache.
+
+    Packed artifacts verify without those snapshots. Unless keep_source_pins()
+    is set, both a fresh install and each already-installed start release the
+    full safetensors to the Hub cache's ordinary garbage collection.
+    """
+    if keep_source_pins():
+        return
+    from . import hub
+
+    refs = []
+    for source in manifest.get("sources", {}).values():
+        if not isinstance(source, dict) or source.get("revision") is None:
+            continue
+        repo = source.get("repo")
+        revision = source.get("revision")
+        if isinstance(repo, str) and models.is_hex_digest(revision, 40):
+            refs.append(hub.pinned(hub.snapshot(repo, revision), link))
+    hub.retire_other_pins([], refs)
+
+
 def verify(link: Path, *, full=False):
     """The built package at a selection link: its manifest names the packed
     format and every artifact's size (with full, its content) matches."""
@@ -2366,7 +2399,14 @@ def install(selection, family, config, repo, target_files, draft_repo, draft_fil
     finally:
         if stage.exists():
             shutil.rmtree(stage)
+    # The package is self-contained: verify() checks its artifacts alone, so
+    # the source snapshots are repair inputs, not serving data. Keep them
+    # pinned only for users who explicitly choose offline repair; otherwise
+    # retire this selection's earlier pins after the verified package is
+    # published.
+    keep_sources = keep_source_pins()
     pins = []
+    replaced = []
     for files, source_repo in (
         (target_files, repo),
         (draft_files, draft_repo),
@@ -2377,9 +2417,13 @@ def install(selection, family, config, repo, target_files, draft_repo, draft_fil
             (snap for path in files.values() if (snap := hub.snapshot_of(str(path)))),
             None,
         )
-        if snapshot is not None:
+        if snapshot is None:
+            continue
+        if keep_sources:
             pins.append(hub.pin(snapshot, source_repo.name, selection.link))
+        else:
+            replaced.append(hub.pinned(snapshot, selection.link))
     models.link_selection(selection.link, destination)
     verify(selection.link)
-    hub.retire_other_pins(pins)
+    hub.retire_other_pins(pins, replaced)
     return manifest

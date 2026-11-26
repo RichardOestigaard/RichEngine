@@ -176,11 +176,10 @@ void LookupAcceptance::observe(bool samples, uint32_t length, std::span<const Lo
   }
 }
 
-LookupAgreement lookupAgreement(uint32_t token, uint32_t depth, std::span<const uint32_t> candidates) {
-  constexpr uint32_t kCandidates = RICHENGINE_DRAFT_CANDIDATES;
-  if ((uint64_t{depth} + 1) * kCandidates > candidates.size())
+LookupAgreement lookupAgreement(uint32_t token, uint32_t depth, std::span<const uint32_t> candidates, uint32_t candidateStride) {
+  if (!candidateStride || (uint64_t{depth} + 1) * candidateStride > candidates.size())
     return LookupAgreement::Unknown;
-  const std::span<const uint32_t> at = candidates.subspan(uint64_t{depth} * kCandidates, kCandidates);
+  const std::span<const uint32_t> at = candidates.subspan(uint64_t{depth} * candidateStride, candidateStride);
   if (at.front() == token)
     return LookupAgreement::Top;
   return std::ranges::find(at, token) != at.end() ? LookupAgreement::Candidate : LookupAgreement::Absent;
@@ -188,10 +187,11 @@ LookupAgreement lookupAgreement(uint32_t token, uint32_t depth, std::span<const 
 
 LookupOutcome lookupOutcome(std::span<const uint32_t> chain,
                             std::span<const uint32_t> retained,
-                            std::span<const uint32_t> candidates) {
+                            std::span<const uint32_t> candidates,
+                            uint32_t candidateStride) {
   LookupOutcome outcome;
   for (uint32_t depth = 0; depth < chain.size() && depth < retained.size(); ++depth) {
-    outcome.verified.push_back(lookupAgreement(chain[depth], depth, candidates));
+    outcome.verified.push_back(lookupAgreement(chain[depth], depth, candidates, candidateStride));
     if (retained[depth] != chain[depth])
       break;
     ++outcome.accepted;

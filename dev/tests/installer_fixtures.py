@@ -8,6 +8,7 @@ force_download, and model_info without a timeout)."""
 import hashlib
 import json
 import shutil
+import struct
 from types import SimpleNamespace
 from unittest import mock
 
@@ -43,8 +44,10 @@ def mlx_target(root, family, *, changes=None):
         "quantization": {"bits": 4, "group_size": 64},
     }
     (root / "config.json").write_text(json.dumps(config))
-    for name in ("tokenizer.json", "tokenizer_config.json", "model.safetensors"):
+    for name in ("tokenizer.json", "tokenizer_config.json"):
         (root / name).write_text("{}")
+    header = b"{}"
+    (root / "model.safetensors").write_bytes(struct.pack("<Q", len(header)) + header)
     return root
 
 
@@ -72,6 +75,7 @@ def selection(root, model=MODEL, **options):
         revision=options.get("revision"),
         language_only=options.get("language_only", True),
         draft_model=options.get("draft_model"),
+        thin=options.get("thin", False),
     )
 
 

@@ -23,6 +23,7 @@
 #include "DispatchReplay.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
+#include "ops/ExecutionPlans.hpp"
 #include "ops/PagedAttention.hpp"
 #include "tuning/AttentionFixture.hpp"
 
@@ -58,9 +59,11 @@ constexpr uint32_t kPrefillRows = RICHENGINE_PREFILL_TOKEN_BUDGET;
 constexpr uint32_t kLayer = 1;
 // The memory plan's extents of the full models: 16 and 10 attention layers.
 constexpr uint32_t kModelLayers27b = 16, kModelLayers35b = 10,
-                   kModelLayersMinicpm5 = 42, kModelLayersLfm2 = 8;
+                   kModelLayersMinicpm5 = 42, kModelLayersLfm2 = 8,
+                   kModelLayersOrnith9b = 8;
 
 AttentionShape shapeOf(const std::string &shape, kv::Format format) {
+  if (shape == "ornith9b") return AttentionShape{16, 4, 256, format};
   if (shape == "minicpm5") return AttentionShape{16, 2, 128, format};
   if (shape == "lfm2") return AttentionShape{32, 8, 64, format};
   return shape == "27b" ? AttentionShape{24, 4, 256, format}
@@ -68,12 +71,14 @@ AttentionShape shapeOf(const std::string &shape, kv::Format format) {
 }
 
 uint32_t shapeLayers(const std::string &shape) {
+  if (shape == "ornith9b") return kModelLayersOrnith9b;
   if (shape == "minicpm5") return kModelLayersMinicpm5;
   if (shape == "lfm2") return kModelLayersLfm2;
   return shape == "27b" ? kModelLayers27b : kModelLayers35b;
 }
 
 std::string shapeName(const std::string &shape) {
+  if (shape == "ornith9b") return "ornith-1.5-9b";
   if (shape == "minicpm5") return "minicpm5-2b";
   if (shape == "lfm2") return "lfm2.5-2.6b";
   return shape == "27b" ? "qwen3.8-27b" : "qwen3.6-35b-a3b";
@@ -96,30 +101,43 @@ std::string shapeName(const std::string &shape) {
 // The prefill chunk on one lane, or the verify rows of `lanes` lanes, all
 // after `history` tokens, with their plan's scratch.
 AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes,
-                              uint32_t history, uint32_t extentPages) {
+                              uint32_t history, uint32_t extentPages,
+                              const ExecutionPlans &operators, bool wide) {
   const kv::Layout layout = attentionLayerLayout(shape);
   const uint32_t caseLanes = prefill ? 1 : lanes;
   AttentionFixturePlan::Histories histories{};
   std::fill_n(histories.begin(), caseLanes, history);
-  const AttentionWorkspace scratch =
-      prefill ? PagedAttention::prefillPlan(kPrefillRows, shape.queryHeads, layout)
+  AttentionWorkspace scratch =
+      prefill ? operators.prefillAttention(kPrefillRows, shape.queryHeads, layout, history)
                     .workspace
               : PagedAttention::verifyPlan(caseLanes, shape.queryHeads, layout,
                                            std::span(histories).first(caseLanes))
                     .workspace;
+  if (wide) {
+    const auto base = operators.prefillAttention(kPrefillRows, shape.queryHeads, layout, history);
+    const auto candidate = PagedAttention::prefillWideInt8Plan(base, shape.queryHeads, layout);
+    scratch.partialsBytes = std::max(scratch.partialsBytes, candidate.workspace.partialsBytes);
+    scratch.statisticsBytes = std::max(scratch.statisticsBytes, candidate.workspace.statisticsBytes);
+  }
   return AttentionFixturePlan::make(shape, caseLanes, prefill ? kPrefillRows : kVerifyRows,
                                     histories, scratch, {kLayer + 1, kLayer, extentPages});
 }
 
 // The store and attention graph the runtime encodes for a case.
-metal::CommandGraph caseGraph(const AttentionFixture &fixture, bool prefill) {
+metal::CommandGraph caseGraph(const AttentionFixture &fixture, bool prefill,
+                             const ExecutionPlans &operators, bool wide) {
   const AttentionFixturePlan &plan = fixture.plan();
   metal::CommandGraph graph;
   const kv::Layout layerLayout = attentionLayerLayout(plan.shape);
-  if (prefill)
-    fixture.addGraph(graph, PagedAttention::prefillPlan(plan.rows, plan.shape.queryHeads,
-                                                        layerLayout));
-  else
+  if (prefill) {
+    const auto base = operators.prefillAttention(
+        plan.rows, plan.shape.queryHeads, layerLayout, plan.histories[0]);
+    if (wide)
+      fixture.addGraph(graph, PagedAttention::prefillWideInt8Plan(
+                                  base, plan.shape.queryHeads, layerLayout));
+    else
+      fixture.addGraph(graph, base);
+  } else
     fixture.addGraph(graph, PagedAttention::verifyPlan(
                                 plan.lanes, plan.shape.queryHeads, layerLayout,
                                 std::span(plan.histories).first(plan.lanes)));
@@ -164,7 +182,8 @@ double median(std::vector<double> values) {
 // a run also brings an idle GPU up to its clocks.
 std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
                           const AttentionFixturePlan &plan, bool prefill, uint32_t repeat,
-                          double warmupSeconds) {
+                          double warmupSeconds, const ExecutionPlans &operators,
+                          bool wide) {
   std::vector<std::unique_ptr<AttentionFixture>> fixtures;
   std::vector<metal::CommandGraph> graphs;
   std::vector<Case> results(backends.size());
@@ -172,7 +191,7 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
     fixtures.push_back(
         std::make_unique<AttentionFixture>(*backends[i], plan, "attention-sweep-fixture"));
     fixtures.back()->fill();
-    graphs.push_back(caseGraph(*fixtures.back(), prefill));
+    graphs.push_back(caseGraph(*fixtures.back(), prefill, operators, wide && i == 1));
     results[i].kvBytes = historyBytes(plan);
   }
   // Warm every variant, then alternate order to limit clock/thermal drift.
@@ -182,7 +201,7 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
       warmup += backends[i]->submitCommand(graphs[i].dispatches()).gpuSeconds;
   for (size_t i = 1; i < fixtures.size(); ++i)
     if (!std::ranges::equal(outputBytes(*fixtures[0]), outputBytes(*fixtures[i])))
-      throw std::runtime_error("comparison metallib changed attention output bits");
+      throw std::runtime_error("comparison variant changed attention output bits");
   for (size_t i = 0; i < fixtures.size(); ++i)
     results[i].outputDigest = outputDigest(*fixtures[i]);
   std::vector<std::vector<double>> fused(backends.size());
@@ -264,7 +283,7 @@ int main(int argc, const char *argv[]) {
       std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--shapes 27b,35b] "
                    "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
                    "[--compare-metallib PATH] [--kv-format int8|bf16] "
-                   "[--extent-pages N]\n";
+                   "[--extent-pages N] [--compare-wide-prefill 1]\n";
       return 64;
     }
     std::vector<uint32_t> histories{0, 2048, 8192, 16384, 32768, 65536, 131072};
@@ -275,6 +294,7 @@ int main(int argc, const char *argv[]) {
     uint32_t extentPages = 0;
     kv::Format format = kv::Format::Int8;
     std::string comparisonLibrary, phases = "both";
+    bool wide = false;
     for (int index = 2; index < argc; index += 2) {
       const std::string option(argv[index]);
       if (index + 1 >= argc)
@@ -295,6 +315,8 @@ int main(int argc, const char *argv[]) {
         format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
       }
       else if (option == "--compare-metallib") comparisonLibrary = argv[index + 1];
+      else if (option == "--compare-wide-prefill")
+        wide = parseCount(argv[index + 1], 1, 1, option) == 1;
       else if (option == "--phases") {
         phases = argv[index + 1];
         if (phases != "both" && phases != "verify" && phases != "prefill")
@@ -309,14 +331,17 @@ int main(int argc, const char *argv[]) {
           const std::string shape =
               text.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
           if (shape != "27b" && shape != "35b" && shape != "minicpm5" &&
-              shape != "lfm2")
-            throw std::invalid_argument("--shapes takes 27b, 35b, minicpm5 or lfm2");
+              shape != "lfm2" && shape != "ornith9b")
+            throw std::invalid_argument("--shapes takes 27b, 35b, minicpm5, lfm2 or ornith9b");
           shapes.push_back(shape);
           if (comma == std::string::npos) break;
           start = comma + 1;
         }
       } else throw std::invalid_argument("unknown option " + option);
     }
+    if (wide && (phases != "prefill" || shapes != std::vector<std::string>{"ornith9b"} ||
+                 format != kv::Format::Int8 || !comparisonLibrary.empty()))
+      throw std::invalid_argument("--compare-wide-prefill requires ornith9b INT8 prefill only");
     for (const std::string &shape : shapes) {
       const AttentionShape geometry = shapeOf(shape, format);
       if (extentPages % kv::Layout{1, geometry.kvHeads, geometry.headDimension, format}
@@ -326,12 +351,14 @@ int main(int argc, const char *argv[]) {
                                     " " + std::string(kv::formatName(format)));
     }
     metal::MetalBackend backend(argv[1]);
+    const ExecutionPlans operators(backend.capabilities());
     std::unique_ptr<metal::MetalBackend> comparison;
     std::vector<metal::MetalBackend *> backends{&backend};
     if (!comparisonLibrary.empty()) {
       comparison = std::make_unique<metal::MetalBackend>(comparisonLibrary);
       backends.push_back(comparison.get());
     }
+    if (wide) backends.push_back(&backend);
     std::cerr << "device " << backend.capabilities().deviceName << ", one attention layer, "
               << "Page32 " << kv::formatName(format) << " KV, median of " << repeat << " fused graphs (ms)\n";
     double warmupSeconds = 1.5;
@@ -351,8 +378,9 @@ int main(int argc, const char *argv[]) {
       for (uint32_t history : histories) {
         auto report = [&](bool prefill, uint32_t lane) {
           const auto cases =
-              measure(backends, casePlan(geometry, prefill, lane, history, shapeExtentPages),
-                      prefill, repeat, warmupSeconds);
+              measure(backends, casePlan(geometry, prefill, lane, history, shapeExtentPages,
+                                         operators, wide),
+                      prefill, repeat, warmupSeconds, operators, wide);
           warmupSeconds = 0.1;
           for (size_t i = 0; i < cases.size(); ++i) {
             std::cout << (firstCase ? "" : ",")

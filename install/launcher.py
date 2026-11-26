@@ -28,7 +28,7 @@ if __name__ == "__main__" and not __package__:
 # library alone: the launcher runs before .venv exists.
 from server import serve_options
 
-from . import assembly, catalog, clients, paths
+from . import assembly, catalog, clients, layout, paths
 from . import models as model_artifacts
 
 ROOT = paths.ROOT
@@ -194,6 +194,8 @@ def _ensure_installed(selection):
             command[-1:-1] = [flag, value]
     if selection.language_only:
         command.insert(-1, "--language-only")
+    if selection.thin:
+        command.insert(-1, "--thin")
     if _run_held(command, cwd=ROOT):
         raise LauncherError(
             "model download or verification failed",
@@ -210,7 +212,7 @@ def _installed_details(models_root=None):
     from .tuning import knobs_for
 
     if models_root is None:
-        models_root = paths.MODELS
+        models_root = paths.models_root()[0]
     from . import layout
 
     installed = []
@@ -254,6 +256,7 @@ def _installed_details(models_root=None):
             "family": None,
             "target_format": None,
             "vision_format": None,
+            "thin": False,
             "bytes": None,
         }
         try:
@@ -280,6 +283,7 @@ def _installed_details(models_root=None):
             entry["family"] = record.get("family")
             entry["target_format"] = record.get("target_format")
             entry["vision_format"] = record.get("vision_format")
+            entry["thin"] = record.get("thin") is True
             files = record.get("files")
             if isinstance(files, dict):
                 entry["bytes"] = sum(
@@ -395,7 +399,7 @@ def tune(args):
     winning engine knobs in its tuning.json (install/autotune.py)."""
     from . import assembly, autotune
 
-    models_root = Path(args.models).resolve() if args.models else paths.MODELS
+    models_root = paths.models_root(args.models)[0].resolve()
     if args.selection is not None:
         # The link's name under the models root, taken verbatim — installs
         # made with options live under .selections/<hash>, unreachable by
@@ -503,20 +507,33 @@ def serve(args):
         or args.revision is not None
         or args.language_only
         or args.draft_model is not None
+        or args.thin
     ):
         raise LauncherError("a serve without a model takes no model options")
     if args.dry_run:
         # The plan alone: resolve the selection and report what is installed,
         # without locks, downloads, builds or an engine check.
+        models_root, root_source = paths.models_root(args.models_dir)
         selection = model_artifacts.Selection.of(
-            paths.MODELS,
+            models_root,
             args.model,
             revision=args.revision,
             language_only=args.language_only,
             draft_model=args.draft_model,
+            thin=args.thin,
         )
         kind = model_artifacts.installation_kind(selection.link)
+        from . import gc as hub_gc
+
+        packed_root = hub_gc.packed_cache_dir()
         fields = [
+            ("root", f"{models_root} ({root_source})"),
+            (
+                "layout",
+                ".resolved assemblies, .blobs weights, .packed packages, "
+                ".selections option links",
+            ),
+            ("packed cache", str(packed_root) if packed_root else "disabled"),
             ("model", selection.model),
             ("revision", selection.revision or _styled("repository default", "2")),
             ("draft", selection.draft_model or _styled("auto (family's draft)", "2")),
@@ -532,8 +549,9 @@ def serve(args):
                 else _styled("no — serve would download it", "33"),
             ),
         ]
+        width = max(len(label) for label, _ in fields)
         for label, value in fields:
-            print(f"  {_styled(f'{label:<11}', '2')}{value}")
+            print(f"  {_styled(f'{label:<{width}}', '2')} {value}")
         return 0
     # Started in the background from a non-interactive shell, the launcher
     # inherits SIGINT as ignored; take both stop signals from the start.
@@ -577,13 +595,18 @@ def serve(args):
                 hint="choose a different port with --port",
             ) from None
         record = None
+        models_root = paths.models_root(args.models_dir)[0]
+        if args.models_dir is not None:
+            # The server receives the same resolved spelling the installer used.
+            args.models_dir = str(models_root)
         if args.model is not None:
             selection = model_artifacts.Selection.of(
-                paths.MODELS,
+                models_root,
                 args.model,
                 revision=args.revision,
                 language_only=args.language_only,
                 draft_model=args.draft_model,
+                thin=args.thin,
             )
             _ensure_installed(selection)
             # A concurrent install may advance the selection link. Keep this
@@ -613,7 +636,7 @@ def serve(args):
                 else []
             ),
             "--models-dir",
-            str(paths.MODELS),
+            str(models_root),
             "--binary",
             str(paths.BINARY),
             "--port",
@@ -690,8 +713,87 @@ def coding_client(args):
     os.execvpe(path, command, environment)
 
 
+def _selection_link(models_root, name):
+    """The selection link name names, exact and contained as tune resolves it."""
+    link = models_root / name
+    if link not in model_artifacts.selection_links(models_root):
+        raise LauncherError(f"{name} is not a selection under {models_root}")
+    return link
+
+
+def _verify_model_storage(args):
+    models_root = paths.models_root(getattr(args, "models", None))[0].resolve()
+    if args.selection is not None and args.model is not None:
+        raise LauncherError("models verify takes a model or --selection NAME, not both")
+    if args.selection is not None:
+        link = _selection_link(models_root, args.selection)
+        display = args.selection
+    elif args.model is not None:
+        selection = model_artifacts.Selection.of(
+            models_root,
+            args.model,
+            revision=args.revision,
+            language_only=args.language_only,
+            draft_model=args.draft_model,
+            thin=args.thin,
+        )
+        link = selection.link
+        display = args.model
+    else:
+        raise LauncherError("models verify needs a model or --selection NAME")
+    if model_artifacts.installation_kind(link) is None:
+        raise LauncherError(f"{display} is not installed in {models_root}")
+    model_artifacts.verify_installation(link, full=args.full)
+    print(
+        f"RichEngine model {display} preflight passed "
+        f"({'full' if args.full else 'quick'})."
+    )
+    return 0
+
+
+def _remove_model_storage(args):
+    models_root = paths.models_root(getattr(args, "models", None))[0].resolve()
+    target = args.target
+    if target.startswith(layout.SELECTIONS + "/"):
+        link = _selection_link(models_root, target)
+    elif (models_root / layout.SELECTIONS / target) in model_artifacts.selection_links(
+        models_root
+    ):
+        target = f"{layout.SELECTIONS}/{target}"
+        link = models_root / target
+    else:
+        link = model_artifacts.Selection.of(
+            models_root,
+            target,
+            revision=args.revision,
+            language_only=args.language_only,
+            draft_model=args.draft_model,
+            thin=args.thin,
+        ).link
+    model_artifacts.remove_installation(models_root, link)
+    print(f"Removed {target} from {models_root}.")
+    return 0
+
+
 def list_models(args):
-    installed = _installed_details()
+    action = getattr(args, "models_command", None)
+    if action == "root":
+        root, source = paths.models_root(getattr(args, "models", None))
+        print(root)
+        print(f"source: {source}")
+        return 0
+    if action == "verify":
+        return _verify_model_storage(args)
+    if action == "migrate":
+        if getattr(args, "models", None) is not None:
+            raise LauncherError(
+                "models migrate always uses the currently resolved root; omit --models"
+            )
+        model_artifacts.migrate_models_root(args.destination)
+        return 0
+    if action == "rm":
+        return _remove_model_storage(args)
+    installed = _installed_details(paths.models_root(getattr(args, "models", None))[0])
     known = sorted(set(catalog.official_ids()) | set(_suggested_models()))
     installed_ids = {entry["model"] for entry in installed}
     if args.json:
@@ -717,14 +819,17 @@ def list_models(args):
                 entry["family"] or "",
                 entry["target_format"] or "",
                 entry["vision_format"] or "",
+                "yes" if entry["thin"] else "",
                 _size(entry["bytes"]) if type(entry["bytes"]) is int else "",
             )
             for entry in installed
         ]
         rows += [
-            (model, "", "", "", "", "") for model in known if model not in installed_ids
+            (model, "", "", "", "", "", "")
+            for model in known
+            if model not in installed_ids
         ]
-        header = ("MODEL", "STATUS", "FAMILY", "FORMAT", "VISION", "SIZE")
+        header = ("MODEL", "STATUS", "FAMILY", "FORMAT", "VISION", "THIN", "SIZE")
     else:
         rows = [(entry["model"], "installed") for entry in installed]
         rows += [(model, "") for model in known if model not in installed_ids]
@@ -757,21 +862,35 @@ def list_flags(args):
     )
     plain = argparse.HelpFormatter("richengine")
     styled = _HelpFormatter("richengine")
+    def rows_for(command_parser):
+        return [
+            (
+                plain._format_action_invocation(a),
+                styled._format_action_invocation(a),
+                a.help,
+            )
+            for a in command_parser._actions
+            if a.option_strings and a.help is not argparse.SUPPRESS
+        ]
+
     sections = [
-        (
-            f"richengine {name}",
-            [
-                (
-                    plain._format_action_invocation(a),
-                    styled._format_action_invocation(a),
-                    a.help,
-                )
-                for a in subcommands.choices[name]._actions
-                if a.option_strings
-            ],
-        )
-        for name in ("serve", "models", "status", "flags", "doctor", "disk")
+        (f"richengine {name}", rows_for(subcommands.choices[name]))
+        for name in ("serve", "models", "tune", "status", "flags", "doctor", "disk")
     ]
+    for parent, nested in (
+        ("models", ("root", "verify", "migrate", "rm")),
+        ("disk", ("dedupe", "wipe", "gc")),
+    ):
+        parent_parser = subcommands.choices[parent]
+        nested_commands = next(
+            action
+            for action in parent_parser._actions
+            if isinstance(action, argparse._SubParsersAction)
+        )
+        sections += [
+            (f"richengine {parent} {name}", rows_for(nested_commands.choices[name]))
+            for name in nested
+        ]
     sections.append(
         (
             "richengine <agent>",
@@ -950,6 +1069,28 @@ def status(args):
     return 1
 
 
+def _packed_cache_usage():
+    """The packed cache root, entry count and bytes; entries are immediate children."""
+    from . import gc as hub_gc
+
+    root = hub_gc.packed_cache_dir()
+    if root is None or not root.is_dir():
+        return root, 0, 0
+    entries = 0
+    bytes_ = 0
+    for entry in root.iterdir():
+        if not entry.is_dir():
+            continue
+        entries += 1
+        for path in entry.rglob("*"):
+            try:
+                if path.is_file() and not path.is_symlink():
+                    bytes_ += path.stat().st_size
+            except OSError:
+                pass
+    return root, entries, bytes_
+
+
 def doctor(args):
     """One health line per check: ok green, warn yellow, fail red, info dim.
     A hard failure — a missing engine or a refused device — ends in 1."""
@@ -1007,9 +1148,18 @@ def doctor(args):
     except ValueError:
         report(info, "memory", "could not read hw.memsize")
 
-    # Room on the volume holding the models directory.
+    # The resolved store and room on the volume holding it.
+    models_root, models_source = paths.models_root(getattr(args, "models", None))
+    report(info, "models", f"{models_root} ({models_source})")
+    cache_root, cache_entries, cache_bytes = _packed_cache_usage()
+    cache_detail = (
+        "disabled"
+        if cache_root is None
+        else f"{cache_entries} entries, {_size(cache_bytes)} at {cache_root}"
+    )
+    report(info, "packed", cache_detail)
     usage = subprocess.run(
-        ["df", "-g", str(paths.MODELS if paths.MODELS.exists() else paths.DATA)],
+        ["df", "-g", str(models_root if models_root.exists() else paths.DATA)],
         capture_output=True,
         text=True,
     )
@@ -1057,6 +1207,16 @@ STORE_SPLASH_CACHE = "splash-cache"
 # Both splash keys together: the "is serving" lock and disk.py's version of
 # it guard them as one.
 SPLASH_STORES = (STORE_SPLASH, STORE_SPLASH_CACHE)
+# Rename-era aliases; the canonical keys above stay valid forever.
+STORE_ALIASES = {
+    "richengine": STORE_SPLASH,
+    "richengine-cache": STORE_SPLASH_CACHE,
+}
+
+
+def _canonical_store(name):
+    return STORE_ALIASES.get(name, name)
+
 
 # The directories other local model tools keep their weights in; each name is
 # what `disk` lists and `disk wipe` accepts. Every store lists candidates —
@@ -1066,7 +1226,7 @@ SPLASH_STORES = (STORE_SPLASH, STORE_SPLASH_CACHE)
 MODEL_STORES = {
     STORE_SPLASH: (
         "Splash/RichEngine",
-        lambda: [paths.MODELS],
+        lambda: [paths.models_root()[0]],
         2,
     ),
     STORE_SPLASH_CACHE: (
@@ -1171,6 +1331,45 @@ def _dir_bytes(path):
     return total
 
 
+def _selection_display(link):
+    """A .selections link's human name: its target repository plus (options)."""
+    repo = None
+    try:
+        record = model_artifacts.read_json(link / layout.ASSEMBLY_RECORD)
+        source = record.get("sources", {}).get(layout.TARGET, {})
+        repo = source.get("repo") or record.get("model")
+    except model_artifacts.ModelError:
+        try:
+            manifest = model_artifacts.read_json(link / layout.PACKAGE_MANIFEST)
+            repo = manifest.get("model") or manifest.get("family")
+        except model_artifacts.ModelError:
+            pass
+    if not isinstance(repo, str) or not repo:
+        repo = link.name
+    elif Path(repo).is_absolute():
+        repo = Path(repo).name
+    return repo, f"{repo} (options)"
+
+
+def _option_entries(path, calc):
+    """The hidden .selections installs of the RichEngine root, surfaced by name."""
+    root = path / layout.SELECTIONS
+    entries = []
+    for link in sorted(root.iterdir()) if root.is_dir() else ():
+        if not link.is_symlink() or link.name.startswith("."):
+            continue
+        repo, display = _selection_display(link)
+        entries.append(
+            {
+                "name": display,
+                "selection": f"{layout.SELECTIONS}/{link.name}",
+                "dedupe": repo,
+                "bytes": _dir_bytes(link) if calc else None,
+            }
+        )
+    return entries
+
+
 def _store_rows(calc=True):
     """Every store with its existing directories and the model entries they
     hold. Sizes are counted only with calc — walking a 200 GB cache is slow."""
@@ -1227,6 +1426,8 @@ def _store_rows(calc=True):
                         "bytes": _dir_bytes(child) if calc else None,
                     }
                 )
+            if key == STORE_SPLASH:
+                entries += _option_entries(path, calc)
         # Largest first where sizes were counted, else by name.
         entries.sort(
             key=lambda e: (-(e["bytes"] or 0), e["name"]) if calc else e["name"]
@@ -1266,16 +1467,21 @@ def disk(args):
         size = (
             _styled(_size(row["bytes"]), "36")
             if args.calc
-            else _styled("(skipped)", "2")
+            else _styled("(size skipped — use --calc)", "2")
         )
         print(f"{row['title']:<{width}}  {size}  {_styled(where, '2')}")
         for entry in row["models"][:10]:
+            suffix = (
+                " " + _styled("[" + entry["selection"] + "]", "2")
+                if entry.get("selection")
+                else ""
+            )
             if entry["bytes"] is None:
-                print(f"{'':<{width}}    {_styled(entry['name'], '2')}")
+                print(f"{'':<{width}}    {_styled(entry['name'], '2')}{suffix}")
             else:
                 print(
                     f"{'':<{width}}    {entry['name']}  "
-                    f"{_styled(_size(entry['bytes']), '2')}"
+                    f"{_styled(_size(entry['bytes']), '2')}{suffix}"
                 )
         if len(row["models"]) > 10:
             more = f"… {len(row['models']) - 10} more"
@@ -1340,7 +1546,7 @@ def _dedupe_groups(variants=False):
         if row is None:
             continue
         for entry in row["models"]:
-            key = _dedupe_key(store, entry["name"], variants)
+            key = _dedupe_key(store, entry.get("dedupe", entry["name"]), variants)
             occurrence = {
                 "store": store,
                 "title": row["title"],
@@ -1491,10 +1697,23 @@ def _model_paths(store, row, model):
     """The filesystem paths `model` names inside `store`, each a direct
     member of one of the store's own directories — never a path that escapes
     it."""
+    store = _canonical_store(store)
     paths_ = []
     for root in row["paths"]:
         root = Path(root)
-        if store == "huggingface":
+        selection = model.split("/")
+        if store == STORE_SPLASH and model.startswith(layout.SELECTIONS + "/"):
+            # Option installs are the one hidden subtree wipe may target:
+            # exactly .selections/<name>, never deeper or outside it.
+            if (
+                len(selection) != 2
+                or not selection[1]
+                or selection[1] in {".", ".."}
+                or selection[1].startswith(".")
+            ):
+                continue
+            candidate = root / model
+        elif store == "huggingface":
             # owner/repo as the Hub cache spells it: models--OWNER--REPO.
             if "/" not in model:
                 continue
@@ -1528,9 +1747,10 @@ def _splash_assembly(link):
         target = link.resolve(strict=True)
     except OSError:
         return None
-    if target.parent != paths.MODELS / ".resolved":
+    models_root = paths.models_root()[0]
+    if target.parent != models_root / ".resolved":
         return None
-    for other in model_artifacts.selection_links(paths.MODELS):
+    for other in model_artifacts.selection_links(models_root):
         if other != link:
             try:
                 if other.resolve() == target:
@@ -1541,7 +1761,8 @@ def _splash_assembly(link):
 
 
 def _disk_wipe(args):
-    name = args.store
+    name = _canonical_store(args.store)
+    args.store = name
     row = next(row for row in _store_rows() if row["name"] == name)
     if not row["exists"]:
         if args.json:
@@ -1583,6 +1804,29 @@ def _disk_wipe(args):
     return 0
 
 
+def _dead_gc_rows(result):
+    """The largest dead repositories and revisions of a gc plan, with sizes."""
+    info = result.get("info")
+    repos = []
+    revisions = []
+    dead_repos = set(result["dead_repos"])
+    dead_revisions = set(result["dead_revisions"])
+    for repo in getattr(info, "repos", ()) or ():
+        if repo.repo_id in dead_repos:
+            repos.append((repo.size_on_disk, repo.repo_id))
+        for revision in repo.revisions:
+            if revision.commit_hash in dead_revisions:
+                revisions.append(
+                    (
+                        revision.size_on_disk,
+                        f"{repo.repo_id}@{revision.commit_hash[:12]}",
+                    )
+                )
+    repos.sort(reverse=True)
+    revisions.sort(reverse=True)
+    return repos, revisions
+
+
 def _disk_gc(args):
     from . import gc as hub_gc
 
@@ -1591,34 +1835,96 @@ def _disk_gc(args):
         print("no Hugging Face cache to collect.")
         return 0
     shared_bytes = sum(result["shared_blobs"].values())
+    packed_bytes = sum(result.get("packed_cache", {}).values())
     print(
         f"Hub cache: {result['repos']} repos, {result['live_revisions']} revisions "
         f"referenced by installed models; "
         f"{len(result['dead_repos'])} repos and {len(result['dead_revisions'])} "
         f"revisions unreferenced, {len(result['shared_blobs'])} shared blobs "
-        f"({_size(shared_bytes)}), {len(result['incomplete'])} partial downloads."
+        f"({_size(shared_bytes)}), {len(result['incomplete'])} partial downloads, "
+        f"{len(result.get('owned_blobs', {}))} orphaned model blobs, "
+        f"{len(result.get('packed_cache', {}))} packed cache entries "
+        f"({_size(packed_bytes)})."
     )
     if not args.yes:
+        repos, revisions = _dead_gc_rows(result)
+        if repos:
+            print("Top unreferenced repos:")
+            for size, name in repos[:5]:
+                print(f"  {name}  {_styled(_size(size), '36')}")
+        if revisions:
+            print("Top unreferenced revisions:")
+            for size, name in revisions[:5]:
+                print(f"  {name}  {_styled(_size(size), '36')}")
         print("Plan only — rerun with --yes to collect.")
         return 0
-    freed = hub_gc.execute(result)
-    print(f"Collected {_size(freed)} of Hub cache.")
+    freed = hub_gc.execute_detailed(result)
+    total = sum(freed.values())
+    print(f"Collected {_size(total)} of Hub cache:")
+    for key, label in (
+        ("revisions", "Hub revisions"),
+        ("shared_blobs", "shared blobs"),
+        ("incomplete", "partial downloads"),
+        ("owned_blobs", "model blobs"),
+        ("packed_cache", "packed cache"),
+    ):
+        print(f"  {label:<18}{_size(freed[key])}")
     return 0
 
 
 def _disk_wipe_model(args, row):
     targets = _model_paths(args.store, row, args.model)
+    matches = [
+        entry
+        for entry in row["models"]
+        if entry["name"] == args.model and entry.get("selection")
+    ]
+    if not targets and len(matches) == 1:
+        targets = _model_paths(args.store, row, matches[0]["selection"])
+    elif not targets and len(matches) > 1:
+        raise LauncherError(
+            f"{args.model!r} names {len(matches)} option installs",
+            hint="target one as .selections/<hash> from the disk listing",
+        )
     if not targets:
         raise LauncherError(
             f"no model {args.model!r} in {row['title']}",
             hint="models there: "
-            + ", ".join(entry["name"] for entry in row["models"][:8]),
+            + ", ".join(
+                entry.get("selection", entry["name"]) for entry in row["models"][:8]
+            ),
         )
     if not args.yes:
         raise LauncherError(
             f"refusing to wipe {args.model} ({', '.join(str(t) for t in targets)}) without confirmation",
             hint=f"run 'richengine disk wipe {args.store} {args.model} --yes'",
         )
+    if args.store == STORE_SPLASH and all(
+        path.parent.name == layout.SELECTIONS and path.is_symlink() for path in targets
+    ):
+        wiped, bytes_ = [], 0
+        for path in targets:
+            bytes_ += _dir_bytes(path)
+            try:
+                model_artifacts.remove_installation(paths.models_root()[0], path)
+                wiped.append(str(path))
+            except model_artifacts.ModelError as error:
+                raise LauncherError(f"could not wipe {path}: {error}") from None
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "wiped": args.store,
+                        "model": args.model,
+                        "paths": wiped,
+                        "bytes": bytes_,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(f"Wiped {args.model} from {row['title']}: {_size(bytes_)}.")
+        return 0
     wiped, bytes_ = [], 0
     for path in targets:
         bytes_ += _dir_bytes(path)
@@ -1690,7 +1996,8 @@ def _print_help():
         f"\n{_styled('Usage:', '2')} richengine {_styled('<command>', '36')} [options]\n"
         f"\n{bold('Server')}\n"
         f"  {command('serve')}run the local server; Ctrl+C stops it\n"
-        f"  {command('models')}list installed and known models\n"
+        f"  {command('models')}list and manage installed models\n"
+        f"  {command('tune')}measure and keep a model's fastest engine knobs\n"
         f"  {command('status')}report the running server\n"
         f"  {command('flags')}list every option of every command\n"
         f"  {command('doctor')}check the engine, environment and server\n"
@@ -1707,8 +2014,12 @@ def _print_help():
         "  richengine serve --model mlx-community/Qwen3.8-27B-4bit\n"
         "  richengine opencode    # in another terminal, after Ready\n"
         f"\n{bold('Environment')}\n"
-        "  RICHENGINE_PORT     default port for serve, status and clients (8000)\n"
-        "  RICHENGINE_API_KEY  bearer token sent to the server, when set"
+        "  RICHENGINE_PORT               default port for serve, status and clients (8000)\n"
+        "  RICHENGINE_API_KEY            bearer token sent to the server, when set\n"
+        "  RICHENGINE_MODELS_DIR         models root override; --models-dir wins\n"
+        "  RICHENGINE_PACKED_CACHE_ROOT  packed weight cache root; empty disables it\n"
+        "  RICHENGINE_PACK_KEEP_SOURCES  keep packed-package source snapshots when 1\n"
+        "  HF_HOME                       Hugging Face home, including its hub cache"
     )
 
 
@@ -1725,8 +2036,12 @@ def _build_parser():
             "Use richengine serve --help for server settings. Client arguments,\n"
             "including --help, are passed through to the installed agent.\n\n"
             "Environment:\n"
-            "  RICHENGINE_PORT      the default port for serve, status and clients (8000)\n"
-            "  RICHENGINE_API_KEY   the bearer token clients and status send, when set"
+            "  RICHENGINE_PORT               the default port for serve, status and clients (8000)\n"
+            "  RICHENGINE_API_KEY            the bearer token clients and status send, when set\n"
+            "  RICHENGINE_MODELS_DIR         models root override; --models-dir wins\n"
+            "  RICHENGINE_PACKED_CACHE_ROOT  packed weight cache root; empty disables it\n"
+            "  RICHENGINE_PACK_KEEP_SOURCES  keep packed-package source snapshots when 1\n"
+            "  HF_HOME                       Hugging Face home, including its hub cache"
         ),
     )
     parser.add_argument("--version", action="version", version=_version())
@@ -1774,6 +2089,17 @@ def _build_parser():
         help="skip vision preparation and loading",
     )
     server.add_argument(
+        "--thin",
+        action="store_true",
+        help=(
+            "experimental, MLX affine targets only: keep serving weights in the "
+            "packed cache and drop target payload links on the start after that "
+            "cache validates; the cache is RICHENGINE_PACKED_CACHE_ROOT or "
+            "~/Library/Caches/RichEngine/packed, and losing it downloads and "
+            "rebuilds the payload"
+        ),
+    )
+    server.add_argument(
         "--offline",
         action="store_true",
         help="start the installed model without contacting the Hugging Face Hub (as HF_HUB_OFFLINE=1)",
@@ -1786,8 +2112,12 @@ def _build_parser():
     serve_options.add_serve_arguments(server)
     models_command = commands.add_parser(
         "models",
-        help="list installed and known models",
-        description="List the models installed locally and every model ID the catalog and the suggested list name.",
+        help="list installed and known models, or manage model storage",
+        description=(
+            "List the models installed locally and every model ID the catalog "
+            "and the suggested list name. The root, verify, migrate and rm "
+            "subcommands inspect, move and remove model storage."
+        ),
         formatter_class=_HelpFormatter,
         **_PARSER_OPTIONS,
     )
@@ -1798,8 +2128,92 @@ def _build_parser():
         "-v",
         "--verbose",
         action="store_true",
-        help="add family, format, vision and installed size columns",
+        help="add family, format, vision, thin and installed size columns",
     )
+    models_command.add_argument(
+        "--models",
+        metavar="DIR",
+        help="models directory (default: RICHENGINE_MODELS_DIR, config.json or the install root's)",
+    )
+    model_commands = models_command.add_subparsers(dest="models_command")
+    model_commands.add_parser(
+        "root",
+        help="print the resolved models root and its source",
+        formatter_class=_HelpFormatter,
+        **_PARSER_OPTIONS,
+    ).add_argument("--models", metavar="DIR", default=argparse.SUPPRESS, help="models directory to resolve")
+
+    def source_options(command):
+        command.add_argument(
+            "--revision", help="optional model branch, tag or commit"
+        )
+        command.add_argument(
+            "--draft-model",
+            type=model_artifacts.parse_draft_model,
+            help="the draft override the installation was made with, if any",
+        )
+        command.add_argument(
+            "--language-only",
+            action="store_true",
+            help="the language-only installation, if that is what was installed",
+        )
+        command.add_argument(
+            "--thin",
+            action="store_true",
+            help="the thin installation, if that is what was installed",
+        )
+        command.add_argument(
+            "--models", metavar="DIR", default=argparse.SUPPRESS, help="models directory"
+        )
+
+    verify_command = model_commands.add_parser(
+        "verify",
+        help="verify one installed model",
+        formatter_class=_HelpFormatter,
+        **_PARSER_OPTIONS,
+    )
+    verify_command.add_argument(
+        "model",
+        nargs="?",
+        type=model_artifacts.parse_model_id,
+        metavar="OWNER/REPO[:VARIANT]",
+        help="the installed model; omit only with --selection",
+    )
+    verify_command.add_argument(
+        "--selection",
+        metavar="NAME",
+        help="an installed selection link relative to the models directory (e.g. .selections/<hash>)",
+    )
+    verify_command.add_argument(
+        "--full", action="store_true", help="rehash file contents, not just sizes and times"
+    )
+    source_options(verify_command)
+    migrate_command = model_commands.add_parser(
+        "migrate",
+        help="copy the currently resolved models root and record the destination in config.json",
+        formatter_class=_HelpFormatter,
+        **_PARSER_OPTIONS,
+    )
+    migrate_command.add_argument("destination", type=Path, metavar="DIR")
+    migrate_command.add_argument(
+        "--models", metavar="DIR", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
+    remove_command = model_commands.add_parser(
+        "rm",
+        help="remove one installed model or selection",
+        formatter_class=_HelpFormatter,
+        **_PARSER_OPTIONS,
+    )
+    remove_command.add_argument(
+        "target",
+        type=lambda value: value
+        if value.startswith(layout.SELECTIONS + "/")
+        or model_artifacts.is_hex_digest(value, 64)
+        else model_artifacts.parse_model_id(value),
+        metavar="OWNER/REPO[:VARIANT]|.selections/HASH",
+        help="the installed model or selection to remove; there is no undo",
+    )
+    source_options(remove_command)
     tune_command = commands.add_parser(
         "tune",
         help="measure and keep this chip's fastest engine knobs for a model",
@@ -1922,12 +2336,17 @@ def _build_parser():
         formatter_class=_HelpFormatter,
         **_PARSER_OPTIONS,
     )
-    commands.add_parser(
+    doctor_command = commands.add_parser(
         "doctor",
         help="check the engine, environment and server",
         description="Check the engine binary and device, the Python environment, memory, disk, the model catalog and the running server. Exits 1 on a hard failure.",
         formatter_class=_HelpFormatter,
         **_PARSER_OPTIONS,
+    )
+    doctor_command.add_argument(
+        "--models",
+        metavar="DIR",
+        help="models directory to diagnose (default: the resolved root)",
     )
     disk_command = commands.add_parser(
         "disk",
@@ -1982,9 +2401,13 @@ def _build_parser():
     )
     wipe.add_argument(
         "store",
-        choices=list(MODEL_STORES),
+        choices=list(MODEL_STORES) + list(STORE_ALIASES),
         metavar="STORE",
-        help="one of: " + ", ".join(MODEL_STORES),
+        help=(
+            "one of: "
+            + ", ".join(MODEL_STORES)
+            + " (aliases: richengine=splash, richengine-cache=splash-cache)"
+        ),
     )
     wipe.add_argument(
         "model",
@@ -1999,8 +2422,8 @@ def _build_parser():
     )
     gc_command = disk_commands.add_parser(
         "gc",
-        help="collect Hugging Face cache entries no installed model references",
-        description="Walk the models root for Hub-cache links, then drop cached repos, revisions, shared blobs and partial downloads nothing references. Without --yes it only reports.",
+        help="collect cache entries no installed model references",
+        description="Walk the models root for Hub-cache and packed-cache references, then drop cached repos, revisions, shared blobs, packed weight images and partial downloads nothing references. Without --yes it only reports.",
         formatter_class=_HelpFormatter,
         **_PARSER_OPTIONS,
     )

@@ -1132,8 +1132,50 @@ Runtime::decodeAsync(const BatchPlan &plan,
           entry.constraint == ConstraintMode::TokenMask ||
           Impl::samplingEnabled(entry) || impl_->speechAudioSlot(entry))
         continue;
-      const uint32_t clipped =
-          std::min(proposals[lane], impl_->ngram_.chainLengths_[lane]);
+      // Adaptive cap: rows whose cumulative acceptance survival — the
+      // acceptance model's Unknown-agreement product down the chain —
+      // falls below clipSurvival_ are dead verify width. Chain rows are
+      // copied context, so survival decays fast on short matches; long
+      // copy-runs (pattern 16+) keep nearly every row. At least one row
+      // survives: the displacement/mix decision already spent it.
+      uint32_t cap = impl_->ngram_.chainLengths_[lane];
+      if (impl_->ngram_.clipSurvival_ > 0.0 && cap > 1) {
+        const uint32_t pattern =
+            std::max(impl_->ngram_.chainPatterns_[lane],
+                     LookupIndex::kMinimumMatch);
+        double survival = 1.0;
+        uint32_t keep = 0;
+        for (uint32_t depth = 0; depth < cap; ++depth) {
+          survival *= impl_->ngram_.lookupAcceptance_.rate(
+              Impl::samplingEnabled(entry), pattern, depth,
+              LookupAgreement::Unknown);
+          if (survival < impl_->ngram_.clipSurvival_ && keep)
+            break;
+          ++keep;
+        }
+        cap = std::max(keep, uint32_t{1});
+      }
+      // Width follows the chain's survival-valued rows, not the lane's
+      // budget/context-scaled count: the survival cap already prices each
+      // row's expected acceptance, and measured cycle time is nearly flat
+      // in width at these row counts while every accepted row is a token
+      // the next step need not emit. Copy-run lanes starved to two rows by
+      // the context scale measured 2.7x slower than full-width verification
+      // at 25K context with byte-identical output. The cap can only shrink
+      // a starved lane further when its chain is genuinely weaker than the
+      // rows it was offered; it never exceeds the chain or the retention
+      // limit.
+      const uint32_t retentionCap =
+          maximumRetained[lane] ? maximumRetained[lane] - 1 : 0;
+      const uint32_t clipped = std::min({cap, retentionCap,
+                                         uint32_t{kDraftProposalTokens}});
+      if (impl_->ngramDebug_)
+        fprintf(stderr,
+                "ngram-clip lane=%u chain=%u pattern=%u cap=%u "
+                "proposals=%u clipped=%u mixed=%u pre=%u\n",
+                lane, impl_->ngram_.chainLengths_[lane],
+                impl_->ngram_.chainPatterns_[lane], cap, proposals[lane],
+                clipped, mixed ? 1 : 0, ngramPredrafted ? 1 : 0);
       if (clipped < proposals[lane])
         impl_->counters.ngramVerifyRowsClipped += proposals[lane] - clipped;
       proposals[lane] = clipped;
@@ -1237,6 +1279,19 @@ Runtime::decodeAsync(const BatchPlan &plan,
         *impl_, std::move(lanes), items, std::move(commandGraph),
         std::move(completion), merged);
   }
+  const uint32_t verifyStride = impl_->geometry.draft.verifyRows();
+  const auto chainPolicy = Impl::samplingPolicy(*entries[0]);
+  static const bool narrowB1 = envFlagOn("RICHENGINE_VERIFY_NARROW_B1");
+  const uint32_t targetStride =
+      narrowB1 && !tree && width == 1 && verifyStride == 16 &&
+              liveRows[0] <= 8 && !draftBypassed && !tuning().verifyAllLive &&
+              impl_->geometry.target.layers == 32 &&
+              impl_->geometry.target.hiddenSize == 4096 &&
+              impl_->geometry.draft.kind == DraftKind::DFlashV1 &&
+              !chainPolicy.samples() && !chainPolicy.constrained &&
+              !chainPolicy.penalties.active()
+          ? 8
+          : verifyStride;
   if (tree) {
     // A comb's tables are host-written and nothing like the predraft's
     // assumed inputs — drain it before the tree passes write theirs.
@@ -1293,7 +1348,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                   {liveRows.data(), width});
     impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
                                 DecodeTensor::Hidden0, width, 1,
-                                impl_->geometry.draft.verifyRows());
+                                targetStride);
     // Audio slots: overwrite the anchor row's gathered embedding with the
     // last frame's feedback row — identical to the KV commit's semantics
     // (the placeholder position's KV keeps its injected value).
@@ -1309,9 +1364,11 @@ Runtime::decodeAsync(const BatchPlan &plan,
           impl_->geometry.target.hiddenSize);
     }
     impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, false,
-                                          {liveRows.data(), width});
+                                          {liveRows.data(), width},
+                                          targetStride);
     impl_->encodeTargetVerifyBatchPolicy(commandGraph, entries, false,
-                                         {liveRows.data(), width});
+                                         {liveRows.data(), width}, 0,
+                                         targetStride);
     impl_->encodeBatchAcceptance(commandGraph, entries,
                                  {maximumRetained.data(), width}, false,
                                  {proposals.data(), width});
@@ -1327,10 +1384,12 @@ Runtime::decodeAsync(const BatchPlan &plan,
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
   static const bool decodeTiming = envFlag("RICHENGINE_DECODE_TIMING");
+  static const bool verifyShapeTiming = envFlag("RICHENGINE_VERIFY_SHAPE_TIMING");
+  const uint32_t verifyLiveMax = *std::max_element(liveRows.begin(), liveRows.begin() + width);
   const auto encodeEnd = richengine::AwakeClock::now();
   auto finish = [impl, lanes = std::move(lanes),
                  items = std::move(copiedItems), tree,
-                 encodeStart, encodeEnd](CommandTiming timing) mutable {
+                 encodeStart, encodeEnd, verifyLiveMax, targetStride](CommandTiming timing) mutable {
     const auto t0 = richengine::AwakeClock::now();
     static const bool dbg = getenv("RICHENGINE_VERIFY_DUMP2") != nullptr;
     if (dbg) fprintf(stderr, "probe finish-enter\n");
@@ -1350,6 +1409,12 @@ Runtime::decodeAsync(const BatchPlan &plan,
     if (!tree)
       impl->completeGpuPredraft(lanes, items);
     if (dbg) fprintf(stderr, "probe predraft-done\n");
+    if (verifyShapeTiming && !tree) {
+      fprintf(stderr, "verify-shape width=%zu history=%llu live_max=%u stride=%u gpu_ms=%.6f accepted=%u retained=%u\n",
+              items.size(), static_cast<unsigned long long>(items.front().logicalPosition),
+              verifyLiveMax, targetStride, impl->counters.lastDecodeGpuSeconds * 1e3,
+              lanes[0].accepted, lanes[0].retained);
+    }
     if (tuning().opTimings &&
         std::any_of(lanes.begin(), lanes.end(), [](const auto &l) {
           return l.request->generatedTokens >= l.request->maxNewTokens;

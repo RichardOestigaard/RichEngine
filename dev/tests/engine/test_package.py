@@ -27,7 +27,7 @@ class PackageTests(unittest.TestCase):
                 ("install/tuning", package.TUNING_FILES),
                 ("install/completions", package.COMPLETION_FILES),
                 ("server", package.SERVER_FILES),
-                ("build", ("richengine", "richengine.metallib")),
+                ("build", ("richengine", "richengine.metallib", "richengine8.metallib")),
             ):
                 (root / folder).mkdir(parents=True)
                 for name in names:
@@ -94,7 +94,7 @@ class PackageTests(unittest.TestCase):
                 ("install", package.INSTALL_FILES),
                 ("install/tuning", package.TUNING_FILES),
                 ("server", package.SERVER_FILES),
-                ("build", ("richengine", "richengine.metallib")),
+                ("build", ("richengine", "richengine.metallib", "richengine8.metallib")),
             ):
                 (root / folder).mkdir(parents=True)
                 for name in names:
@@ -351,7 +351,7 @@ class Formula
   def odie(message); raise message; end
 end
 load ARGV[0]
-RichEngine.new(Pathname(ARGV[1]), Pathname(ARGV[2])).install
+Richengine.new(Pathname(ARGV[1]), Pathname(ARGV[2])).install
 """
             subprocess.run(
                 ["ruby", "-e", driver, str(formula), str(prefix), str(opt)],
