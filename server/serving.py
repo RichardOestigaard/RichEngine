@@ -36,6 +36,10 @@ class VisionSpec:
     pipeline resizes into. None for a family serving no tower."""
 
     pad_token: str = "<|image_pad|>"
+    # Nemotron Omni wraps each image's pad-token run in these span markers;
+    # empty for towers whose pads stand alone.
+    start_token: str | None = None
+    end_token: str | None = None
     patch_size: int = 16
     temporal_patch_size: int = 2
     merge_size: int = 2
@@ -45,6 +49,10 @@ class VisionSpec:
     # The tower's own resize cap where it states one narrower than the
     # server's default; the frontend prepares under the tighter bound.
     max_pixels: int | None = None
+
+    def __post_init__(self):
+        if (self.start_token is None) != (self.end_token is None):
+            raise ValueError("vision start_token and end_token must be set together")
 
 
 @dataclass(frozen=True)
@@ -153,6 +161,8 @@ class ServingContract:
             vision=(
                 VisionSpec(
                     pad_token=vision.get("pad_token", "<|image_pad|>"),
+                    start_token=vision.get("start_token"),
+                    end_token=vision.get("end_token"),
                     patch_size=int(vision.get("patch_size", 16)),
                     temporal_patch_size=int(vision.get("temporal_patch_size", 2)),
                     merge_size=int(vision.get("merge_size", 2)),

@@ -296,6 +296,16 @@ constexpr MeasuredSplit kMeasuredStagedSplits[] = {
     {kApple10Plus20Cores, 512, 2'560, 8, 8},    {kApple10Plus20Cores, 12'800, 4'096, 8, 2},
     {kApple10Plus20Cores, 1'024, 4'096, 32, 4}, {kApple10Plus20Cores, 2'048, 10'752, 16, 8},
     {kApple10Plus20Cores, 25'600, 4'096, 8, 2}, {kApple10Plus20Cores, 25'600, 4'096, 16, 2},
+    // Nemotron-3.5-Bolt-74B-A9B's 16-row decode on the 20-core M5 Pro
+    // (gguf_decode_sweep bolt, three runs): the IQ2_XXS shared-expert up
+    // and down at four splits over the tier's two (+9%/+3%), the narrow
+    // Q8_0 latent down at four over the tier's eight (+7-11%) and the
+    // 1024-input Q8_0 latent up unsplit over the tier's two (+21%). The
+    // tier already picks the sweep winners of Bolt's other shapes:
+    // {18688,4096} and {131072,4096} unsplit, {4096,8192} and {4096,4096}
+    // at two.
+    {kApple10Plus20Cores, 5'376, 4'096, 16, 4}, {kApple10Plus20Cores, 4'096, 5'376, 16, 4},
+    {kApple10Plus20Cores, 1'024, 4'096, 16, 4}, {kApple10Plus20Cores, 4'096, 1'024, 16, 1},
     // Isolated winners rejected on the 20-core M5 Pro for flipping emitted
     // tokens end-to-end (decode-profile --dump-tokens): LFM2.5-2.6B's
     // {6144,2048}@32 (conv in_proj, s1 over s2), {10752,2048} gate/up at

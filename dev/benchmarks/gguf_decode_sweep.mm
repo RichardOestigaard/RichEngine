@@ -82,7 +82,7 @@ Image allocateImage(MetalBackend &backend, const Shape &shape,
   return image;
 }
 
-void run(const std::string &metallibPath) {
+void run(const std::string &metallibPath, const std::string &filter) {
   MetalBackend backend(metallibPath);
   const auto &capabilities = backend.capabilities();
   std::cout << "device=\"" << capabilities.deviceName
@@ -183,6 +183,16 @@ void run(const std::string &metallibPath) {
       {"af4_6144x2048", 6'144, 2'048, GGUF_FMT_AF4},
       {"af4_512x2048", 512, 2'048, GGUF_FMT_AF4},
       {"af4_768x768", 768, 768, GGUF_FMT_AF4},
+      // NVIDIA-Nemotron-3.5-Bolt-74B-A9B (4096-wide hybrid): the mamba
+      // in_proj, attention out and the q80 projections of its dense blocks.
+      {"bolt_inproj_nvfp4", 18'688, 4'096, GGUF_FMT_NVFP4},
+      {"bolt_attn_nvfp4", 4'096, 8'192, GGUF_FMT_NVFP4},
+      {"bolt_gateup_iq2xxs", 5'376, 4'096, GGUF_FMT_IQ2XXS},
+      {"bolt_down_iq2xxs", 4'096, 5'376, GGUF_FMT_IQ2XXS},
+      {"bolt_kq80", 1'024, 4'096, GGUF_FMT_Q80},
+      {"bolt_up_q80", 4'096, 1'024, GGUF_FMT_Q80},
+      {"bolt_q_q80", 4'096, 4'096, GGUF_FMT_Q80},
+      {"bolt_head_q80", 131'072, 4'096, GGUF_FMT_Q80},
   };
   const FusedShape fused[] = {
       // MiniCPM5-2B: q + kv + kv (16 query heads, 2 KV heads x 128).
@@ -213,6 +223,8 @@ void run(const std::string &metallibPath) {
       {"gguf_decode_%s_m32_a", 32},
   };
   for (const Shape &shape : shapes) {
+    if (!filter.empty() && std::string_view(shape.label).find(filter) == std::string_view::npos)
+      continue;
     const QuantFormat &f = kQuantFormats[shape.formatId];
     if (shape.outputSize % QUANT_TILE_ROWS) {
       std::cout << shape.label << " skipped (output not a tile multiple)\n";
@@ -248,12 +260,12 @@ void run(const std::string &metallibPath) {
           uint64_t{tile.rows} * shape.outputSize * sizeof(__bf16),
           BufferStorage::Shared, "output");
       MetalBuffer partials = backend.allocateBuffer(
-          uint64_t{8} * tile.rows * shape.outputSize * sizeof(float),
+          uint64_t{16} * tile.rows * shape.outputSize * sizeof(float),
           BufferStorage::Shared, "partials");
       MetalBuffer counters = backend.allocateBuffer(
           uint64_t{columnTiles} * sizeof(uint32_t), BufferStorage::Shared,
           "counters");
-      for (uint32_t splits = 1; splits <= 8; ++splits) {
+      for (uint32_t splits = 1; splits <= 16; ++splits) {
         if (shape.inputSize / GGUF_STAGED_STEP / splits == 0) continue;
         // Whole splits per group partition; uneven splits are allowed but the
         // policy only takes divisors.
@@ -284,6 +296,8 @@ void run(const std::string &metallibPath) {
   // The fused three-segment projections: one image per segment, one split
   // count for the whole dispatch, grid over every segment's column tiles.
   for (const FusedShape &fusedShape : fused) {
+    if (!filter.empty() && std::string_view(fusedShape.label).find(filter) == std::string_view::npos)
+      continue;
     uint32_t totalCols = 0;
     Image images[3]{};
     uint64_t fusedBytes = 0;
@@ -352,12 +366,12 @@ void run(const std::string &metallibPath) {
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
-    if (argc != 2) {
-      std::cerr << "usage: gguf_decode_sweep <metallib>\n";
+    if (argc < 2 || argc > 3) {
+      std::cerr << "usage: gguf_decode_sweep <metallib> [label-filter]\n";
       return 2;
     }
     try {
-      run(argv[1]);
+      run(argv[1], argc == 3 ? argv[2] : "");
     } catch (const std::exception &error) {
       std::cerr << "FAIL: " << error.what() << '\n';
       return 1;

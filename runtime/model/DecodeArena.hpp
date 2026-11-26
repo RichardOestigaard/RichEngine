@@ -193,6 +193,10 @@ enum class DecodeTensor : uint32_t {
   MoeLatentRows,
   MoeLatentOutput,
   MoeZeroLatent,
+  // LiLiCorr's per-dispatch-lane scorer image and the per-state-lane
+  // context anchor row the next block consumes. Zero-sized elsewhere.
+  LiLiCorrScratch,
+  LiLiCorrAnchor,
   // One tensor per ops::kMoeScratchFields entry, in its order (moeScratchTensor).
   MoeScratch,
   MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,

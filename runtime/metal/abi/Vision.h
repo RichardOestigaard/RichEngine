@@ -53,6 +53,16 @@ struct VisionQkvParams {
 static_assert(sizeof(VisionQkvParams) == 12,
               "Vision QKV parameters are 12 bytes on both sides");
 
+struct NemotronVisionPrepareParams {
+  uint32_t grid_height;
+  uint32_t grid_width;
+  uint32_t tokens;
+  uint32_t registers;
+};
+
+static_assert(sizeof(NemotronVisionPrepareParams) == 16,
+              "Nemotron vision prepare parameters are 16 bytes on both sides");
+
 struct VisionAttentionParams {
   uint32_t tokens;
   uint32_t padded_tokens;

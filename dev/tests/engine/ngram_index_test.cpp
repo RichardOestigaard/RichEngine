@@ -47,6 +47,20 @@ void testLookupPicksLongestExtension() {
           "lookup should emit the better-extended followers");
 }
 
+// The optional extension cap bounds the backward scan without changing
+// the selected occurrence's followers.
+void testLookupHonoursExtensionCap() {
+  ngram::Table t =
+      table({9, 9, 9, 1, 2, 3, 40, 50, 9, 9, 9, 1, 2, 3});
+  std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS> out{};
+  uint32_t extension = 99;
+  const uint32_t found =
+      ngram::lookup(t, out.data(), &extension, /*extensionCap=*/1);
+  require(found >= 2 && out[0] == 40 && out[1] == 50,
+          "capped lookup should keep the occurrence's followers");
+  require(extension == 1, "capped lookup should report at most the cap");
+}
+
 // The stream's own tail is a key's newest start; it is not a candidate.
 void testLookupNeedsFourTokens() {
   ngram::Table t = table({1, 2, 3});
@@ -419,6 +433,7 @@ int main() {
   try {
     testLookupFollowsEarlierOccurrence();
     testLookupPicksLongestExtension();
+    testLookupHonoursExtensionCap();
     testLookupNeedsFourTokens();
     testAlternateSkipsChainToken();
     testAlternateExhausted();

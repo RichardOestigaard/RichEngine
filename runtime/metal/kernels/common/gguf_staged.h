@@ -15,8 +15,44 @@ inline half2 staged_linear(uint pair, float s, float m) {
   if constexpr (F::Zero) return half2(code * s);
   else return half2(fma(code, float2(s), float2(m)));
 }
+// IQ2_XXS group decode (dequant32_chunks' sink interface), bespoke: the grid magnitudes of kIQ2XXSGrid only ever
+// hold bytes 8, 25 and 43, so the group needs its three signed-magnitude products once — half(fl(s * m)) is the
+// element's own rounding, s * m commutative — and each element selects among them instead of converting and
+// multiplying. The generic chunk path decodes every 7-bit sign index twice (chunks 2c, 2c + 1 halve the same
+// index) and re-extracts scale bits per chunk; here the four indices and the four grid entries decode once.
+template <class Sink>
+inline void dequant32_iq2xxs(uint2 a, ushort meta, Sink sink) {
+  const QuantCoef k = FmtIQ2XXS::coef(meta, FmtIQ2XXS::chunk({a}, 0));
+  const float s = k.s.x;
+  const half h8 = half(s * 8.0f), h25 = half(s * 25.0f), h43 = half(s * 43.0f);
+  const uint64_t g0 = kIQ2XXSGrid[a.x & 0xFF], g1 = kIQ2XXSGrid[(a.x >> 8) & 0xFF],
+                 g2 = kIQ2XXSGrid[(a.x >> 16) & 0xFF], g3 = kIQ2XXSGrid[a.x >> 24];
+  const uint n0 = quant_signs7(a.y & 127), n1 = quant_signs7((a.y >> 7) & 127),
+             n2 = quant_signs7((a.y >> 14) & 127), n3 = quant_signs7((a.y >> 21) & 127);
+  // Chunk c: elements 4c..4c+3 of half c & 1 of grid entry c >> 1 (lo) and of entry 2 + (c >> 1) (hi), their sign
+  // bits at the same positions of the entries' sign bytes. 25 and 43 are the magnitudes with bit 0 set, 43 the one
+  // with bit 1.
+  const auto emit = [&](ushort c, uint64_t ga, uint64_t gb, uint na, uint nb) __attribute__((always_inline)) {
+    const uint h = 32u * (c & 1);
+    const uchar4 ma = as_type<uchar4>(uint(ga >> h)), mb = as_type<uchar4>(uint(gb >> h));
+    half4 lo = select(select(half4(h8), half4(h25), bool4(ma & uchar4(1))), half4(h43), bool4(ma & uchar4(2)));
+    half4 hi = select(select(half4(h8), half4(h25), bool4(mb & uchar4(1))), half4(h43), bool4(mb & uchar4(2)));
+    const uint sa = (na >> (4 * (c & 1))) & 0xF, sb = (nb >> (4 * (c & 1))) & 0xF;
+    lo = select(lo, -lo, bool4(sa & 1, sa & 2, sa & 4, sa & 8));
+    hi = select(hi, -hi, bool4(sb & 1, sb & 2, sb & 4, sb & 8));
+    sink(c, lo, hi);
+  };
+  emit(0, g0, g2, n0, n2);
+  emit(1, g0, g2, n0, n2);
+  emit(2, g1, g3, n1, n3);
+  emit(3, g1, g3, n1, n3);
+}
 template <class F, class Sink>
 inline void dequant32_chunks(typename F::Payload w, typename F::Meta meta, ushort j, threadgroup half2 *tl, Sink sink) {
+  if constexpr (F::Id == GGUF_FMT_IQ2XXS) {
+    dequant32_iq2xxs(w.a, meta, sink);
+    return;
+  }
   QuantCoef k;
   if constexpr (F::ScaleInChunk) k = F::coef(meta, F::chunk(w, 0)); else k = F::coef(meta, j);
 #pragma unroll

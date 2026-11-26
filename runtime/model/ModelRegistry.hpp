@@ -97,6 +97,8 @@ struct ModelFamilyRegistration {
   bool servesVisionTower = false;
   // The family serves the LFM3-VL tower from a GGUF mmproj.
   bool servesLfmVisionTower = false;
+  // The family serves the Nemotron Omni tower from a GGUF mmproj.
+  bool servesNemotronVisionTower = false;
   // The family serves the lfm3a audio encoder from the same shared mmproj.
   bool servesAudioTower = false;
   // The family serves the lfm3a_gen speech decoder (the a.gen.* sections

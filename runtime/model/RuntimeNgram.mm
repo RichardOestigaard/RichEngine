@@ -1,6 +1,27 @@
 #include "model/RuntimeImpl.hpp"
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <utility>
+
 namespace richengine::model {
+namespace {
+
+template <class F> struct ScopeExit final {
+  explicit ScopeExit(F action) : action(std::move(action)) {}
+  ~ScopeExit() { action(); }
+  ScopeExit(const ScopeExit &) = delete;
+  ScopeExit &operator=(const ScopeExit &) = delete;
+  F action;
+};
+
+template <class F> ScopeExit<F> scopeExit(F action) {
+  return ScopeExit<F>(std::move(action));
+}
+
+} // namespace
+
 
   // (Re)seeds a lane's n-gram state from its prompt at admission; emitted
   // tokens then append through commitSelected.
@@ -102,6 +123,26 @@ namespace richengine::model {
       ngram::push(ngram_.ngramCorpusDocs_, tokens, 64, 1u << 20, 0, session);
   }
 
+  // The chain length that can actually occupy verify rows. Draft
+  // checkpoints commonly train fewer proposals than the compiled fifteen;
+  // scoring fifteen retrieved tokens against a five-proposal neural draft
+  // otherwise overvalues every long exact match.
+  uint32_t Runtime::Impl::ngramScoringDepth(const Request &entry,
+                                            uint32_t found) const {
+    const uint32_t proposalCap =
+        modelPolicy().proposalCap.value_or(geometry.draft.proposalLimit());
+    const uint32_t budget =
+        adaptiveProposals_ && entry.constraint != ConstraintMode::TokenMask
+            ? std::clamp(entry.proposalBudget, std::min<uint32_t>(1, proposalCap),
+                         proposalCap)
+            : proposalCap;
+    const uint32_t remaining = entry.maxNewTokens > entry.generatedTokens
+                                   ? entry.maxNewTokens - entry.generatedTokens
+                                   : 0;
+    const uint32_t retention = remaining ? remaining - 1 : 0;
+    return std::min({found, budget, retention});
+  }
+
   // A lane's expected accepted tokens if its n-gram chain is used now:
   // no match contributes nothing; a lane still warming up or due a probe
   // is scored at the draft's own measured rate so the mixer's tie-break
@@ -118,6 +159,55 @@ namespace richengine::model {
     return entry.ngramAcceptedAvg;
   }
 
+  uint32_t Runtime::Impl::draftCandidateStride() const {
+    return std::holds_alternative<DSparkDraft>(draftModel)
+               ? RICHENGINE_DSPARK_POOL
+               : RICHENGINE_DRAFT_CANDIDATES;
+  }
+
+  std::span<const uint32_t> Runtime::Impl::draftCandidateRow(
+      uint32_t lane, uint32_t width) const {
+    if (!width || lane >= width)
+      return {};
+    const bool dspark = std::holds_alternative<DSparkDraft>(draftModel);
+    const DecodeTensor tensor =
+        dspark ? DecodeTensor::TopPartialIds : DecodeTensor::Candidates;
+    const MetalBuffer packedBuffer = decodeArena->packed(tensor, width);
+    if (!packedBuffer)
+      return {};
+    const uint32_t stride = draftCandidateStride();
+    const size_t perLane =
+        size_t{RICHENGINE_DRAFT_PROPOSAL_TOKENS} * stride;
+    if (packedBuffer.sizeBytes() < uint64_t{width} * perLane * sizeof(uint32_t))
+      return {};
+    const uint32_t *base = contents<uint32_t>(packedBuffer, "draft candidates");
+    return {base + size_t{lane} * perLane, perLane};
+  }
+
+  bool Runtime::Impl::ngramSkipsGpuPredraft(
+      std::span<Request *const> entries, uint32_t width) const {
+    if (!ngram_.skipGpuPredraft_ || !width)
+      return false;
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      const Request &entry = *entries[lane];
+      // Suppressing the overlapped draft is not free exploration: when the
+      // later displacement gate declines, the lane pays a synchronous draft
+      // in the decode command. Require measured proposer evidence first;
+      // corpus chains may qualify through their match-length prior.
+      const bool unproven =
+          entry.ngramRounds + entry.lookupRounds + entry.corpusRounds <
+          ngram_.ngramWarmup_;
+      if (unproven &&
+          ngram_.chainSources_[lane] != NgramPredraft::ChainSource::Corpus)
+        return false;
+      if (ngram_.chainSources_[lane] == NgramPredraft::ChainSource::None ||
+          ngram_.chainLengths_[lane] < ngram_.skipMinChain_ ||
+          ngram_.chainScores_[lane] + 1e-9 < entry.proposalAcceptedAvg)
+        return false;
+    }
+    return true;
+  }
+
   // The learning-free predraft: each lane's chain comes from the followers
   // of its closing 3-gram's last earlier occurrence; a lane without a match
   // repeats its anchor (a wrong guess only wastes its verify rows). The
@@ -125,7 +215,15 @@ namespace richengine::model {
   // GPU draft would have accepted — mixed-quality lanes no longer veto.
   // Greedy lanes only: injected proposals carry no probabilities.
   bool Runtime::Impl::applyNgramPredraft(std::span<Request *const> entries,
-                          uint32_t width, bool emitTree) {
+                          uint32_t width, bool emitTree, bool mixOnly) {
+    const auto hostStart = std::chrono::steady_clock::now();
+    const auto hostTimer = scopeExit([&] {
+      counters.ngramHostMicroseconds +=
+          static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - hostStart)
+                                    .count());
+      ++counters.ngramHostEvaluations;
+    });
     // A NullDraft model (Granite) has no GPU draft: the n-gram predraft is
     // its only proposer, so the gates below do not veto it.
     const bool nullDraft = std::holds_alternative<NullDraft>(draftModel);
@@ -135,6 +233,8 @@ namespace richengine::model {
     ngram_.predraftedTreeNodes_ = RICHENGINE_TREE_VERIFY_NODES;
     ngram_.mixMask_ = 0;
     ngram_.mixCorpusMask_ = 0;
+    ngram_.suppressMask_ = 0;
+    ngram_.resetEvaluation();
     std::array<std::array<uint32_t, RICHENGINE_DRAFT_PROPOSAL_TOKENS>, kLaneCount>
         proposals{};
     std::array<uint32_t, kLaneCount> foundCounts{};
@@ -149,6 +249,57 @@ namespace richengine::model {
     // mixing scores, the total displacement actually has to beat.
     double mixExpect = 0;
     bool sampledLane = false;
+    const auto acceptanceSum = [&](const Request &entry, uint32_t matchLength,
+                                   uint32_t chainLength) {
+      double survival = 1.0;
+      double total = 0;
+      for (uint32_t depth = 0; depth < chainLength; ++depth) {
+        survival *= ngram_.lookupAcceptance_.rate(
+            samplingEnabled(entry), matchLength, depth,
+            LookupAgreement::Unknown);
+        total += survival;
+      }
+      return total;
+    };
+    // O6: blend the lane's residual EWMA with this step's match-depth prior.
+    // scoreBlend is the prior's weight; 0.5 halves stale-EWMA domination.
+    const auto blendLaneScore = [&](const Request &entry, double base,
+                                    uint32_t matchLength,
+                                    uint32_t chainLength) {
+      if (!ngram_.stepScore_ || !chainLength)
+        return base;
+      // The prior is a cumulative-survival sum: rate() is conditional on
+      // the parent surviving, so depth d contributes only after every
+      // earlier conditional acceptance. Summing the conditionals would
+      // overestimate deep chains.
+      double survival = 1.0;
+      double prior = 0.0;
+      for (uint32_t depth = 0; depth < chainLength; ++depth) {
+        survival *= ngram_.lookupAcceptance_.rate(
+            samplingEnabled(entry), matchLength, depth,
+            LookupAgreement::Unknown);
+        prior += survival;
+      }
+      if (base <= 0)
+        return prior;
+      const double blend = std::clamp(ngram_.scoreBlend_, 0.0, 1.0);
+      return (1.0 - blend) * base + blend * prior;
+    };
+    const auto pseudoConfidence = [&](uint32_t lane, uint32_t depth) {
+      const uint32_t matchLength = std::max<uint32_t>(ngram_.chainPatterns_[lane], 3);
+      double acceptance = ngram_.lookupAcceptance_.rate(
+          false, matchLength, depth, LookupAgreement::Unknown);
+      acceptance = std::clamp(acceptance, 1e-5, 1.0 - 1e-5);
+      const VerifyBudget::Acceptance &fit = verifyBudget_.acceptance();
+      const double slope = fit.slope == 0.0F ? 1.0 : fit.slope;
+      const double logitAcceptance =
+          std::log(acceptance / (1.0 - acceptance));
+      const double z = (logitAcceptance - fit.intercepts[depth]) / slope;
+      const double confidence = 1.0 / (1.0 + std::exp(-z));
+      if (!std::isfinite(confidence))
+        return 0.0F;
+      return static_cast<float>(std::clamp(confidence, 0.0, 1.0));
+    };
     for (uint32_t lane = 0; lane < width; ++lane) {
       Request &entry = *entries[lane];
       // Sampled lanes cannot consume probability-free proposals; a Null
@@ -162,9 +313,41 @@ namespace richengine::model {
         mixExpect += entry.proposalAcceptedAvg;
         continue;
       }
+      // NullDraft self-suppression: a lane that finished its warmup with a
+      // dead proposer — acceptance EWMA under kNgramSuppressAcceptance —
+      // verifies its anchor alone instead of burning rows on proposals
+      // that never land. The probe cadence still owes it one measurement
+      // round each kNgramProbeTokens (generatedTokens >= ngramProbeAt),
+      // bounding the worst-case waste to one round in 256 tokens; a probe
+      // that lands lifts the EWMA back over the bar and the lane proposes
+      // continuously again.
+      // Rounds and acceptance count both proposers: a lookup-displaced
+      // round never increments ngramRounds, so the 3-gram's own counters
+      // alone would leave a fully displaced lane warming up — and
+      // proposing — forever. Either source landing keeps the lane alive.
+      const uint32_t proposingRounds =
+          entry.ngramRounds + entry.lookupRounds;
+      const double bestAccepted =
+          std::max(entry.ngramAcceptedAvg, entry.lookupAcceptedAvg);
+      if (nullDraft && proposingRounds >= ngram_.ngramWarmup_ &&
+          entry.generatedTokens < entry.ngramProbeAt &&
+          bestAccepted < NgramPredraft::kNgramSuppressAcceptance) {
+        ngram_.suppressMask_ |= uint32_t{1} << lane;
+        entry.lookupSourced = false;
+        if (ngramDebug_)
+          fprintf(stderr, "ngram-predraft lane=%u suppressed ewma=%.3f\n",
+                  lane, bestAccepted);
+        continue;
+      }
+      ++counters.ngramEvaluations;
       uint32_t extension = 0;
       uint32_t found =
-          ngram::lookup(entry.ngram, proposals[lane].data(), &extension);
+          ngram::lookup(entry.ngram, proposals[lane].data(), &extension,
+                        tuning().ngramExtensionCap);
+      if (found) {
+        ngram_.chainSources_[lane] = NgramPredraft::ChainSource::Self;
+        ngram_.chainPatterns_[lane] = 3 + extension;
+      }
       // The cross-request corpus offers its own continuation; it displaces
       // the lane's match only past the preference margin — the corpus
       // pattern (3 + its backward extension against the lane) must be that
@@ -228,6 +411,8 @@ namespace richengine::model {
           found = corpusFound;
           corpusLanes[lane] = true;
           corpusPatterns[lane] = corpusPattern;
+          ngram_.chainSources_[lane] = NgramPredraft::ChainSource::Corpus;
+          ngram_.chainPatterns_[lane] = corpusPattern;
           if (ngramDebug_)
             fprintf(stderr, "  corpus-displaced lane=%u cfound=%u cext=%u\n",
                     lane, corpusFound, corpusExtension);
@@ -251,22 +436,29 @@ namespace richengine::model {
         const std::span<const uint32_t> lookupTokens =
             entry.lookup.proposals(RICHENGINE_DRAFT_PROPOSAL_TOKENS);
         if (!lookupTokens.empty()) {
-          if (entry.lookupRounds >= ngram_.ngramWarmup_) {
-            lookupLaneScore = entry.lookupAcceptedAvg;
-          } else {
-            for (uint32_t d = 0; d < lookupTokens.size(); ++d)
-              lookupLaneScore += ngram_.lookupAcceptance_.rate(
-                  samplingEnabled(entry), lookupMatch.length, d,
-                  LookupAgreement::Unknown);
-          }
-          if (lookupLaneScore >
-              ngramLaneScore(entry, found != 0, !nullDraft)) {
+          const uint32_t lookupDepth = ngramScoringDepth(
+              entry, static_cast<uint32_t>(lookupTokens.size()));
+          const double lookupBase =
+              entry.lookupRounds >= ngram_.ngramWarmup_
+                  ? entry.lookupAcceptedAvg
+                  : acceptanceSum(entry, lookupMatch.length, lookupDepth);
+          lookupLaneScore = blendLaneScore(
+              entry, lookupBase, lookupMatch.length, lookupDepth);
+          double selfCompare =
+              ngramLaneScore(entry, found != 0, !nullDraft);
+          if (ngram_.chainSources_[lane] == NgramPredraft::ChainSource::Self)
+            selfCompare = blendLaneScore(
+                entry, selfCompare, ngram_.chainPatterns_[lane],
+                ngramScoringDepth(entry, found));
+          if (lookupLaneScore > selfCompare) {
             found = static_cast<uint32_t>(lookupTokens.size());
             std::copy(lookupTokens.begin(), lookupTokens.end(),
                       proposals[lane].begin());
             entry.lookupSourced = true;
             entry.lookupMatchLength = lookupMatch.length;
             entry.lookupChainLength = found;
+            ngram_.chainSources_[lane] = NgramPredraft::ChainSource::Lookup;
+            ngram_.chainPatterns_[lane] = lookupMatch.length;
             std::copy(lookupTokens.begin(), lookupTokens.end(),
                       entry.lookupChain.begin());
             if (ngramDebug_)
@@ -277,6 +469,18 @@ namespace richengine::model {
         }
       }
       foundCounts[lane] = found;
+      ngram_.chainLengths_[lane] = found;
+      counters.ngramChainTokens += found;
+      if (found < 16)
+        ++counters.ngramChainLengthsExact[found];
+      if (!found)
+        ++counters.ngramChainLength0;
+      else if (found < 4)
+        ++counters.ngramChainLength1To3;
+      else if (found < 8)
+        ++counters.ngramChainLength4To7;
+      else
+        ++counters.ngramChainLength8To15;
       if (found) {
         // Repeat the last real candidate: a duplicate only loses its row.
         for (uint32_t j = found; j < RICHENGINE_DRAFT_PROPOSAL_TOKENS; ++j)
@@ -288,14 +492,35 @@ namespace richengine::model {
       double nScore = entry.lookupSourced
                           ? lookupLaneScore
                           : ngramLaneScore(entry, found != 0, !nullDraft);
+      if (!entry.lookupSourced &&
+          ngram_.chainSources_[lane] == NgramPredraft::ChainSource::Self)
+        nScore = blendLaneScore(entry, nScore, ngram_.chainPatterns_[lane],
+                                ngramScoringDepth(entry, found));
       // A corpus-displaced chain carries its own evidence — the pattern
       // length that won the margin is a direct measurement, not an EWMA
       // estimate — so it scores itself instead of waiting on a prior the
       // draft-blind content could never clear.
-      if (corpusLanes[lane])
-        nScore = std::max(
-            nScore, std::min<double>(corpusPatterns[lane],
-                                     RICHENGINE_DRAFT_PROPOSAL_TOKENS));
+      if (corpusLanes[lane]) {
+        if (ngram_.stepScore_) {
+          // O6 prices corpus chains by the same conditional-survival
+          // evidence as lookup chains. The legacy pattern-length score is
+          // nearly always fifteen for a long hit, so it displaces a strong
+          // neural draft even when only the first few continuations are
+          // likely. A trained corpus lane blends its own measured residual.
+          const uint32_t corpusDepth = ngramScoringDepth(entry, found);
+          const double corpusBase =
+              entry.corpusRounds
+                  ? entry.corpusAcceptedAvg
+                  : acceptanceSum(entry, corpusPatterns[lane], corpusDepth);
+          nScore = blendLaneScore(entry, corpusBase, corpusPatterns[lane],
+                                  corpusDepth);
+        } else {
+          nScore = std::max(
+              nScore, std::min<double>(corpusPatterns[lane],
+                                       RICHENGINE_DRAFT_PROPOSAL_TOKENS));
+        }
+      }
+      ngram_.chainScores_[lane] = nScore;
       const double dScore = entry.proposalAcceptedAvg;
       // Unproven lanes (warmup or probe-due) score at parity so they can
       // mix — free exploration inside a drafted batch — but contribute
@@ -311,8 +536,11 @@ namespace richengine::model {
       // Mix arm: the n-gram at least matches what the draft would score on
       // this lane — parity is the warmup prior, so ties explore; a batch
       // that stays drafted gets applyNgramMix's row swap for free.
+      const bool corpusOnlyBlocked =
+          ngram_.mixCorpusOnly_ &&
+          ngram_.chainSources_[lane] != NgramPredraft::ChainSource::Corpus;
       if (!nullDraft && ngram_.ngramMix_ && nScore >= dScore &&
-          entry.constraint != ConstraintMode::TokenMask) {
+          !corpusOnlyBlocked && entry.constraint != ConstraintMode::TokenMask) {
         ngram_.mixMask_ |= uint32_t{1} << lane;
         if (corpusLanes[lane])
           ngram_.mixCorpusMask_ |= uint32_t{1} << lane;
@@ -320,11 +548,23 @@ namespace richengine::model {
                         lane * RICHENGINE_DRAFT_PROPOSAL_TOKENS,
                     proposals[lane].data(),
                     RICHENGINE_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t));
+        if (ngram_.pseudoConf_) {
+          float *confidence =
+              static_cast<float *>(ngramMixConfidence().contents()) +
+              lane * RICHENGINE_DRAFT_PROPOSAL_TOKENS;
+          std::fill_n(confidence, RICHENGINE_DRAFT_PROPOSAL_TOKENS, 0.0F);
+          for (uint32_t depth = 0; depth < found; ++depth)
+            confidence[depth] = pseudoConfidence(lane, depth);
+        }
       }
       if (ngramDebug_)
         fprintf(stderr, "ngram-predraft lane=%u match=%u score=%.2f\n", lane,
                 found, nScore);
     }
+    // A GPU-predraft adoption only asks for per-lane mixing: no host writes
+    // to the shared proposal rows may happen while that forward is active.
+    if (mixOnly)
+      return false;
     // All-ngram clears the mixed total discounted by ρ: skipping the draft
     // forward refunds its cost share, so a sum modestly under Σ max can
     // still be the cheaper step. With mixing off the bar is the draft's.
@@ -342,8 +582,18 @@ namespace richengine::model {
         hot |= entries[lane]->ngramAcceptedAvg >= ngram_.ngramTreeMin_;
       if (!hot)
         emitTree = false;
+      // A comb sizes its verify batch-wide; a suppressed lane's rows can
+      // only shrink inside the chain path, so a batch carrying one falls
+      // back to it.
+      if (ngram_.suppressMask_)
+        emitTree = false;
     }
     for (uint32_t lane = 0; lane < width; ++lane) {
+      // Suppressed lanes write nothing and owe no measurement: their rows
+      // are dead by the decode path's zeroed proposal count, and a round
+      // they never offered must not train the EWMA.
+      if (ngram_.suppressMask_ & (uint32_t{1} << lane))
+        continue;
       std::memcpy(contents<uint32_t>(
                       decodeArena->get(lane, DecodeTensor::ProposedTokens),
                       "ngram proposals"),
@@ -353,6 +603,7 @@ namespace richengine::model {
       entries[lane]->corpusInFlight = corpusLanes[lane];
       entries[lane]->lookupInFlight = entries[lane]->lookupSourced;
     }
+    ++counters.ngramPredraftedBatches;
     if (!emitTree)
       return true;
     uint32_t liveNodes = RICHENGINE_TARGET_VERIFY_ROWS;
@@ -401,9 +652,28 @@ namespace richengine::model {
           {lane, 2 * RICHENGINE_DRAFT_PROPOSAL_TOKENS, 0}, 1,
           2 * RICHENGINE_DRAFT_PROPOSAL_TOKENS);
       entries[lane]->ngramInFlight = true;
+      entries[lane]->ngramMixedInFlight = true;
+      const NgramPredraft::ChainSource source = ngram_.chainSources_[lane];
       entries[lane]->corpusInFlight =
-          (ngram_.mixCorpusMask_ & (uint32_t{1} << lane)) != 0;
-      entries[lane]->lookupInFlight = entries[lane]->lookupSourced;
+          source == NgramPredraft::ChainSource::Corpus;
+      entries[lane]->lookupInFlight =
+          source == NgramPredraft::ChainSource::Lookup;
+      ++counters.ngramMixedLanes;
+      if (source == NgramPredraft::ChainSource::Self)
+        ++counters.ngramMixedSelfLanes;
+      else if (source == NgramPredraft::ChainSource::Lookup)
+        ++counters.ngramMixedLookupLanes;
+      else if (source == NgramPredraft::ChainSource::Corpus)
+        ++counters.ngramMixedCorpusLanes;
+      if (ngram_.pseudoConf_) {
+        const MetalBuffer confidence =
+            decodeArena->packed(DecodeTensor::VerifyConfidence, width);
+        ops::RowCopy::add(
+            graph, ngramMixConfidence(),
+            {lane, 2 * RICHENGINE_DRAFT_PROPOSAL_TOKENS, 0}, confidence,
+            {lane, 2 * RICHENGINE_DRAFT_PROPOSAL_TOKENS, 0}, 1,
+            2 * RICHENGINE_DRAFT_PROPOSAL_TOKENS);
+      }
       if (ngramDebug_)
         fprintf(stderr, "ngram-mix lane=%u\n", lane);
     }

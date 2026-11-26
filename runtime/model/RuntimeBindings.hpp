@@ -116,9 +116,12 @@ inline   StateAdmission Runtime::Impl::activate(const ModelRequest &request, uin
                     if constexpr (std::is_same_v<W, QwenVisionWeights>)
                       return ops::Vision::scratchBytes(weights.tensors.layout,
                                                        encodePatches);
-                    else
+                    else if constexpr (std::is_same_v<W, LfmVisionWeights>)
                       return ops::LfmVision::scratchBytes(weights.tensors.layout,
                                                           encodePatches);
+                    else
+                      return ops::NemotronVision::scratchBytes(weights.tensors.layout,
+                                                               encodePatches);
                   },
                   package.vision)
             : 0;
@@ -132,8 +135,11 @@ inline   StateAdmission Runtime::Impl::activate(const ModelRequest &request, uin
               if constexpr (std::is_same_v<W, QwenVisionWeights>)
                 return std::make_shared<ops::Vision>(
                     backend, weights.tensors, encodePatches);
-              else
+              else if constexpr (std::is_same_v<W, LfmVisionWeights>)
                 return std::make_shared<ops::LfmVision>(
+                    backend, weights.tensors, encodePatches);
+              else
+                return std::make_shared<ops::NemotronVision>(
                     backend, weights.tensors, encodePatches);
             },
             package.vision);

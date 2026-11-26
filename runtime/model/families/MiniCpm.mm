@@ -80,6 +80,9 @@ ModelDescriptor denseDescriptor(std::string name) {
   ModelDescriptor descriptor = makeModelDescriptor(
       std::move(name), denseTargetLayout(), denseDraftLayout(), vision);
   descriptor.visionSource = VisionSource::None;
+  descriptor.tuning.ngramGpuMix = true;
+  descriptor.tuning.ngramGpuMixMinWidth = 2;
+  descriptor.tuning.ngramMixCorpusOnly = true;
   return descriptor;
 }
 

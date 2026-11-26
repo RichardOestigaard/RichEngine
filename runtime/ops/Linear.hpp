@@ -56,7 +56,11 @@ void requireAffineProjection(const Projection &projection, LinearMatrix matrix);
 void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what, uint32_t planeInputs = 0);
 
 enum class LinearPhase : uint8_t { Prefill, Decode };
-enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
+// ReluSquared is the ungated relu(x)^2 activation of nemotron's dense shared
+// expert, folded into the up projection's output store (gguf_tile.h's
+// EpReluSquared, bitwise the bf16-rounded sum's activation). The GGUF tiles
+// alone instantiate it.
+enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate, ReluSquared };
 // Compute tiles over the StorageN=256 packing. Paired tiles pipeline two
 // quant groups of one lane. Split128 is the N128 tile with K split across
 // `splits` threadgroups, grid (column tiles, splits), every lane's rows in each
@@ -382,6 +386,13 @@ public:
                                    metal::MetalBuffer output, metal::MetalBuffer sums,
                                    uint32_t rows, LinearScratch scratch, PreparedInput prepared = {},
                                    bool canvas = false) const;
+  // The up projection of nemotron's dense shared expert: the relu² activation
+  // folds into the output store, sparing the elementwise pass. GGUF tiles only.
+  PreparedInput addPrefillReluSquared(metal::CommandGraph &graph, metal::MetalBuffer input,
+                                      const Projection &projection, metal::MetalBuffer output,
+                                      metal::MetalBuffer sums, uint32_t rows,
+                                      LinearScratch scratch, PreparedInput prepared = {},
+                                      bool canvas = false) const;
   // output = residual + down(silu(gate x) * up x) of `rows` normalized rows,
   // whose Q4 sums the norm wrote.
   void addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &buffers,

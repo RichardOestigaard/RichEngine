@@ -18,6 +18,17 @@ struct DraftSelectorWorkspace final {
   uint64_t proposalProbabilitiesBytes = 0;
 };
 
+// Extra operands only LiLiCorr's scorer consumes. `anchors` is indexed by
+// dispatch lane but each entry is the lane's persistent state-lane anchor
+// row. `scratch` is the packed lanes' LILICORR_SCRATCH_STRIDE image.
+struct DraftLiLiCorrBuffers final {
+  metal::MetalBuffer finalHidden;
+  metal::MetalBuffer tokenEmbedding;
+  uint32_t tokenEmbeddingFormat = 0;
+  metal::MetalBuffer scratch;
+  std::array<metal::MetalBuffer, RICHENGINE_MAXIMUM_BATCH_WIDTH> anchors{};
+};
+
 struct DraftSelectorBuffers final {
   // fp32 [rows][vocabulary].
   metal::MetalBuffer logits;
@@ -47,6 +58,8 @@ struct DraftSelectorBuffers final {
   // (whose anchor the encode cannot know) selects correctly; the host paths
   // write the same token there.
   metal::MetalBuffer draftInput;
+  // Non-null only for LiLiCorr; the other draft kinds ignore it.
+  const DraftLiLiCorrBuffers *lilicorr = nullptr;
 };
 
 // What a decode cycle's verify rows follow (DraftSelector::addVerifyRows,
@@ -122,7 +135,8 @@ public:
                 std::span<const uint32_t> anchors,
                 std::span<const SamplingPolicy> policies,
                 uint32_t queryRows =
-                    RICHENGINE_DRAFT_QUERY_ROWS) const;
+                    RICHENGINE_DRAFT_QUERY_ROWS,
+                uint32_t rowOffset = 0) const;
   // The same plain selection ending in draft_select_plain_tree: treeMask
   // lanes additionally write each position's rank-1 candidate as a sibling
   // leaf of the verify comb.
@@ -132,7 +146,8 @@ public:
                     std::span<const SamplingPolicy> policies,
                     uint32_t treeMask,
                     uint32_t queryRows =
-                        RICHENGINE_DRAFT_QUERY_ROWS) const;
+                        RICHENGINE_DRAFT_QUERY_ROWS,
+                    uint32_t rowOffset = 0) const;
   // The DSpark draft's selection (dspark_select_top16_sharded +
   // draft_select_dspark_markov): like the plain path, but position p reads
   // logits row p + rowOffset (0 on anchor-first drafts, whose anchor row

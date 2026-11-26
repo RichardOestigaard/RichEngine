@@ -70,6 +70,7 @@ public:
   void end(uint64_t requestId) override;
 
   [[nodiscard]] WarmupStepResult warmupPrefill(uint32_t rows) override;
+  [[nodiscard]] uint32_t maximumPrefillWarmupRows() const noexcept override;
   [[nodiscard]] WarmupStepResult
   warmupDecodeBatch(uint32_t width) override;
   [[nodiscard]] WarmupStepResult

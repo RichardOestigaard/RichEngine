@@ -123,7 +123,23 @@ class RealServer:
             stdout=self.log,
             stderr=subprocess.STDOUT,
             text=True,
+            # Its native child must join one group: a failed startup otherwise
+            # leaves the model-resident engine alive after the Python parent exits.
+            start_new_session=True,
         )
+
+    def native_pids(self) -> list[int]:
+        """Direct native-engine children of this server process."""
+        try:
+            out = subprocess.run(
+                ["pgrep", "-P", str(self.process.pid)],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if out.returncode != 0:
+            return []
+        return [int(line) for line in out.stdout.split() if line.isdigit()]
 
     def tail(self) -> str:
         self.log.flush()
@@ -145,13 +161,26 @@ class RealServer:
         raise SmokeFailure(f"server did not become ready\n{self.tail()}")
 
     def close(self) -> None:
+        # Terminate the whole session group. server.py normally stops its
+        # native child itself, but bootstrap failures can orphan that child
+        # with multi-GiB weights still resident.
+        if hasattr(os, "killpg"):
+            try:
+                os.killpg(self.process.pid, 15)
+            except (ProcessLookupError, PermissionError):
+                pass
         if self.process.poll() is None:
             self.process.terminate()
+        try:
+            self.process.wait(10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(10)
+        if hasattr(os, "killpg"):
             try:
-                self.process.wait(30)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(10)
+                os.killpg(self.process.pid, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
         self.log.close()
 
 

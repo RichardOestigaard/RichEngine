@@ -83,9 +83,25 @@ struct ModelTuning final {
   std::optional<uint32_t> proposalCap;    // RICHENGINE_PROPOSAL_CAP
   std::optional<bool> icbOff;             // RICHENGINE_ICB_OFF
   std::optional<bool> chainPredraft;      // RICHENGINE_CHAIN_PREDRAFT
+  // N-gram acceleration of an adopted GPU predraft. Width gating keeps
+  // mixing off the latency-critical single-lane path and enables it for
+  // concurrent batches, where cross-request exact reuse is strongest.
+  std::optional<bool> ngramGpuMix;        // RICHENGINE_NGRAM_GPU_MIX
+  std::optional<uint32_t> ngramGpuMixMinWidth; // RICHENGINE_NGRAM_GPU_MIX_MIN_WIDTH
+  // Restrict per-lane replacement to exact cross-request corpus chains.
+  std::optional<bool> ngramMixCorpusOnly; // RICHENGINE_NGRAM_MIX_CORPUS_ONLY
+  // Score exact-copy chains by their agreement with the GPU draft candidates.
+  std::optional<bool> ngramDraftAgreement; // RICHENGINE_NGRAM_DRAFT_AGREEMENT
+  std::optional<bool> ngramStepScore;     // RICHENGINE_NGRAM_STEP_SCORE
+  std::optional<bool> ngramChainClip;     // RICHENGINE_NGRAM_CHAIN_CLIP
+  std::optional<bool> ngramBudgetIsolation; // RICHENGINE_NGRAM_BUDGET_ISOLATION
+  std::optional<bool> ngramPseudoConf;    // RICHENGINE_NGRAM_PSEUDO_CONF
+  std::optional<bool> ngramSkipGpuPredraft; // RICHENGINE_NGRAM_SKIP_GPU_PREDRAFT
   // A DSpark draft's confidence-prune threshold (draft_conf_score +
   // VerifyRowsParams's conf_min); unset leaves it off.
   std::optional<double> draftConfMin;     // RICHENGINE_DRAFT_CONF_MIN
+  // LiLiCorr's lattice-walk confidence floor; unset leaves it off.
+  std::optional<double> lilicorrPmin;     // RICHENGINE_LILICORR_PMIN
   // The canvas bundle the family's diffusion model runs under
   // ("paper"|"balanced"|"fast"); RICHENGINE_CANVAS_PROFILE overrides.
   std::optional<std::string> canvasProfile;

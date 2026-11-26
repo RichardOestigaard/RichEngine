@@ -158,6 +158,63 @@ PreparedInput Mamba2::addDecode(metal::CommandGraph &graph,
           lane < lanes ? tapeLanes->rows[lane] : 0;
     }
   }
+  if (shape.core == Mamba2Core::Bolt128) {
+    if (!buffers.decayValues ||
+        buffers.decayValues.sizeBytes() <
+            uint64_t{lanes} * verifyStride * shape.heads * sizeof(float))
+      throw std::invalid_argument("Mamba2 decay values are below the width");
+    // Bolt's fused scan keeps only groups x lanes threadgroups in flight and
+    // walks each group's 1024 (head, dim) rows in one threadgroup. Split the
+    // row-independent recurrence into sixteen-row tiles instead: prepare and
+    // gate keep their group grids, while the scan dispatches 64 tiles per
+    // group. Lightning keeps the fused kernels below bit for bit.
+    constexpr uint32_t scanRowsPerThreadgroup = 16;
+    const metal::MetalBuffer tapeBinding =
+        folded ? buffers.tape : buffers.hidden;
+
+    std::vector<metal::MetalBuffer> prepareBindings{buffers.packed,
+                                                    buffers.convolutionWeights};
+    appendLaneBindings(prepareBindings, buffers.currentStates,
+                       buffers.nextStates);
+    prepareBindings.insert(prepareBindings.end(),
+                           {buffers.mixed, buffers.aWeights, buffers.timeBias,
+                            buffers.stepSizes, buffers.decayValues,
+                            buffers.skipWeights, tapeBinding,
+                            buffers.convolutionBias});
+    graph.addParamsAt(mamba2Base(kVerifyMamba2Prepare, shape.core),
+                      std::move(prepareBindings), params, 16,
+                      {shape.groups, lanes, 1});
+
+    std::vector<metal::MetalBuffer> scanBindings;
+    scanBindings.reserve(15);
+    appendLaneBindings(scanBindings, buffers.currentStates,
+                       buffers.nextStates);
+    scanBindings.insert(scanBindings.end(),
+                        {buffers.mixed, buffers.aWeights, buffers.stepSizes,
+                         buffers.decayValues, buffers.skipWeights,
+                         buffers.hidden, tapeBinding});
+    graph.addParamsAt(mamba2Base(kVerifyMamba2Scan, shape.core),
+                      std::move(scanBindings), params, 14,
+                      {shape.groupWidth() / scanRowsPerThreadgroup, lanes,
+                       shape.groups});
+
+    std::vector<metal::MetalBuffer> gateBindings{
+        buffers.packed, buffers.mixerNorm.buffer, buffers.hidden};
+    if (prepare)
+      gateBindings.insert(gateBindings.end(),
+                          {buffers.linearScratch.input,
+                           buffers.linearScratch.sums});
+    const std::string gateName =
+        mamba2Base(kVerifyMamba2Gate, shape.core) + tableSuffix(input);
+    graph.addParamsAt(
+        mamba2Kernel(gateName, buffers.mixerNorm, shape.innerSize),
+        std::move(gateBindings), params, prepare ? 5u : 3u,
+        {shape.groups, lanes, 1});
+    if (!prepare)
+      return {};
+    return {buffers.hidden, input};
+  }
+
   const std::string name =
       mamba2Base(kVerifyMamba2Fused, shape.core) + tableSuffix(input);
   const std::string kernel_name =

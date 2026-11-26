@@ -288,6 +288,44 @@ std::string runtimeStatusJson(
       << ",\"weak_matches\":" << executorTelemetry.corpusWeakMatches
       << ",\"dropped_starts\":" << executorTelemetry.corpusDroppedStarts
       << "}"
+      << ",\"ngram\":{\"gpu_predrafts_armed\":"
+      << executorTelemetry.gpuPredraftsArmed
+      << ",\"gpu_predrafts_adopted\":"
+      << executorTelemetry.gpuPredraftsAdopted
+      << ",\"gpu_predrafts_rejected\":"
+      << executorTelemetry.gpuPredraftsRejected
+      << ",\"gpu_predrafts_suppressed\":"
+      << executorTelemetry.gpuPredraftsSuppressed
+      << ",\"evaluations\":" << executorTelemetry.ngramEvaluations
+      << ",\"skipped_gpu_predraft\":"
+      << executorTelemetry.ngramSkippedGpuPredraft
+      << ",\"predrafted_batches\":"
+      << executorTelemetry.ngramPredraftedBatches
+      << ",\"mixed_lanes\":" << executorTelemetry.ngramMixedLanes
+      << ",\"mixed_self_lanes\":" << executorTelemetry.ngramMixedSelfLanes
+      << ",\"mixed_lookup_lanes\":" << executorTelemetry.ngramMixedLookupLanes
+      << ",\"mixed_corpus_lanes\":" << executorTelemetry.ngramMixedCorpusLanes
+      << ",\"chain_tokens\":" << executorTelemetry.ngramChainTokens
+      << ",\"verify_rows_clipped\":"
+      << executorTelemetry.ngramVerifyRowsClipped
+      << ",\"verify_rows_total\":"
+      << executorTelemetry.verifyRowsTotal
+      << ",\"verify_row_lanes\":"
+      << executorTelemetry.verifyRowLanes
+      << ",\"host_microseconds\":"
+      << executorTelemetry.ngramHostMicroseconds
+      << ",\"host_evaluations\":"
+      << executorTelemetry.ngramHostEvaluations
+      << ",\"chain_length_buckets\":{\"0\":"
+      << executorTelemetry.ngramChainLength0
+      << ",\"1_3\":" << executorTelemetry.ngramChainLength1To3
+      << ",\"4_7\":" << executorTelemetry.ngramChainLength4To7
+      << ",\"8_15\":" << executorTelemetry.ngramChainLength8To15
+      << "},\"chain_lengths_exact\":["
+      << executorTelemetry.ngramChainLengthsExact[0];
+  for (uint32_t i = 1; i < 16; ++i)
+    out << "," << executorTelemetry.ngramChainLengthsExact[i];
+  out << "]}"
       << ",\"scheduler\":{\"queued\":" << scheduler.queued
       << ",\"waiting_resources\":" << scheduler.waitingResources
       << ",\"waiting_prefix\":" << scheduler.waitingPrefix

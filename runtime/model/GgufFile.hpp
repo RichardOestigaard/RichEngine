@@ -28,7 +28,7 @@ public:
 // The ggml type ids production names, as stored in GGUF tensor infos; the
 // rest are looked up in kGgmlTypes.
 namespace ggml {
-inline constexpr uint32_t kF32 = 0, kBF16 = 30, kPQ2_0 = 142;
+inline constexpr uint32_t kF32 = 0, kF16 = 1, kI32 = 26, kBF16 = 30, kPQ2_0 = 142;
 // Not a ggml type: the private id marking a descriptor-prefixed section whose
 // planes are StorageN-packed affine q4 tiles, so an oQ image can hold a
 // projection the Affine64 kernels read (model/OqWrite.cpp).
@@ -44,7 +44,7 @@ struct GgmlTypeTraits {
 // (id, name, block elements, block bytes) of the ggml types this parser can
 // size, as ggml-common.h defines them and, for 142, PrismML-Eng/llama.cpp's
 // block_pq2_0; a tensor of another type is rejected.
-inline constexpr std::array<std::pair<uint32_t, GgmlTypeTraits>, 45> kGgmlTypes{{
+inline constexpr std::array<std::pair<uint32_t, GgmlTypeTraits>, 51> kGgmlTypes{{
     {0, {"F32", 1, 4}},         {1, {"F16", 1, 2}},         {2, {"Q4_0", 32, 18}},
     {3, {"Q4_1", 32, 20}},      {6, {"Q5_0", 32, 22}},      {7, {"Q5_1", 32, 24}},
     {8, {"Q8_0", 32, 34}},      {9, {"Q8_1", 32, 36}},      {10, {"Q2_K", 256, 84}},
@@ -56,6 +56,11 @@ inline constexpr std::array<std::pair<uint32_t, GgmlTypeTraits>, 45> kGgmlTypes{
     {26, {"I32", 1, 4}},        {27, {"I64", 1, 8}},        {28, {"F64", 1, 8}},
     {29, {"IQ1_M", 256, 56}},   {30, {"BF16", 1, 2}},       {39, {"MXFP4", 32, 17}},
     {40, {"NVFP4", 64, 36}},
+    // NariQ's trellis types tile 16x16 weights. Sizing them as 16 input
+    // elements per 2*bits bytes gives the same total bytes without implying
+    // that a row can be repacked independently.
+    {44, {"TRL1", 16, 2}},        {45, {"TRL2", 16, 4}},        {46, {"TRL3", 16, 6}},
+    {47, {"TRL4", 16, 8}},        {48, {"TRL5", 16, 10}},       {49, {"TRL6", 16, 12}},
     {142, {"PQ2_0", 128, 34}},
     // Not a GGML type: the private id of the AF4 sections an MLX affine
     // image carries (metal/abi/QuantFormat.h), listed so its tensors size.
@@ -84,6 +89,9 @@ inline constexpr std::array<std::pair<uint32_t, GgmlTypeTraits>, 45> kGgmlTypes{
   return nullptr;
 }
 [[nodiscard]] std::string ggmlTypeName(uint32_t type);
+[[nodiscard]] constexpr uint32_t ggmlTrellisBits(uint32_t type) noexcept {
+  return type >= 44 && type <= 49 ? type - 43 : 0;
+}
 
 struct GgufTensor {
   std::string name;

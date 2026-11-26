@@ -51,9 +51,21 @@ struct ModelPolicy final {
   bool icbOff = false;                  // RICHENGINE_ICB_OFF
   // model/RuntimeEncodeDraft.mm: the in-command chained predraft.
   bool chainPredraft = false;           // RICHENGINE_CHAIN_PREDRAFT
+  bool ngramGpuMix = false;             // RICHENGINE_NGRAM_GPU_MIX
+  uint32_t ngramGpuMixMinWidth = 1;     // RICHENGINE_NGRAM_GPU_MIX_MIN_WIDTH
+  bool ngramMixCorpusOnly = false;      // RICHENGINE_NGRAM_MIX_CORPUS_ONLY
+  bool ngramDraftAgreement = false;     // RICHENGINE_NGRAM_DRAFT_AGREEMENT
+  bool ngramStepScore = false;          // RICHENGINE_NGRAM_STEP_SCORE
+  bool ngramChainClip = false;          // RICHENGINE_NGRAM_CHAIN_CLIP
+  bool ngramBudgetIsolation = false;    // RICHENGINE_NGRAM_BUDGET_ISOLATION
+  bool ngramPseudoConf = false;         // RICHENGINE_NGRAM_PSEUDO_CONF
+  bool ngramSkipGpuPredraft = false;    // RICHENGINE_NGRAM_SKIP_GPU_PREDRAFT
   // model/RuntimeEncodeDraft.mm + Runtime.mm: the DSpark confidence-prune
   // threshold; 0 leaves the proposals unpruned.
   double draftConfMin = 0.0;            // RICHENGINE_DRAFT_CONF_MIN
+  // model/Runtime.mm: LiLiCorr's lattice-walk confidence-prune threshold;
+  // 0 leaves the proposals unpruned.
+  double lilicorrPmin = 0.0;            // RICHENGINE_LILICORR_PMIN
   // model/RuntimeImpl.hpp adaptive decode gates: an explicitly set variable
   // wins a disable; otherwise the family maker's default applies.
   bool adaptiveProposals = false;  // RICHENGINE_ADAPTIVE_PROPOSALS
@@ -136,8 +148,42 @@ namespace detail {
   p.chainPredraft = envFlag("RICHENGINE_CHAIN_PREDRAFT")
                         ? env.chainPredraft
                         : maker.chainPredraft.value_or(false);
+  p.ngramGpuMix = envFlag("RICHENGINE_NGRAM_GPU_MIX")
+                      ? envUint("RICHENGINE_NGRAM_GPU_MIX", 0) != 0
+                      : maker.ngramGpuMix.value_or(false);
+  p.ngramGpuMixMinWidth =
+      envFlag("RICHENGINE_NGRAM_GPU_MIX_MIN_WIDTH")
+          ? envUint("RICHENGINE_NGRAM_GPU_MIX_MIN_WIDTH", 1)
+          : maker.ngramGpuMixMinWidth.value_or(1);
+  p.ngramMixCorpusOnly =
+      envFlag("RICHENGINE_NGRAM_MIX_CORPUS_ONLY")
+          ? envUint("RICHENGINE_NGRAM_MIX_CORPUS_ONLY", 0) != 0
+          : maker.ngramMixCorpusOnly.value_or(false);
+  p.ngramDraftAgreement =
+      envFlag("RICHENGINE_NGRAM_DRAFT_AGREEMENT")
+          ? envUint("RICHENGINE_NGRAM_DRAFT_AGREEMENT", 0) != 0
+          : maker.ngramDraftAgreement.value_or(false);
+  p.ngramStepScore = envFlag("RICHENGINE_NGRAM_STEP_SCORE")
+                         ? envUint("RICHENGINE_NGRAM_STEP_SCORE", 0) != 0
+                         : maker.ngramStepScore.value_or(false);
+  p.ngramChainClip = envFlag("RICHENGINE_NGRAM_CHAIN_CLIP")
+                         ? envUint("RICHENGINE_NGRAM_CHAIN_CLIP", 0) != 0
+                         : maker.ngramChainClip.value_or(false);
+  p.ngramBudgetIsolation =
+      envFlag("RICHENGINE_NGRAM_BUDGET_ISOLATION")
+          ? envUint("RICHENGINE_NGRAM_BUDGET_ISOLATION", 0) != 0
+          : maker.ngramBudgetIsolation.value_or(false);
+  p.ngramPseudoConf = envFlag("RICHENGINE_NGRAM_PSEUDO_CONF")
+                          ? envUint("RICHENGINE_NGRAM_PSEUDO_CONF", 0) != 0
+                          : maker.ngramPseudoConf.value_or(false);
+  p.ngramSkipGpuPredraft =
+      envFlag("RICHENGINE_NGRAM_SKIP_GPU_PREDRAFT")
+          ? envUint("RICHENGINE_NGRAM_SKIP_GPU_PREDRAFT", 0) != 0
+          : maker.ngramSkipGpuPredraft.value_or(false);
   p.draftConfMin = env.draftConfMinSet ? env.draftConfMin
                                        : maker.draftConfMin.value_or(0.0);
+  p.lilicorrPmin = env.lilicorrPminSet ? env.lilicorrPmin
+                                       : maker.lilicorrPmin.value_or(0.0);
   // unlessZero knobs: the variable only ever disables, so an explicit set
   // wins; otherwise the maker's default stands.
   p.adaptiveProposals = envFlag("RICHENGINE_ADAPTIVE_PROPOSALS")

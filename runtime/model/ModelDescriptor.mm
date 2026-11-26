@@ -1138,7 +1138,8 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
       std::filesystem::exists(root / "draft" / "config.json"))
     throw std::invalid_argument("diffusion gemma targets take no draft");
   if ((result.draft.kind != DraftKind::Null &&
-       result.draft.kind != DraftKind::Mtp) ||
+       result.draft.kind != DraftKind::Mtp &&
+       result.draft.kind != DraftKind::LiLiCorr) ||
       declaredDraft) {
   NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
   NSArray *architectures = requireArray(draft, @"architectures", "draft architectures");
@@ -1746,6 +1747,19 @@ ModelDescriptor inspectSourceModel(const std::filesystem::path &root) {
           {"patch_size", l.patchSize}, {"spatial_merge_size", l.spatialMerge},
           {"temporal_patch_size", 2}, {"in_channels", 3}});
       requireEqual(requireString(v, @"hidden_act", "vision activation"), "silu", "vision activation");
+    } else if (tower == "nemotron_omni") {
+      if (!entry->servesNemotronVisionTower || vision != "gguf")
+        throw std::invalid_argument("unsupported vision source format: " + vision);
+      result.visionSource = VisionSource::Gguf;
+      result.visionTower = VisionTower::NemotronOmni;
+      const auto &l = result.nemotronVision;
+      requireNumbers(v, "vision config", {{"depth", l.depth}, {"hidden_size", l.hiddenSize},
+          {"num_heads", l.heads}, {"intermediate_size", l.intermediateSize},
+          {"out_hidden_size", l.outputHiddenSize}, {"patch_size", l.patchSize},
+          {"spatial_merge_size", l.spatialMerge}, {"temporal_patch_size", 1},
+          {"in_channels", 3}, {"num_position_embeddings", l.positionGridSide * l.positionGridSide},
+          {"num_registers", l.registers}, {"projector_hidden_size", l.projectorHiddenSize}});
+      requireEqual(requireString(v, @"hidden_act", "vision activation"), "gelu_erf", "vision activation");
     } else {
       if (tower != "qwen3vl_merger")
         throw std::invalid_argument("unsupported vision projector type: " + tower);
@@ -1876,7 +1890,8 @@ bool ModelDescriptor::valid() const noexcept {
       !targetKvLayout.valid() || !stateLayout.valid() ||
       stateLayout.draft != draft.stateLayout() ||
       (visionTower == VisionTower::Lfm3Vl ? lfmVision.outputHiddenSize
-                                         : vision.outputHiddenSize) !=
+          : visionTower == VisionTower::NemotronOmni ? nemotronVision.outputHiddenSize
+                                                     : vision.outputHiddenSize) !=
           draft.hiddenSize) {
     return false;
   }

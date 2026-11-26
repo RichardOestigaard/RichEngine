@@ -126,7 +126,7 @@ void DraftSelector::addPlain(metal::CommandGraph &graph,
                              const DraftSelectorBuffers &buffers,
                              std::span<const uint32_t> anchors,
                              std::span<const SamplingPolicy> policies,
-                             uint32_t queryRows) const {
+                             uint32_t queryRows, uint32_t rowOffset) const {
   if (anchors.empty() || anchors.size() != policies.size() ||
       anchors.size() > RICHENGINE_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
@@ -143,7 +143,7 @@ void DraftSelector::addPlain(metal::CommandGraph &graph,
   }
   graph.addTail(std::string(kDraftSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            DraftTop16Params{vocabulary_, logitsStride_, 1}, queryRows,
+            DraftTop16Params{vocabulary_, logitsStride_, rowOffset}, queryRows,
             {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDraftSelectPlain),
             {buffers.partialIds, buffers.partialValues, buffers.uniforms,
@@ -156,7 +156,8 @@ void DraftSelector::addPlainTree(metal::CommandGraph &graph,
                                  const DraftSelectorBuffers &buffers,
                                  std::span<const uint32_t> anchors,
                                  std::span<const ops::SamplingPolicy> policies,
-                                 uint32_t treeMask, uint32_t queryRows) const {
+                                 uint32_t treeMask, uint32_t queryRows,
+                                 uint32_t rowOffset) const {
   if (anchors.empty() || anchors.size() != policies.size() ||
       anchors.size() > RICHENGINE_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
@@ -174,7 +175,7 @@ void DraftSelector::addPlainTree(metal::CommandGraph &graph,
   }
   graph.addTail(std::string(kDraftSelectTop16Sharded),
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            DraftTop16Params{vocabulary_, logitsStride_, 1}, queryRows,
+            DraftTop16Params{vocabulary_, logitsStride_, rowOffset}, queryRows,
             {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add(std::string(kDraftSelectPlainTree),
             {buffers.partialIds, buffers.partialValues, buffers.uniforms,

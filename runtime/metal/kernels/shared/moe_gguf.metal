@@ -22,7 +22,7 @@
 // MOE_GGUF_COLUMN_ROWS live rows runs the column tile instead (kernels/common/gguf_column_tile.h, moe_column_tile),
 // each lane one of the simdgroup's columns over the live rows: routes spread over many experts leave most decode
 // tiles at one or two rows, where the staged tile's padded matmul steps bound it.
-template <ushort Rows, GgufEpilogue Ep, bool NativeMxfp4>
+template <ushort Rows, GgufEpilogue Ep, bool NativeMxfp4, bool Relaxed = false>
 inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescriptor *tiles, device const uint *tile_count,
                                  device uchar *w0, device uchar *w1, device uchar *meta, device uchar *sw0, device uchar *sw1,
                                  device uchar *smeta, device bfloat *output, device bfloat *aux,
@@ -67,9 +67,9 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
       }
     }
 #endif
-    auto acc = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(x, p.input_size, my);
+    auto acc = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, Relaxed>(x, p.input_size, my);
     gguf_zero(acc);
-    staged_accumulate_any_native<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, NativeMxfp4>(s.format, x, s.w0, s.w1, s.meta, p.input_size,
+    staged_accumulate_any_native<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, NativeMxfp4, Relaxed>(s.format, x, s.w0, s.w1, s.meta, p.input_size,
                                             s.row0 + origin, my, tl,
                                             simd_group * 32 + simd_lane, simd_lane, 0, p.input_size / GGUF_STAGED_STEP, 0, acc);
     gguf_elements(acc, [&](uint row, uint column, float v) {
@@ -79,7 +79,7 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
   };
   moe_live_rows<Rows>(tile.rows, run);
 }
-template <ushort Rows, GgufEpilogue Ep, bool NativeMxfp4>
+template <ushort Rows, GgufEpilogue Ep, bool NativeMxfp4, bool Relaxed = false>
 [[max_total_threads_per_threadgroup(GGUF_STAGED_THREADS)]]
 kernel void moe_expert_gguf(device bfloat *input [[buffer(0)]], device const MoeTileDescriptor *tiles [[buffer(1)]],
                             device const uint *tile_count [[buffer(2)]], device uchar *w0 [[buffer(3)]],
@@ -89,7 +89,7 @@ kernel void moe_expert_gguf(device bfloat *input [[buffer(0)]], device const Moe
                             constant MoeGgufExpertParams &p [[buffer(11)]], uint2 group [[threadgroup_position_in_grid]],
                             uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup half stage[kStagedStages]; threadgroup half2 tl[kQuantPairTableEntries];
-  moe_gguf_expert_tile<Rows, Ep, NativeMxfp4>(input, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, output, aux, p, group,
+  moe_gguf_expert_tile<Rows, Ep, NativeMxfp4, Relaxed>(input, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, output, aux, p, group,
                                  simd_lane, simd_group, stage, tl);
 }
 using MoeExpertGgufKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *, device uchar *,
@@ -112,13 +112,20 @@ template [[host_name("moe_expert_gguf_m8_r")]] kernel MoeExpertGgufKernel moe_ex
 template [[host_name("moe_expert_gguf_m32_r")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpReluSquared, false>;
 template [[host_name("moe_expert_gguf_m8_r_n")]] kernel MoeExpertGgufKernel moe_expert_gguf<8, EpReluSquared, true>;
 template [[host_name("moe_expert_gguf_m32_r_n")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpReluSquared, true>;
+// Prefill-only relaxed-precision variants. Decode keeps the unsuffixed kernels strict.
+template [[host_name("moe_expert_gguf_m32_a_relaxed")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpNone, false, true>;
+template [[host_name("moe_expert_gguf_m32_g_relaxed")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpUpWithGate, false, true>;
+template [[host_name("moe_expert_gguf_m32_r_relaxed")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpReluSquared, false, true>;
+template [[host_name("moe_expert_gguf_m32_a_n_relaxed")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpNone, true, true>;
+template [[host_name("moe_expert_gguf_m32_g_n_relaxed")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpUpWithGate, true, true>;
+template [[host_name("moe_expert_gguf_m32_r_n_relaxed")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpReluSquared, true, true>;
 
 // The streamed variant of moe_gguf_expert_tile (ops/MoE.cpp's streamed
 // prefill passes): the routed experts' planes are not bound — moe_gguf_stream_segment resolves the tile's expert
 // through the arena's slot and chunk-address tables, and a tile whose expert
 // holds no slot this round writes nothing (its expert's earlier round's
 // output stands). Everything past the segment is the staged tile's own.
-template <ushort Rows, GgufEpilogue Ep, bool NativeMxfp4>
+template <ushort Rows, GgufEpilogue Ep, bool NativeMxfp4, bool Relaxed = false>
 inline void moe_gguf_expert_tile_streamed(
     device bfloat *input, device const MoeTileDescriptor *tiles, device const uint *tile_count,
     device const uint *slots, device const ulong *chunks, device uchar *sw0, device uchar *sw1,
@@ -164,9 +171,9 @@ inline void moe_gguf_expert_tile_streamed(
       }
     }
 #endif
-    auto acc = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(x, p.input_size, my);
+    auto acc = staged_accumulator<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, Relaxed>(x, p.input_size, my);
     gguf_zero(acc);
-    staged_accumulate_any_native<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, NativeMxfp4>(s.format, x, s.w0, s.w1, s.meta, p.input_size,
+    staged_accumulate_any_native<R, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, NativeMxfp4, Relaxed>(s.format, x, s.w0, s.w1, s.meta, p.input_size,
                                             s.row0 + origin, my, tl,
                                             simd_group * 32 + simd_lane, simd_lane, 0, p.input_size / GGUF_STAGED_STEP, 0, acc);
     gguf_elements(acc, [&](uint row, uint column, float v) {
@@ -479,7 +486,7 @@ template [[host_name("moe_expert_gguf_m32_g_p")]] kernel MoeExpertGgufPackedKern
 // way and writes the expertOutput rows the combine's shared routes read.
 // Grid (output_size / 64, ceil(rows / tile_rows)); a ragged last row block
 // takes the column tile, which reads the live rows alone.
-template <ushort Rows>
+template <ushort Rows, bool Relaxed = false>
 inline void moe_shared_gguf_tile(device bfloat *input, device const uint *tile_count,
                                  device uchar *w0, device uchar *w1, device uchar *meta,
                                  device bfloat *output, constant MoeGgufSharedParams &p, uint2 group,
@@ -506,15 +513,15 @@ inline void moe_shared_gguf_tile(device bfloat *input, device const uint *tile_c
     return;
   }
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
-  auto acc = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(x, p.input_size, my);
+  auto acc = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, Relaxed>(x, p.input_size, my);
   gguf_zero(acc);
-  staged_accumulate_any_native<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, false>(
+  staged_accumulate_any_native<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP, false, Relaxed>(
       p.format, x, w0, w1, meta, p.input_size, origin, my, tl,
       simd_group * 32 + simd_lane, simd_lane, 0, p.input_size / GGUF_STAGED_STEP, 0, acc);
   gguf_elements(acc, [&](uint row, uint column, float v) { store(row, origin + column, v); });
 }
 
-template <ushort Rows>
+template <ushort Rows, bool Relaxed = false>
 [[max_total_threads_per_threadgroup(GGUF_STAGED_THREADS)]]
 kernel void moe_shared_gguf(device bfloat *input [[buffer(0)]],
                             device const uint *tile_count [[buffer(1)]],
@@ -525,11 +532,12 @@ kernel void moe_shared_gguf(device bfloat *input [[buffer(0)]],
                             uint simd_lane [[thread_index_in_simdgroup]],
                             uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup half stage[kStagedStages]; threadgroup half2 tl[kQuantPairTableEntries];
-  moe_shared_gguf_tile<Rows>(input, tile_count, w0, w1, meta, output, p, group, simd_lane,
-                             simd_group, stage, tl);
+  moe_shared_gguf_tile<Rows, Relaxed>(input, tile_count, w0, w1, meta, output, p, group, simd_lane,
+                                      simd_group, stage, tl);
 }
 using MoeSharedGgufKernel = void(device bfloat *, device const uint *, device uchar *, device uchar *,
                                  device uchar *, device bfloat *, constant MoeGgufSharedParams &,
                                  uint2, uint, uint);
 template [[host_name("moe_shared_gguf_m8")]] kernel MoeSharedGgufKernel moe_shared_gguf<8>;
 template [[host_name("moe_shared_gguf_m32")]] kernel MoeSharedGgufKernel moe_shared_gguf<32>;
+template [[host_name("moe_shared_gguf_m32_relaxed")]] kernel MoeSharedGgufKernel moe_shared_gguf<32, true>;

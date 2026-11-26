@@ -2,12 +2,16 @@
 #include "TestFiles.hpp"
 #include "TestGguf.hpp"
 #include "model/GgufFile.hpp"
+#include "model/GgufTrellis.hpp"
+#include "model/TrellisCodec.hpp"
 
 #include <iostream>
 #include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
+#include <cstring>
+#include <cmath>
 
 namespace {
 namespace gguf = richengine::test::gguf;
@@ -90,6 +94,73 @@ int main() {
       gguf::append<uint64_t>(nested, 1);
     }
     rejects("excessive nesting", array(nested), "nesting is too deep");
+
+    // TRL type sizing and the exact trellis metadata subset.
+    {
+      using richengine::model::ggmlTrellisBits;
+      require(ggmlTrellisBits(45) == 2 && ggmlTrellisBits(49) == 6 && !ggmlTrellisBits(44 - 1),
+              "trellis bit lookup changed");
+      constexpr uint32_t trl2 = 45, f16 = 1, i32 = 26;
+      gguf::Bytes weight(16 * 32 / 8 * 2), scales(2 * 2), pre(32 * 4), post(16 * 4), pin(32 * 4), pout(16 * 4);
+      for (uint32_t i = 0; i < weight.size(); ++i) weight[i] = uint8_t(17 * i + 3);
+      for (uint32_t i = 0; i < 32; ++i) {
+        const int32_t v = static_cast<int32_t>(i);
+        std::memcpy(pin.data() + 4 * i, &v, 4);
+      }
+      for (uint32_t i = 0; i < 16; ++i) {
+        const int32_t v = static_cast<int32_t>(15 - i);
+        std::memcpy(pout.data() + 4 * i, &v, 4);
+      }
+      const gguf::Bytes data = gguf::file(
+          {gguf::uint32Key("trellis.version", 1), gguf::int32ArrayKey("trellis.desc.weight", {0, 0, 1, 0, 0, 1, 1, 16})},
+          {{"weight", {32, 16}, trl2, weight},
+           {"weight.trellis_s16", {2}, f16, scales},
+           {"weight.trellis_pre", {32}, kF32, pre},
+           {"weight.trellis_post", {16}, kF32, post},
+           {"weight.trellis_pin", {32}, i32, pin},
+           {"weight.trellis_pout", {16}, i32, pout}});
+      richengine::test::writeFile(path, data);
+      richengine::model::WeightSource trellisSource(path);
+      richengine::model::GgufFile trellisFile(trellisSource);
+      const auto info = richengine::model::readTrellisTensor(trellisFile, "weight");
+      require(info.bits() == 2 && info.inputSize() == 32 && info.outputSize() == 16 && info.pin && info.pout,
+              "trellis tensor metadata changed");
+      require(trellisFile.require("weight").bytes == weight.size(), "TRL2 tensor sizing changed");
+    }
+
+    // Host reference invariants used later by the Metal kernel tests.
+    {
+      namespace trl = richengine::model::trellis;
+      constexpr uint32_t bits = 3, columns = 32, rows = 16;
+      std::vector<uint32_t> codes(2 * 8 * bits);
+      for (uint32_t i = 0; i < codes.size(); ++i) codes[i] = 0x9e3779b9u * (i + 1);
+      uint16_t scaleBits[2];
+      for (uint32_t i = 0; i < 2; ++i) {
+        const __fp16 one = static_cast<__fp16>(1.0f);
+        std::memcpy(scaleBits + i, &one, 2);
+      }
+      std::vector<float> decoded(rows * columns);
+      trl::decodeRows(codes.data(), bits, columns, 0, rows, scaleBits, decoded.data());
+      for (uint32_t r = 0; r < rows; ++r)
+        for (uint32_t c = 0; c < columns; ++c) {
+          const uint32_t tile = (r / 16) * (columns / 16) + c / 16;
+          const int expected = trl::codedValue(codes.data() + tile * 8 * bits, bits, trl::position(r % 16, c % 16));
+          require(decoded[r * columns + c] == float(expected), "trellis tile decode mismatch");
+        }
+
+      std::vector<float> wave(32), original(32);
+      for (uint32_t i = 0; i < wave.size(); ++i) wave[i] = original[i] = std::sin(float(i) * 0.37f);
+      trl::blockTransform(wave.data(), 32, 32);
+      trl::blockTransform(wave.data(), 32, 32);
+      for (uint32_t i = 0; i < wave.size(); ++i)
+        require(std::fabs(wave[i] - original[i]) < 1e-5f, "normalized block Hadamard is not involutive");
+
+      std::vector<int32_t> pout = {2, 0, 3, 1};
+      const auto inverse = trl::inversePermutation(pout);
+      require((inverse == std::vector<int32_t>{1, 3, 0, 2}), "inverse permutation mismatch");
+      const auto composed = trl::composeOutputPermutation({}, 8, 4, 1, 2, 2);
+      require((composed == std::vector<int32_t>{0, 1, 2, 3, 4, 6, 5, 7}), "grouped output permutation mismatch");
+    }
     std::cout << "GGUF parser bounds tests passed\n";
     return 0;
   } catch (const std::exception &error) {

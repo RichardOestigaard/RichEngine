@@ -252,6 +252,22 @@ void ggufMoePlans() {
     require(plans.moePrefillWorkspace(shape, 2048) == devicePlans,
             "GGUF MoE prefill bound is not the bound of the device's plans");
   }
+  // Bolt's wide latent-MoE geometry defaults decode to the 32-row staged
+  // tile; narrower latent and wide full-width shapes keep the 8-row tile.
+  MoeShape latent{4096, 496, 9, 2560, WeightLayout::Block32,
+                  GGUF_FMT_COUNT, false, true};
+  latent.latentSize = 1024;
+  const ExecutionPlans apple10(device(10));
+  require(apple10.moeDecode(latent, 1).tileRows() == 32,
+          "wide latent MoE decode did not take the 32-row tile");
+  MoeShape narrowLatent = latent;
+  narrowLatent.experts = 256;
+  require(apple10.moeDecode(narrowLatent, 1).tileRows() == 8,
+          "narrow latent MoE decode left the 8-row tile");
+  MoeShape fullWidth = latent;
+  fullWidth.latentSize = 0;
+  require(apple10.moeDecode(fullWidth, 1).tileRows() == 8,
+          "full-width MoE decode left the 8-row tile");
   // The register tile reads GGUF 8-row tiles only.
   rejects([&] { (void)MoE::decodePlan(routedShape, 1, RICHENGINE_TARGET_VERIFY_ROWS, {MoeExpertTile::M8, moeRouteWideRows(kAssumedGpuCores),
                                                        MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); });

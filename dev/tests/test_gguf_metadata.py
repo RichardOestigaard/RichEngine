@@ -43,6 +43,12 @@ GGML = {
     "IQ1_M": 29,
     "BF16": 30,
     "MXFP4": 39,
+    "I32": 26,
+    "TRL2": 45,
+    "TRL3": 46,
+    "TRL4": 47,
+    "TRL5": 48,
+    "TRL6": 49,
     "PQ2_0": 142,
 }
 
@@ -370,6 +376,97 @@ class GgufMetadataTests(unittest.TestCase):
                 with self.assertRaises(models.ModelError):
                     gguf.tokenizer_files(self.metadata(values))
 
+    def test_trellis_screening(self):
+        """The NariQ subset: TRL2-TRL6 coded tensors, their side tensors and
+        descriptors, and a banded output head."""
+        values = {
+            key.replace("qwen35moe.", "qwen35."): value
+            for key, value in fixture().items()
+            if not key.startswith("qwen35moe.expert")
+        }
+        values["general.architecture"] = "qwen35"
+        values["qwen35.block_count"] = 1
+        values["trellis.version"] = 1
+        values["trellis.lm_head_bands"] = 2
+
+        table = []
+        metadata = dict(values)
+
+        def plain(name, kind):
+            table.append((name, [256], kind, b""))
+
+        def coded(name, rows, kind, columns=256, pout=False):
+            base = name[:-7] if name.endswith(".weight") else name
+            rows_kind, rows_block = (0, 0) if name == "token_embd.weight" else (1, 128)
+            metadata["trellis.desc." + base] = [
+                rows_kind,
+                rows_block,
+                1,
+                1,
+                128,
+                1,
+                1,
+                rows,
+            ]
+            table.append((name, [columns, rows], kind, b""))
+            table.extend(
+                [
+                    (base + ".trellis_s16", [columns // 16], GGML["F16"], b""),
+                    (base + ".trellis_pre", [columns], GGML["F32"], b""),
+                    (base + ".trellis_post", [rows], GGML["F32"], b""),
+                ]
+            )
+            if pout:
+                table.append((base + ".trellis_pout", [rows], GGML["I32"], b""))
+
+        for name, kind in loadable_tensors(values, self.root).items():
+            if name in ("token_embd.weight", "output.weight"):
+                continue
+            plain(name, kind)
+        coded("token_embd.weight", 256, GGML["TRL2"])
+        coded("output.band00.weight", 128, GGML["TRL3"], pout=True)
+        coded("output.band01.weight", 128, GGML["TRL4"])
+        table.append(("output.vocab_gather", [256], GGML["I32"], b""))
+
+        def write(values=metadata, entries=table):
+            return fixture_files.write_gguf(self.root / "trellis.gguf", values, entries)
+
+        gguf.require_loadable(gguf.Metadata(write(), tensors=True))
+
+        missing_desc = dict(metadata)
+        del missing_desc["trellis.desc.token_embd"]
+        with self.assertRaisesRegex(models.ModelError, "trellis descriptor"):
+            gguf.require_loadable(gguf.Metadata(write(missing_desc), tensors=True))
+
+        missing_side = [entry for entry in table if entry[0] != "token_embd.trellis_pre"]
+        with self.assertRaisesRegex(models.ModelError, "side tensor"):
+            gguf.require_loadable(gguf.Metadata(write(entries=missing_side), tensors=True))
+
+        wrong_side = [
+            (name, shape, GGML["BF16"] if name == "token_embd.trellis_pre" else kind, raw)
+            for name, shape, kind, raw in table
+        ]
+        with self.assertRaisesRegex(models.ModelError, "side tensor"):
+            gguf.require_loadable(gguf.Metadata(write(entries=wrong_side), tensors=True))
+
+        unsupported = dict(metadata)
+        unsupported["trellis.desc.token_embd"][3] = 2
+        with self.assertRaisesRegex(models.ModelError, "transform"):
+            gguf.require_loadable(gguf.Metadata(write(unsupported), tensors=True))
+
+        no_metadata = dict(metadata)
+        del no_metadata["trellis.version"]
+        del no_metadata["trellis.lm_head_bands"]
+        with self.assertRaisesRegex(models.ModelError, "require trellis metadata"):
+            gguf.require_loadable(gguf.Metadata(write(no_metadata), tensors=True))
+
+        trl1 = [
+            (name, shape, 44 if name == "token_embd.weight" else kind, raw)
+            for name, shape, kind, raw in table
+        ]
+        with self.assertRaisesRegex(models.ModelError, "TRL1"):
+            gguf.require_loadable(gguf.Metadata(write(entries=trl1), tensors=True))
+
     def test_screening_takes_the_rotation_the_native_loader_runs(self):
         # A dense target stored for rotated inputs, as Prism ML's GGUFs are:
         # PQ2_0 projections and token table, BF16 alpha and beta.
@@ -512,7 +609,8 @@ class GgufMetadataTests(unittest.TestCase):
             0
         ]
         types = [gguf.TENSOR_TYPES[int(n)] for n in re.findall(r"\{(\d+),", table)]
-        self.assertEqual(set(types), gguf.QUANTIZED_TYPES)
+        trellis = {"TRL2", "TRL3", "TRL4", "TRL5", "TRL6"}
+        self.assertEqual(set(types) | trellis, gguf.QUANTIZED_TYPES)
         ids = {
             name: int(value)
             for name, value in re.findall(r"#define GGUF_FMT_(\w+) (\d+)u", header)
@@ -520,7 +618,7 @@ class GgufMetadataTests(unittest.TestCase):
         embedding = (abi / "Gguf.h").read_text().split("gguf_embedding_format", 1)[1]
         embedding = embedding.split("}", 1)[0]
         names = re.findall(r"GGUF_FMT_(\w+)", embedding)
-        self.assertEqual({types[ids[name]] for name in names}, gguf.EMBEDDING_TYPES)
+        self.assertEqual({types[ids[name]] for name in names} | trellis, gguf.EMBEDDING_TYPES)
 
     def test_rotation_screen_is_the_native_loaders(self):
         # ROTATION and ROTATION_ARRAYS must be what GgufFile::readRotation

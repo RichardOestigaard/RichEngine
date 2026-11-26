@@ -1,10 +1,14 @@
 #include "DFlashTwoDraft.hpp"
 #include "Checked.hpp"
+#include "metal/abi/Gguf.h"
+#include "metal/abi/LiLiCorr.h"
+#include "metal/abi/Mtp.h"
 #include "DraftCheckpoint.hpp"
 #include "Tuning.hpp"
 #include "model/ModelPolicy.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -17,11 +21,12 @@ void requireLayout(const DFlashDraftLayout &layout) {
       !layout.dynamicSize || !layout.qkvSize || !layout.attentionSize ||
       !layout.intermediateSize || !layout.attentionHeadDimension ||
       !(layout.rotaryTheta > 0.0F) ||
-      !layout.targetHiddenSize || !layout.selectorRank ||
-      !layout.kvHeads) {
+      !layout.targetHiddenSize || !layout.kvHeads ||
+      (layout.kind != DraftKind::LiLiCorr && !layout.selectorRank)) {
     throw WeightStoreError("DFlash draft layout contains a zero dimension");
   }
-  if (layout.selectorRank != RICHENGINE_DRAFT_SELECTOR_RANK) {
+  if (layout.kind != DraftKind::LiLiCorr &&
+      layout.selectorRank != RICHENGINE_DRAFT_SELECTOR_RANK) {
     throw WeightStoreError("draft selector kernels are compiled for rank " +
                            std::to_string(RICHENGINE_DRAFT_SELECTOR_RANK));
   }
@@ -36,7 +41,8 @@ void requireLayout(const DFlashDraftLayout &layout) {
   validateQ4Layout(layout.intermediateSize, layout.hiddenSize);
   validateQ4Layout(layout.hiddenSize, layout.intermediateSize);
   validateQ4Layout(layout.hiddenSize, layout.targetHiddenSize);
-  validateQ4Layout(layout.selectorRank, layout.hiddenSize);
+  if (layout.kind != DraftKind::LiLiCorr)
+    validateQ4Layout(layout.selectorRank, layout.hiddenSize);
 }
 
 // The key and value rows of each layer's fused QKV projection, without a
@@ -60,6 +66,24 @@ std::vector<ops::Projection> contextKvRows(metal::MetalBackend &backend,
       // 32-column group and 4-byte meta units per 64-column block.
       const ops::QuantizedSegment &fused =
           layer.qkvProjection.blocks().segments.at(0);
+      if (fused.isFloat()) {
+        // LiLiCorr's GGUF stores q, k and v separately. The loader fuses
+        // them as bf16 float segments at their output-column offsets, so the
+        // context slice is simply the tail segments renumbered to zero.
+        ops::BlockWeights slice;
+        uint32_t covered = 0;
+        for (const ops::QuantizedSegment &segment : layer.qkvProjection.blocks().segments) {
+          if (segment.columnOffset < layout.attentionSize) continue;
+          ops::QuantizedSegment tail = segment;
+          tail.columnOffset = covered;
+          covered += tail.outputSize;
+          slice.segments.push_back(std::move(tail));
+        }
+        if (covered != layout.contextKvSize())
+          throw std::invalid_argument("draft float QKV does not slice the context K/V");
+        result.emplace_back(layout.contextKvSize(), layout.hiddenSize, std::move(slice));
+        continue;
+      }
       constexpr uint32_t kTileRows = 256;
       if (layout.attentionSize % kTileRows ||
           layout.contextKvSize() % kTileRows || fused.plane1)
@@ -95,6 +119,215 @@ std::vector<ops::Projection> contextKvRows(metal::MetalBackend &backend,
   return result;
 }
 
+metal::DispatchSize elementsGrid(uint64_t elements, uint32_t threads = 256) {
+  return {(elements + threads - 1) / threads, 1, 1};
+}
+
+LiLiCorrGemmParams gemmParams(uint32_t rows, uint32_t rowsPerLane,
+                              uint32_t inputSize, uint32_t outputSize,
+                              uint32_t inputOffset, uint32_t outputOffset,
+                              uint32_t epilogue = 0, float scale = 1.0F) {
+  return {rows, inputSize, outputSize, rowsPerLane,
+          LILICORR_SCRATCH_STRIDE, inputOffset, outputOffset, epilogue, scale};
+}
+
+bool gemmMmaShape(const LiLiCorrGemmParams &params) {
+  return params.rows_per_lane && params.rows_per_lane <= LILICORR_NODES &&
+         params.rows % params.rows_per_lane == 0 &&
+         params.input_size % 8 == 0 && params.output_size % 8 == 0;
+}
+
+void addGemmF32(metal::CommandGraph &graph, const metal::MetalBuffer &scratch,
+                const metal::MetalBuffer &weight, const metal::MetalBuffer &bias,
+                const LiLiCorrGemmParams &params) {
+  if (gemmMmaShape(params)) {
+    graph.add("lilicorr_gemm_f32_mma", {scratch, weight, bias, scratch}, params,
+              {params.output_size / 8, params.rows / params.rows_per_lane, 1},
+              {256, 1, 1});
+    return;
+  }
+  graph.add("lilicorr_gemm_f32", {scratch, weight, bias, scratch}, params,
+            elementsGrid(uint64_t{params.rows} * params.output_size));
+}
+
+void addGemmNvfp4(metal::CommandGraph &graph, const metal::MetalBuffer &scratch,
+                  const metal::MetalBuffer &weight, const metal::MetalBuffer &bias,
+                  const LiLiCorrGemmParams &params) {
+  if (gemmMmaShape(params)) {
+    graph.add("lilicorr_gemm_nvfp4_mma", {scratch, weight, bias, scratch}, params,
+              {params.output_size / 8, params.rows / params.rows_per_lane, 1},
+              {256, 1, 1});
+    return;
+  }
+  graph.add("lilicorr_gemm_nvfp4", {scratch, weight, bias, scratch}, params,
+            elementsGrid(uint64_t{params.rows} * params.output_size));
+}
+
+LiLiCorrNormParams normParams(uint32_t rows, uint32_t rowsPerLane,
+                              uint32_t width, uint32_t inputOffset,
+                              uint32_t outputOffset, float epsilon) {
+  return {rows, width, rowsPerLane, LILICORR_SCRATCH_STRIDE,
+          inputOffset, outputOffset, epsilon};
+}
+
+void addRmsNorm(metal::CommandGraph &graph, const metal::MetalBuffer &scratch,
+                const metal::MetalBuffer &weight,
+                const LiLiCorrNormParams &params) {
+  graph.add("lilicorr_rmsnorm", {weight, scratch}, params,
+            {params.rows, 1, 1}, {256, 1, 1});
+}
+
+void addResidual(metal::CommandGraph &graph, const metal::MetalBuffer &scratch,
+                 uint32_t rows, uint32_t deltaOffset) {
+  const LiLiCorrGemmParams params =
+      gemmParams(rows, LILICORR_NODES, LILICORR_HIDDEN, 0, deltaOffset,
+                 LILICORR_SCRATCH_X);
+  graph.add("lilicorr_residual", {scratch}, params,
+            elementsGrid(uint64_t{rows} * LILICORR_HIDDEN));
+}
+
+void addL2Norm(metal::CommandGraph &graph, const metal::MetalBuffer &scratch,
+               uint32_t rows, uint32_t rowsPerLane, uint32_t offset,
+               float epsilon) {
+  const LiLiCorrNormParams params =
+      normParams(rows, rowsPerLane, LILICORR_HIDDEN, offset, offset, epsilon);
+  graph.add("lilicorr_l2norm", {scratch}, params, {rows, 1, 1}, {256, 1, 1});
+}
+
+void addLiLiCorrScorer(metal::CommandGraph &graph,
+                       const ops::DraftSelectorBuffers &buffers,
+                       const LiLiCorrScorerWeights &scorer,
+                       uint32_t lanes, uint32_t queryRows,
+                       uint32_t vocabulary, uint32_t logitsStride) {
+  const ops::DraftLiLiCorrBuffers &input = *buffers.lilicorr;
+  if (input.tokenEmbeddingFormat != GGUF_FMT_Q80)
+    throw std::invalid_argument("LiLiCorr scorer requires a q8_0 token table");
+  const metal::MetalBuffer &scratch = input.scratch;
+  const uint32_t nodeRows = lanes * LILICORR_NODES;
+  const uint32_t passRows = lanes * LILICORR_SLOTS;
+
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    graph.add("lilicorr_stage_anchor", {input.anchors[lane], scratch},
+              LiLiCorrCopyParams{LILICORR_TARGET_HIDDEN, lane},
+              elementsGrid(LILICORR_TARGET_HIDDEN));
+  }
+  const LiLiCorrFeatureParams features{lanes, vocabulary, logitsStride, queryRows};
+  graph.add("lilicorr_features",
+            {buffers.logits, buffers.candidates, buffers.proposalProbabilities, scratch},
+            features, {lanes * LILICORR_SLOTS, 1, 1}, {256, 1, 1});
+  graph.add("lilicorr_gather_inputs",
+            {input.tokenEmbedding, input.finalHidden, scratch}, features,
+            elementsGrid(uint64_t{lanes} *
+                         (LILICORR_NODES + LILICORR_SLOTS) *
+                         LILICORR_TARGET_HIDDEN));
+
+  addGemmNvfp4(graph, scratch, scorer.tokenProjection, scorer.tokenBias,
+               gemmParams(nodeRows, LILICORR_NODES, LILICORR_TARGET_HIDDEN,
+                          LILICORR_HIDDEN, LILICORR_SCRATCH_TOKEN_INPUT,
+                          LILICORR_SCRATCH_TOKEN_STATES, 0, scorer.tokenScale));
+  addGemmNvfp4(graph, scratch, scorer.passProjection, scorer.passBias,
+               gemmParams(passRows, LILICORR_SLOTS, LILICORR_TARGET_HIDDEN,
+                          LILICORR_HIDDEN, LILICORR_SCRATCH_PASS_INPUT,
+                          LILICORR_SCRATCH_PASS_STATES, 0, scorer.passScale));
+  addGemmNvfp4(graph, scratch, scorer.contextProjection, scorer.contextBias,
+               gemmParams(lanes, 1, LILICORR_TARGET_HIDDEN, LILICORR_HIDDEN,
+                          LILICORR_SCRATCH_ANCHOR_INPUT,
+                          LILICORR_SCRATCH_ANCHOR_STATE, 0, scorer.contextScale));
+
+  graph.add("lilicorr_feature_norm",
+            {scorer.featureNorm, scorer.featureNormBias, scratch},
+            normParams(nodeRows, LILICORR_NODES, LILICORR_FEATURE_WIDTH,
+                       LILICORR_SCRATCH_FEATURES,
+                       LILICORR_SCRATCH_FEATURE_NORMED, 1e-5F),
+            elementsGrid(nodeRows));
+  addGemmF32(graph, scratch, scorer.featureUp, scorer.featureUpBias,
+             gemmParams(nodeRows, LILICORR_NODES, LILICORR_FEATURE_WIDTH,
+                        LILICORR_HIDDEN, LILICORR_SCRATCH_FEATURE_NORMED,
+                        LILICORR_SCRATCH_FEATURE_UP, 1));
+  addGemmF32(graph, scratch, scorer.featureDown, scorer.featureDownBias,
+             gemmParams(nodeRows, LILICORR_NODES, LILICORR_HIDDEN,
+                        LILICORR_HIDDEN, LILICORR_SCRATCH_FEATURE_UP,
+                        LILICORR_SCRATCH_FEATURE_STATES));
+  graph.add("lilicorr_assemble_nodes",
+            {scorer.slotEmbedding, scorer.rankEmbedding, scratch},
+            normParams(nodeRows, LILICORR_NODES, LILICORR_HIDDEN, 0, 0, 0),
+            elementsGrid(uint64_t{nodeRows} * LILICORR_HIDDEN));
+
+  for (const LiLiCorrScorerLayerWeights &layer : scorer.layers) {
+    addRmsNorm(graph, scratch, layer.attentionNorm,
+               normParams(nodeRows, LILICORR_NODES, LILICORR_HIDDEN,
+                          LILICORR_SCRATCH_X, LILICORR_SCRATCH_NORMED,
+                          scorer.rmsEpsilon));
+    addGemmF32(graph, scratch, layer.attentionIn, layer.attentionInBias,
+               gemmParams(nodeRows, LILICORR_NODES, LILICORR_HIDDEN,
+                          3 * LILICORR_HIDDEN, LILICORR_SCRATCH_NORMED,
+                          LILICORR_SCRATCH_QKV));
+    graph.add("lilicorr_attention", {scorer.attentionBias, scratch},
+              LiLiCorrAttentionParams{lanes, LILICORR_SCRATCH_STRIDE,
+                                      1.0F / 11.313708499F},
+              {lanes * LILICORR_HEADS * LILICORR_NODES, 1, 1},
+              {LILICORR_HEAD_DIM, 1, 1});
+    addGemmNvfp4(graph, scratch, layer.attentionOut, layer.attentionOutBias,
+                 gemmParams(nodeRows, LILICORR_NODES, LILICORR_HIDDEN,
+                            LILICORR_HIDDEN, LILICORR_SCRATCH_ATTENTION_OUT,
+                            LILICORR_SCRATCH_MLP, 0, layer.attentionOutScale));
+    addResidual(graph, scratch, nodeRows, LILICORR_SCRATCH_MLP);
+    addRmsNorm(graph, scratch, layer.mlpNorm,
+               normParams(nodeRows, LILICORR_NODES, LILICORR_HIDDEN,
+                          LILICORR_SCRATCH_X, LILICORR_SCRATCH_NORMED,
+                          scorer.rmsEpsilon));
+    addGemmNvfp4(graph, scratch, layer.mlpUp, layer.mlpUpBias,
+                 gemmParams(nodeRows, LILICORR_NODES, LILICORR_HIDDEN,
+                            LILICORR_MLP_HIDDEN, LILICORR_SCRATCH_NORMED,
+                            LILICORR_SCRATCH_MLP, 1, layer.mlpUpScale));
+    addGemmNvfp4(graph, scratch, layer.mlpDown, layer.mlpDownBias,
+                 gemmParams(nodeRows, LILICORR_NODES, LILICORR_MLP_HIDDEN,
+                            LILICORR_HIDDEN, LILICORR_SCRATCH_MLP,
+                            LILICORR_SCRATCH_ATTENTION_OUT, 0,
+                            layer.mlpDownScale));
+    addResidual(graph, scratch, nodeRows, LILICORR_SCRATCH_ATTENTION_OUT);
+  }
+
+  addRmsNorm(graph, scratch, scorer.outputNorm,
+             normParams(nodeRows, LILICORR_NODES, LILICORR_HIDDEN,
+                        LILICORR_SCRATCH_X, LILICORR_SCRATCH_X,
+                        scorer.rmsEpsilon));
+  addRmsNorm(graph, scratch, scorer.anchorNorm,
+             normParams(lanes, 1, LILICORR_HIDDEN,
+                        LILICORR_SCRATCH_ANCHOR_STATE,
+                        LILICORR_SCRATCH_ANCHOR_NORMED, scorer.rmsEpsilon));
+  graph.add("lilicorr_factor_input", {scratch},
+            normParams(nodeRows, LILICORR_NODES, LILICORR_HIDDEN, 0, 0, 0),
+            elementsGrid(uint64_t{nodeRows} * LILICORR_HIDDEN));
+  addGemmF32(graph, scratch, scorer.factorInput, scorer.factorInputBias,
+             gemmParams(nodeRows, LILICORR_NODES, 3 * LILICORR_HIDDEN,
+                        LILICORR_HIDDEN, LILICORR_SCRATCH_FACTOR_INPUT,
+                        LILICORR_SCRATCH_FACTORS, 1));
+  addGemmF32(graph, scratch, scorer.outHead, scorer.outHeadBias,
+             gemmParams(nodeRows, LILICORR_NODES, LILICORR_HIDDEN,
+                        LILICORR_HIDDEN, LILICORR_SCRATCH_FACTORS,
+                        LILICORR_SCRATCH_OUT));
+  addGemmF32(graph, scratch, scorer.inHead, scorer.inHeadBias,
+             gemmParams(nodeRows, LILICORR_NODES, LILICORR_HIDDEN,
+                        LILICORR_HIDDEN, LILICORR_SCRATCH_FACTORS,
+                        LILICORR_SCRATCH_IN));
+  addGemmF32(graph, scratch, scorer.anchorOutHead, scorer.anchorOutHeadBias,
+             gemmParams(lanes, 1, LILICORR_HIDDEN, LILICORR_HIDDEN,
+                        LILICORR_SCRATCH_ANCHOR_NORMED,
+                        LILICORR_SCRATCH_ANCHOR_OUT));
+  addL2Norm(graph, scratch, nodeRows, LILICORR_NODES,
+            LILICORR_SCRATCH_OUT, scorer.vectorEpsilon);
+  addL2Norm(graph, scratch, nodeRows, LILICORR_NODES,
+            LILICORR_SCRATCH_IN, scorer.vectorEpsilon);
+  addL2Norm(graph, scratch, lanes, 1,
+            LILICORR_SCRATCH_ANCHOR_OUT, scorer.vectorEpsilon);
+  graph.add("lilicorr_walk",
+            {scratch, buffers.proposedTokens, buffers.confidence},
+            LiLiCorrWalkParams{lanes, LILICORR_SCRATCH_STRIDE,
+                               scorer.vectorEpsilon, scorer.logitScale},
+            {lanes, 1, 1}, {1, 1, 1});
+}
+
 } // namespace
 
 DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
@@ -113,6 +346,28 @@ void DFlashDraft::addSelection(
     metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
     std::span<const uint32_t> anchors,
     std::span<const ops::SamplingPolicy> policies, uint32_t treeMask) const {
+  if (weights_.layout.kind == DraftKind::LiLiCorr) {
+    if (treeMask)
+      selector_.addPlainTree(graph, buffers, anchors, policies, treeMask,
+                             weights_.layout.queryRows(), 1);
+    else
+      selector_.addPlain(graph, buffers, anchors, policies,
+                         weights_.layout.queryRows(), 1);
+    const bool sampled =
+        std::any_of(policies.begin(), policies.end(),
+                    [](const ops::SamplingPolicy &policy) {
+                      return policy.samples();
+                    });
+    if (!treeMask && !sampled && buffers.lilicorr &&
+        weights_.lilicorr.present) {
+      addLiLiCorrScorer(graph, buffers, weights_.lilicorr,
+                        static_cast<uint32_t>(anchors.size()),
+                        weights_.layout.queryRows(),
+                        weights_.layout.vocabularySize,
+                        paddedVocabularySize(weights_.layout.vocabularySize));
+    }
+    return;
+  }
   // The pool walk is greedy-only: a sampled lane's residual draw stages
   // kDraftCandidates entries, so any sampling policy falls the whole batch
   // back to the merged-16 path.
@@ -156,14 +411,37 @@ void DFlashDraft::addContextPrefill(
     if (span.ring.size() != layout.layers)
       throw std::invalid_argument("draft prefill ring layer mismatch");
   }
-  operators_.linear().addPrefillSums(graph, buffers.capturedTargetHidden, buffers.projectionSums,
-                                     weights_.contextProjection, rows);
-  operators_.linear().addPrefill(graph, buffers.capturedTargetHidden, weights_.contextProjection,
-                                 buffers.projected, buffers.projectionSums, rows,
-                                 buffers.linearScratch);
-  ops::Normalization::addRmsWithQ4Sums(
-      graph, buffers.projected, weights_.hiddenNorm, buffers.hidden,
-      buffers.projectionSums, layout.hiddenSize, rows);
+  if (weights_.contextProjection.layout() == ops::WeightLayout::Block32) {
+    operators_.linear().addPrefill(graph, buffers.capturedTargetHidden,
+                                   weights_.contextProjection, buffers.projected,
+                                   buffers.projectionSums, rows,
+                                   buffers.linearScratch);
+    ops::Normalization::addRms(graph, buffers.projected, weights_.hiddenNorm,
+                               buffers.hidden, layout.hiddenSize, rows);
+  } else {
+    operators_.linear().addPrefillSums(graph, buffers.capturedTargetHidden, buffers.projectionSums,
+                                       weights_.contextProjection, rows);
+    operators_.linear().addPrefill(graph, buffers.capturedTargetHidden, weights_.contextProjection,
+                                   buffers.projected, buffers.projectionSums, rows,
+                                   buffers.linearScratch);
+    ops::Normalization::addRmsWithQ4Sums(
+        graph, buffers.projected, weights_.hiddenNorm, buffers.hidden,
+        buffers.projectionSums, layout.hiddenSize, rows);
+  }
+
+  if (layout.kind == DraftKind::LiLiCorr) {
+    for (const DFlashPrefillSpan &span : spans) {
+      if (span.anchorRow == ~0u || !span.anchor)
+        continue;
+      const metal::MetalBuffer row = backend_.view(
+          buffers.hidden,
+          uint64_t{span.anchorRow} * layout.hiddenSize * sizeof(uint16_t),
+          uint64_t{layout.hiddenSize} * sizeof(uint16_t));
+      graph.add("mtp_anchor_prefill", {row, span.anchor},
+                MtpAnchorParams{layout.hiddenSize, 0, 1},
+                {1, 1, 1}, {256, 1, 1});
+    }
+  }
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     operators_.linear().addPrefill(graph, buffers.hidden,
@@ -243,7 +521,7 @@ void DFlashDraft::addDecode(
         graph,
         {buffers.attention, buffers.persistentKeys[layer],
          buffers.persistentValues[layer], buffers.queryKeys,
-         buffers.queryValues, {}},
+         buffers.queryValues, weights.attentionSinks},
         cacheLengths, attentionPlan, /*causal=*/false, devicePack);
     linear.add(graph, {.input = buffers.attention, .output = buffers.projected, .scratch = scratch},
                weights.outputProjection, linear.decodePlan(weights.outputProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.queryRows()));
@@ -283,21 +561,27 @@ void DFlashDraft::addDecode(
   // The final norm feeds the shared vocabulary head and then the selector;
   // the selector reuses whatever table the head leaves when the layouts match.
   const ops::LinearPlan headPlan = linear.decodePlan(vocabularyProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.queryRows());
-  const ops::LinearPlan selectorPlan = linear.decodePlan(weights_.selectorProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.queryRows());
-  // The selector reuses the head's table only when the layouts match; a
-  // mismatch makes it re-prepare from the bf16 rows, which must then exist.
-  const bool sharedTable = headPlan.input() != ops::LinearInput::Plain &&
-                           headPlan.input() == selectorPlan.input();
+  std::optional<ops::LinearPlan> selectorPlan;
+  bool sharedTable = false;
+  if (layout.kind != DraftKind::LiLiCorr) {
+    selectorPlan.emplace(linear.decodePlan(weights_.selectorProjection, lanes, ops::LinearEpilogue::None, nullptr, layout.queryRows()));
+    // The selector reuses the head's table only when the layouts match; a
+    // mismatch makes it re-prepare from the bf16 rows, which must then exist.
+    sharedTable = headPlan.input() != ops::LinearInput::Plain &&
+                  headPlan.input() == selectorPlan->input();
+  }
   const ops::PreparedInput finalHidden = ops::Normalization::addRms(
       graph, buffers.hidden[weights_.layout.layers & 1], weights_.finalNorm,
       buffers.finalHidden, layout.hiddenSize, rows, scratch, headPlan.input(), !sharedTable);
   const ops::PreparedInput afterHead = linear.add(
       graph, {.input = buffers.finalHidden, .output = buffers.logits, .scratch = scratch, .prepared = finalHidden},
       vocabularyProjection, headPlan);
-  linear.add(graph,
-             {.input = buffers.finalHidden, .output = buffers.selectorHidden, .scratch = scratch,
-              .prepared = afterHead},
-             weights_.selectorProjection, selectorPlan);
+  if (layout.kind != DraftKind::LiLiCorr) {
+    linear.add(graph,
+               {.input = buffers.finalHidden, .output = buffers.selectorHidden, .scratch = scratch,
+                .prepared = afterHead},
+               weights_.selectorProjection, *selectorPlan);
+  }
   graph.endBakedSpan();
 }
 
@@ -334,7 +618,18 @@ void DFlashDraft::addContextCommit(
   const bool kvRowsDead = kvUniform && kvInput != ops::LinearInput::Plain;
   ops::PreparedInput hidden = ops::Normalization::addRms(
       graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize, rows,
-      scratch, kvInput, !kvRowsDead);
+      scratch, kvInput, !kvRowsDead || layout.kind == DraftKind::LiLiCorr);
+
+  if (layout.kind == DraftKind::LiLiCorr) {
+    const auto anchor = [&](uint32_t lane) {
+      return buffers.mtpAnchors[std::min(lane, lanes - 1)];
+    };
+    graph.add("mtp_anchor_commit",
+              {buffers.hidden, buffers.retainedCounts,
+               anchor(0), anchor(1), anchor(2), anchor(3)},
+              MtpAnchorParams{layout.hiddenSize, layout.verifyRows(), lanes},
+              {lanes, 1, 1}, {256, 1, 1});
+  }
 
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     const ops::Projection &projection = contextKvProjections_[layer];

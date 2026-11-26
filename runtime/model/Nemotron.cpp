@@ -155,12 +155,10 @@ public:
       addPrefillMamba(step, *mamba, layer.inputNorm, input, output);
     } else if (const auto *attention =
                    std::get_if<AttentionMixerWeights>(&layer.mixer)) {
-      const metal::MetalBuffer residual =
-          model_.addPrefillMixer(step, *attention, layer.inputNorm, input);
-      ops::RowCopy::add(step.graph, residual,
-                        {0, model_.geometry_.hiddenSize, 0}, output,
-                        {0, model_.geometry_.hiddenSize, 0}, step.rows,
-                        model_.geometry_.hiddenSize);
+      // No FFN follows the attention block: the residual output projection
+      // writes the layer output directly, eliding the scratch copy.
+      model_.addPrefillMixer(step, *attention, layer.inputNorm, input,
+                             output);
     } else {
       addPrefillMoe(step, layer, input, output);
     }
@@ -176,12 +174,8 @@ public:
       addVerifyMamba(step, *mamba, layer.inputNorm, input, output);
     } else if (const auto *attention =
                    std::get_if<AttentionMixerWeights>(&layer.mixer)) {
-      const metal::MetalBuffer residual =
-          model_.addVerifyMixer(step, *attention, layer.inputNorm, input);
-      ops::RowCopy::add(step.graph, residual,
-                        {0, model_.geometry_.hiddenSize, 0}, output,
-                        {0, model_.geometry_.hiddenSize, 0}, step.rows,
-                        model_.geometry_.hiddenSize);
+      model_.addVerifyMixer(step, *attention, layer.inputNorm, input,
+                            output);
     } else {
       addVerifyMoe(step, layer, input, output);
     }
@@ -228,8 +222,14 @@ private:
            mixer.mixerNorm,
            u16(b.gdnHidden, model_.geometry_.mambaInnerSize)},
           model_.geometry_.mambaShape(), sequence.rows,
-          prefillSums(model_.backend_, b.projectionSums, sequence.rowBegin,
-                      sequence.rows, model_.geometry_.mambaInnerSize));
+          // The gate's sums pass exists for an affine out-projection alone:
+          // a block (GGUF) consumer reads no input sums, so its re-read and
+          // write of the hidden rows is dead traffic.
+          mixer.outputProjection.layout() == ops::WeightLayout::Affine64
+              ? prefillSums(model_.backend_, b.projectionSums,
+                            sequence.rowBegin, sequence.rows,
+                            model_.geometry_.mambaInnerSize)
+              : metal::MetalBuffer{});
     }
     model_.addPrefillOutput(step, b.gdnHidden, mixer.outputProjection,
                             input, output);
@@ -261,7 +261,6 @@ private:
     const ops::Projection latentUp = moeSegmentProjection(block.latentUp);
     const ops::Projection sharedUp = moeSegmentProjection(block.up.shared);
     const ops::Projection sharedDown = moeSegmentProjection(block.down.shared);
-    const uint32_t sharedWidth = model_.geometry_.sharedIntermediateSize;
 
     // gdnHidden is rows x mambaInnerSize (8192 on Bolt) scratch of the
     // Mamba layers. A MoE-only layer never runs a mixer, so it holds the
@@ -269,11 +268,11 @@ private:
     ops::PreparedInput prepared = linear.addPrefill(
         step.graph, b.normalized, latentDown, b.moeLatentRows,
         b.projectionSums, step.rows, b.linearScratch);
-    linear.addPrefill(step.graph, b.normalized, sharedUp, b.gdnHidden,
-                      b.projectionSums, step.rows, b.linearScratch, prepared);
-    ops::RowCopy::addReluSquared(step.graph, b.gdnHidden,
-                                 {0, sharedWidth, 0}, b.gdnHidden,
-                                 {0, sharedWidth, 0}, step.rows, sharedWidth);
+    // The shared expert's relu² activation folds into its up projection's
+    // output store, sparing the elementwise pass over the intermediate.
+    linear.addPrefillReluSquared(step.graph, b.normalized, sharedUp,
+                                 b.gdnHidden, b.projectionSums, step.rows,
+                                 b.linearScratch, prepared);
     ops::MoE::add(step.graph,
                   {.input = b.normalized, .residual = b.moeZeroLatent,
                    .output = b.moeLatentOutput, .scratch = b.moe,
@@ -319,7 +318,7 @@ private:
         b.currentGdnStates,
         b.nextGdnStates, b.gdnMixed[layer], mixer.decay, mixer.timeBias,
         b.gdnDecay[layer], mixer.skip, mixer.mixerNorm, b.gdnHidden,
-        b.linearScratch, b.gdnTape};
+        b.linearScratch, b.gdnTape, b.gdnBeta[layer]};
     // The tape lane record carries byte offsets only — the GDN record and
     // the mamba one are layout-identical, the layer stride aside, and the
     // stride the runtime computes is already the mamba shape's. A tree
@@ -381,12 +380,11 @@ private:
         latentUp, step.planLanes, ops::LinearEpilogue::Residual, nullptr,
         step.rowCapacity);
     const ops::LinearPlan sharedUpPlan = linear.decodePlan(
-        sharedUp, step.planLanes, ops::LinearEpilogue::None, nullptr,
+        sharedUp, step.planLanes, ops::LinearEpilogue::ReluSquared, nullptr,
         step.rowCapacity);
     const ops::LinearPlan sharedDownPlan = linear.decodePlan(
         sharedDown, step.planLanes, ops::LinearEpilogue::Residual, nullptr,
         step.rowCapacity);
-    const uint32_t sharedWidth = model_.geometry_.sharedIntermediateSize;
 
     step.graph.beginBakedSpan();
     // The router reads the bf16 rows as well as the linear consumer's
@@ -406,9 +404,6 @@ private:
                {.input = b.normalized, .output = b.gdnHidden,
                 .scratch = b.linearScratch, .prepared = prepared},
                sharedUp, sharedUpPlan);
-    ops::RowCopy::addReluSquared(step.graph, b.gdnHidden,
-                                 {0, sharedWidth, 0}, b.gdnHidden,
-                                 {0, sharedWidth, 0}, step.rows, sharedWidth);
     ops::MoE::add(step.graph,
                   {.input = b.normalized, .residual = b.moeZeroLatent,
                    .output = b.moeLatentOutput, .scratch = b.moe,

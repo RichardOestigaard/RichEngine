@@ -136,7 +136,7 @@ kernel void vision_prepare_positions(
 
 // Dense bf16 GEMM: output[M, N] = input[M, K] * weights[N, K]^T + bias[N]
 
-enum VisionActivation { VisionNone, VisionGeluTanh, VisionGeluErf };
+enum VisionActivation { VisionNone, VisionGeluTanh, VisionGeluErf, VisionReluSquared };
 
 // Abramowitz & Stegun 7.1.26 (max error ~1.5e-7, far below bf16 rounding).
 inline float vision_erf(float x) {
@@ -211,6 +211,9 @@ inline void vision_gemm_tile(
         } else if constexpr (Activation == VisionGeluErf) {
             value = 0.5f * value *
                 (1.0f + vision_erf(value * 0.7071067811865476f));
+        } else if constexpr (Activation == VisionReluSquared) {
+            value = max(value, 0.0f);
+            value *= value;
         }
         if constexpr (AddResidual) {
             value += float(residual[
@@ -247,9 +250,13 @@ VISION_GEMM_KERNEL(vision_gemm_m64n128_residual, 64, 128, VisionNone, true,
                    float)
 VISION_GEMM_KERNEL(vision_gemm_m64n128_gelu_tanh, 64, 128, VisionGeluTanh, false,
                    bfloat)
+VISION_GEMM_KERNEL(vision_gemm_m64n128_gelu_erf, 64, 128, VisionGeluErf, false,
+                   bfloat)
 // The merger's 256-divisible output sizes use the wider tile.
 VISION_GEMM_KERNEL(vision_gemm_m32n256, 32, 256, VisionNone, false, bfloat)
 VISION_GEMM_KERNEL(vision_gemm_m32n256_gelu_erf, 32, 256, VisionGeluErf,
+                   false, bfloat)
+VISION_GEMM_KERNEL(vision_gemm_m32n256_relu_squared, 32, 256, VisionReluSquared,
                    false, bfloat)
 
 // LayerNorm with bias of an fp32 residual row (fp32 statistics), one

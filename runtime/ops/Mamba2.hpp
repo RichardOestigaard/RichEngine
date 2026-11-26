@@ -125,6 +125,10 @@ struct Mamba2DecodeBuffers final {
   // the previous step's retained rows and this step's — pending_tape and
   // step_tape in the parameters carry the offsets. Empty disables the fold.
   metal::MetalBuffer tape;
+  // Bolt's split scan reuses the target's otherwise unused beta scratch for
+  // the prologue's fp32 dA values, in stepSizes' [row][head] layout. The
+  // fused kernels leave it empty and recompute nothing.
+  metal::MetalBuffer decayValues{};
 };
 
 // One lane's tape offsets and previous retained count: pending/step are the

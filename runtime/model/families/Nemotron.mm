@@ -49,6 +49,38 @@ DFlashDraftLayout nemotronNullDraftLayout(const TargetLayout &target) {
   return layout;
 }
 
+// Bolt's LiLiCorr trunk: five block-bidirectional DFlash layers over a
+// 4096-wide hidden state, with Lightning's q32/k2/d128 attention geometry,
+// per-head sinks, a 1024-wide sliding prefix window and the six-layer target
+// feature concat its fc consumes. The trunk layout carries no scorer
+// dimensions; the LiLiCorr lattice scorer's weights ride the same image
+// and its walk rewrites greedy non-tree lanes' plain chains.
+DFlashDraftLayout boltLiLiCorrDraftLayout(const TargetLayout &target) {
+  DFlashDraftLayout layout;
+  layout.kind = DraftKind::LiLiCorr;
+  layout.layers = 5;
+  layout.hiddenSize = 4096;
+  layout.vocabularySize = target.vocabularySize;
+  layout.dynamicSize = 1024;
+  layout.qkvSize = 4608;
+  layout.attentionSize = 4096;
+  layout.intermediateSize = 12288;
+  layout.attentionHeadDimension = 128;
+  layout.rotaryTheta = 10000.0F;
+  layout.targetHiddenSize = 6 * target.hiddenSize;
+  layout.selectorRank = 0;
+  layout.kvHeads = 2;
+  layout.blockSize = 8;
+  layout.ropeInterleaved = false;
+  layout.slidingWindow = 1024;
+  layout.rmsEpsilon = 1e-6F;
+  layout.causalLayers = 0;
+  layout.attentionSinks = true;
+  layout.headCore = ops::DraftHeadCore::Q32K2D128;
+  layout.contextCore = ops::DraftContextCore::Hidden4096;
+  return layout;
+}
+
 // The nemotron source's config check: the geometry and the mamba/MoE
 // settings the released config.json fixes.
 void validateNemotronSourceConfig(id textObj,
@@ -111,26 +143,50 @@ void validateNemotronSourceConfig(id textObj,
 
 // Nemotron is text-only: no vision layout, and no vision weights to load.
 ModelDescriptor nemotronDescriptorFor(std::string name,
-                                      const TargetLayout &layout) {
+                                      const TargetLayout &layout,
+                                      DFlashDraftLayout draft) {
   ops::VisionLayout vision;
   vision.outputHiddenSize = layout.hiddenSize;
   ModelDescriptor descriptor =
-      makeModelDescriptor(std::move(name), layout,
-                          nemotronNullDraftLayout(layout),
-                          vision);
+      makeModelDescriptor(std::move(name), layout, std::move(draft), vision);
+  descriptor.nemotronVision = {.depth = 32,
+                               .hiddenSize = 1280,
+                               .patchDimension = 768,
+                               .intermediateSize = 5120,
+                               .mergedHiddenSize = 5120,
+                               .projectorHiddenSize = 20480,
+                               .outputHiddenSize = layout.hiddenSize,
+                               .heads = 16,
+                               .headDimension = 80,
+                               .positionGridSide = 128,
+                               .patchSize = 16,
+                               .spatialMerge = 2,
+                               .registers = 10};
   descriptor.visionSource = VisionSource::None;
   return descriptor;
 }
 
 ModelDescriptor nemotronDescriptor(std::string name) {
-  return nemotronDescriptorFor(std::move(name), nemotronTargetLayout());
+  const TargetLayout target = nemotronTargetLayout();
+  ModelDescriptor descriptor = nemotronDescriptorFor(
+      std::move(name), target, nemotronNullDraftLayout(target));
+  // Lightning's measured concurrency path: exact cross-request corpus
+  // chains may overwrite an already-sunk GPU predraft once at least two
+  // lanes are live. Width one keeps DSpark's stronger open-context rows;
+  // the gate measured neutral sequentially and faster in four-lane waves.
+  descriptor.tuning.ngramGpuMix = true;
+  descriptor.tuning.ngramGpuMixMinWidth = 2;
+  descriptor.tuning.ngramMixCorpusOnly = true;
+  return descriptor;
 }
 
 // Bolt's descriptor: the 88-block layout — its discrimination from
 // Lightning is the family the install's signature match names, which the
 // per-layer GGUF metadata (88 blocks, moe_latent_size) then verifies.
 ModelDescriptor boltDescriptor(std::string name) {
-  return nemotronDescriptorFor(std::move(name), boltTargetLayout());
+  const TargetLayout target = boltTargetLayout();
+  return nemotronDescriptorFor(std::move(name), target,
+                               boltLiLiCorrDraftLayout(target));
 }
 
 // The registry's erased-signature entry for the nemotron target.
@@ -154,7 +210,8 @@ const bool kRegisteredNemotronFamilies = [] {
        .modelType = "nemotron_h_moe_text", .legacyType = "nemotron_h",
        .makeDescriptor = &boltDescriptor,
        .validateSourceConfig = &validateNemotronSourceConfig,
-       .acceptsDeclaredDraft = true});
+       .acceptsDeclaredDraft = true,
+       .servesNemotronVisionTower = true});
   return true;
 }();
 

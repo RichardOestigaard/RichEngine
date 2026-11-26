@@ -141,7 +141,8 @@ inline void append(Table &table, std::span<const uint32_t> tokens) {
 // `extensionOut`, when set, gets the winning occurrence's backward
 // extension — the matched pattern's effective length is 3 + extension.
 inline uint32_t lookup(const Table &table, uint32_t *out,
-                       uint32_t *extensionOut = nullptr) {
+                       uint32_t *extensionOut = nullptr,
+                       uint32_t extensionCap = UINT32_MAX) {
   const std::vector<uint32_t> &history = table.history;
   const uint32_t size = static_cast<uint32_t>(history.size());
   if (size < 4)
@@ -160,8 +161,9 @@ inline uint32_t lookup(const Table &table, uint32_t *out,
       continue;
     // Two tokens per compare while a whole pair fits, the scalar loop
     // handling the odd remainder — identical extension values.
+    const uint32_t extensionLimit = std::min(start, extensionCap);
     uint32_t extension = 0;
-    while (extension + 2 <= start) {
+    while (extension + 2 <= extensionLimit) {
       uint64_t a, b;
       std::memcpy(&a, history.data() + (start - 2 - extension), 8);
       std::memcpy(&b, history.data() + (size - 5 - extension), 8);
@@ -169,7 +171,7 @@ inline uint32_t lookup(const Table &table, uint32_t *out,
         break;
       extension += 2;
     }
-    while (extension < start &&
+    while (extension < extensionLimit &&
            history[start - 1 - extension] == history[size - 4 - extension])
       ++extension;
     const uint32_t followers = size - (start + 3);

@@ -188,8 +188,12 @@ namespace richengine::model {
   layout.moeRoutedScale = 5.0F;
   layout.moeLatentSize = 1024;
   layout.rmsEpsilon = 1e-5F;
-  layout.hiddenCaptureLayers = {87};
-  layout.captureLayerCount = 1;
+  layout.maskToken = 990;
+  // LiLiCorr reads the inputs of target layers 2, 19, 36, 52, 69 and 86
+  // (its GGUF target_layers). A layer input is the previous block's output
+  // in this engine's capture stream, so the captured outputs are one less.
+  layout.hiddenCaptureLayers = {1, 18, 35, 51, 68, 85};
+  layout.captureLayerCount = 6;
   return layout;
 }
 

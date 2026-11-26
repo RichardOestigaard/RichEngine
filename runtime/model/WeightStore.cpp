@@ -20,7 +20,8 @@ namespace {
 [[nodiscard]] uint64_t q4Elements(uint32_t outputSize, uint32_t inputSize) {
     if (!outputSize || !inputSize || inputSize % kQ4GroupElements) {
         throw WeightStoreError(
-            "Q4 projection dimensions must be positive and input-aligned");
+            "Q4 projection dimensions must be positive and input-aligned (" +
+            std::to_string(outputSize) + "x" + std::to_string(inputSize) + ")");
     }
     return checkedMultiply<WeightStoreError>(outputSize, inputSize, "Q4 element count");
 }
@@ -291,8 +292,9 @@ GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label
     // Rows bound only by the decode kernels' 64-column output tile — the
     // stored planes pad the tail tile (a nemotron projection's 2688
     // outputs fill forty-two tiles' worth).
+    const bool trellis = ggmlTrellisBits(d.type) != 0;
     if (!d.outputSize || !d.inputSize ||
-        (tiled && d.type != ggml::kF32 && d.type != ggml::kBF16 && !affine &&
+        (tiled && !trellis && d.type != ggml::kF32 && d.type != ggml::kBF16 && !affine &&
          (d.outputSize % GGUF_TILE_COLUMNS || d.inputSize % columnUnit)) ||
         (tiled && affine && (d.outputSize % kQ4StorageN || d.inputSize % kQ4GroupElements)))
         throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label) +
@@ -307,6 +309,29 @@ GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label
 ops::QuantizedSegment segmentFromDescriptor(WeightFile &file,
                                             const GgufTensorDescriptor &d,
                                             std::string_view label) {
+    if (ggmlTrellisBits(d.type)) {
+        metal::MetalBuffer section = file.section(sizeof(GgufTrellisDescriptor), std::string(label) + "-trellis-desc");
+        const uint8_t *bytes = static_cast<const uint8_t *>(section.contents());
+        if (!bytes) throw WeightStoreError("GGUF trellis descriptor is not host visible");
+        GgufTrellisDescriptor t;
+        std::memcpy(&t, bytes, sizeof t);
+        if (t.bits != ggmlTrellisBits(d.type) || t.codesBytes != d.plane0Bytes ||
+            t.scalesBytes != d.plane1Bytes || t.preBytes != d.metaTotalBytes)
+            throw WeightStoreError("GGUF trellis section sizes are inconsistent: " + std::string(label));
+        ops::TrellisWeight weight;
+        weight.bits = t.bits;
+        weight.inputBlock = t.inputBlock;
+        weight.outputBlock = t.outputBlock;
+        weight.hasPin = (t.flags & 1) && t.pinBytes;
+        weight.hasPout = (t.flags & 2) && t.poutBytes;
+        weight.codes = file.section(t.codesBytes, std::string(label) + "-codes");
+        weight.scales = file.section(t.scalesBytes, std::string(label) + "-scales");
+        weight.pre = file.section(t.preBytes, std::string(label) + "-pre");
+        weight.post = file.section(t.postBytes, std::string(label) + "-post");
+        if (t.pinBytes) weight.pin = file.section(t.pinBytes, std::string(label) + "-pin");
+        if (t.poutBytes) weight.pout = file.section(t.poutBytes, std::string(label) + "-pout");
+        return ops::QuantizedSegment::trellis(std::move(weight), d.outputSize, d.inputSize);
+    }
     if (d.type == ggml::kF32 || d.type == ggml::kBF16) {
         const uint64_t elementBytes = d.type == ggml::kBF16 ? 2 : sizeof(float);
         if (d.p0 || d.p1 || d.metaBytes || d.metaGroups || d.plane1Bytes || d.metaTotalBytes ||
@@ -346,10 +371,33 @@ ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view la
 
 ops::Projection readBlockProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
                                     std::string_view label) {
-    ops::QuantizedSegment segment = readQuantizedSegment(file, label);
-    if (segment.outputSize != outputSize || segment.inputSize != inputSize)
+    ops::BlockWeights weights;
+    uint32_t covered = 0;
+    ops::QuantizedSegment first = readQuantizedSegment(file, label);
+    if (first.inputSize != inputSize || first.outputSize > outputSize)
         throw WeightStoreError("GGUF tensor does not match the layout: " + std::string(label));
-    return {outputSize, inputSize, ops::BlockWeights{{std::move(segment)}}};
+    first.columnOffset = covered;
+    covered += first.outputSize;
+    const bool bandedTrellis = first.isTrellis() && first.outputSize != outputSize;
+    weights.segments.push_back(std::move(first));
+    if (bandedTrellis) {
+        while (covered < outputSize) {
+            ops::QuantizedSegment segment = readQuantizedSegment(file, label);
+            if (!segment.isTrellis() || segment.inputSize != inputSize || segment.outputSize > outputSize - covered)
+                throw WeightStoreError("GGUF trellis bands do not tile the projection: " + std::string(label));
+            segment.columnOffset = covered;
+            covered += segment.outputSize;
+            weights.segments.push_back(std::move(segment));
+        }
+        metal::MetalBuffer scatter = file.section(uint64_t{outputSize} * sizeof(int32_t), std::string(label) + "-vocab-scatter");
+        for (ops::QuantizedSegment &segment : weights.segments) {
+            segment.trellisData->scatter = scatter;
+            segment.trellisData->hasScatter = true;
+        }
+    } else if (covered != outputSize) {
+        throw WeightStoreError("GGUF tensor does not match the layout: " + std::string(label));
+    }
+    return {outputSize, inputSize, std::move(weights)};
 }
 
 ops::Projection readProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
@@ -364,6 +412,15 @@ ops::EmbeddingWeights readBlockEmbedding(WeightFile &file, uint32_t outputSize, 
     const GgufTensorDescriptor d = readGgufDescriptor(file, label, /*tiled=*/false);
     if (d.outputSize != outputSize || d.inputSize != inputSize)
         throw WeightStoreError("GGUF embedding does not match the layout: " + std::string(label));
+    if (ggmlTrellisBits(d.type)) {
+        // Re-read the extended payload through the segment path, then move it
+        // into the token table. Its coded rows are tile-coded, not independent
+        // native rows, but Embedding dispatches the trellis gather by this flag.
+        ops::QuantizedSegment segment = segmentFromDescriptor(file, d, label);
+        ops::NativeRows rows(segment.trellisData->codes, ops::QuantizedSegment::kTrellisBase + segment.trellisData->bits);
+        rows.trellis = std::move(segment.trellisData);
+        return {outputSize, inputSize, std::move(rows)};
+    }
     const uint32_t format = gguf_format_of(d.type);
     if (format == GGUF_FMT_COUNT ||
         d.plane0Bytes != d.outputSize * ggufRowBytes(kQuantFormats[format], d.inputSize))

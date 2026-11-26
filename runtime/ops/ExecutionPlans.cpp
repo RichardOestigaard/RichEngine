@@ -116,8 +116,11 @@ MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phas
     const MoeGgufTile tile = moeGgufTile(policy_, shape);
     if (prefill) config.expertTile = moeGgufPrefillTile(shape, rows, tile);
     // RICHENGINE_MOE_DECODE_M32: wide decode batches take the 32-row tile so
-    // an expert's weights stream once per 32 of its rows, not per 8.
-    else if (!canvas && tile == MoeGgufTile::Staged && tuning().moeDecodeM32)
+    // an expert's weights stream once per 32 of its rows, not per 8. Bolt's
+    // wide latent-MoE geometry takes it by default; the envvar still opts
+    // narrower latent shapes and full-width experts in for A/Bs.
+    else if (!canvas && tile == MoeGgufTile::Staged &&
+             (tuning().moeDecodeM32 || (shape.latentSize && shape.wideExperts())))
       config.expertTile = MoeExpertTile::M32;
     config.ggufTile = tile;
     // Live-tile indirect dispatch (RICHENGINE_MOE_INDIRECT_DISPATCH=auto):

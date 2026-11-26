@@ -190,17 +190,36 @@ namespace richengine::model {
           !policies[lane].penalties.active())
         treeMask |= uint32_t{1} << lane;
     }
+    ops::DraftLiLiCorrBuffers lilicorrBuffers;
+    const ops::DraftLiLiCorrBuffers *lilicorrSelection = nullptr;
+    if (geometry.draft.kind == DraftKind::LiLiCorr) {
+      const ops::EmbeddingWeights &embedding = targetModel.tokenEmbedding();
+      if (embedding.layout() == ops::WeightLayout::Block32) {
+        const ops::NativeRows &rows = embedding.blocks();
+        lilicorrBuffers.tokenEmbedding = rows.rows;
+        lilicorrBuffers.tokenEmbeddingFormat = rows.formatId;
+      }
+      lilicorrBuffers.finalHidden = d(DecodeTensor::DraftFinalHidden);
+      lilicorrBuffers.scratch =
+          decodeArena->packed(DecodeTensor::LiLiCorrScratch, lanes);
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        lilicorrBuffers.anchors[lane] = decodeArena->get(
+            laneEntry(entries, lane).stateLane, DecodeTensor::LiLiCorrAnchor);
+      lilicorrSelection = &lilicorrBuffers;
+    }
     std::visit([&](const auto &model) {
+      ops::DraftSelectorBuffers selectorBuffers{
+          d(DecodeTensor::Logits), d(DecodeTensor::TopPartialIds),
+          d(DecodeTensor::TopPartialValues), d(DecodeTensor::Candidates),
+          d(DecodeTensor::Unary), d(DecodeTensor::SelectorHidden),
+          d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
+          d(DecodeTensor::ProposalProbs), d(DecodeTensor::VerifyConfidence),
+          d(DecodeTensor::TreeNodes),
+          d(DecodeTensor::TreeTokens), d(DecodeTensor::TreeCounts),
+          d(DecodeTensor::DraftInputTokens)};
+      selectorBuffers.lilicorr = lilicorrSelection;
       model.addSelection(
-          graph,
-          {d(DecodeTensor::Logits), d(DecodeTensor::TopPartialIds),
-           d(DecodeTensor::TopPartialValues), d(DecodeTensor::Candidates),
-           d(DecodeTensor::Unary), d(DecodeTensor::SelectorHidden),
-           d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
-           d(DecodeTensor::ProposalProbs), d(DecodeTensor::VerifyConfidence),
-           d(DecodeTensor::TreeNodes),
-           d(DecodeTensor::TreeTokens), d(DecodeTensor::TreeCounts),
-           d(DecodeTensor::DraftInputTokens)},
+          graph, selectorBuffers,
           std::span(anchors).first(lanes), std::span(policies).first(lanes),
           treeMask);
     }, draftModel);
@@ -313,6 +332,7 @@ namespace richengine::model {
               std::chrono::duration<double, std::milli>(p2 - p1).count());
     }
     predraft.submitted = true;
+    ++counters.gpuPredraftsArmed;
     gpuPredraft_ = std::move(predraft);
   }
 
@@ -389,12 +409,18 @@ namespace richengine::model {
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.retainedCounts = d(DecodeTensor::RetainedCount);
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
-    if (geometry.draft.kind == DraftKind::Mtp) {
+    if (geometry.draft.kind == DraftKind::Mtp ||
+        geometry.draft.kind == DraftKind::LiLiCorr) {
       // The MTP commit's verify output tokens, anchors and row scratch.
+      // LiLiCorr reuses the anchor slots for its raw target-hidden ring row.
       buffers.outputTokens = d(DecodeTensor::OutputTokens);
+      const DecodeTensor anchorTensor =
+          geometry.draft.kind == DraftKind::LiLiCorr
+              ? DecodeTensor::LiLiCorrAnchor
+              : DecodeTensor::MtpAnchor;
       for (uint32_t lane = 0; lane < lanes; ++lane)
         buffers.mtpAnchors[lane] = decodeArena->get(
-            laneEntry(entries, lane).stateLane, DecodeTensor::MtpAnchor);
+            laneEntry(entries, lane).stateLane, anchorTensor);
       // The commit's projections stage lanes×verifyRows rows to the
       // GGUF decode tile (LinearGguf.cpp stagedTileRows): bind the slots
       // the staged plan covers, which a three-lane batch under-packs.
@@ -450,6 +476,14 @@ namespace richengine::model {
         entries.empty() || entries.size() > kLaneCount)
       return;
     const uint32_t width = static_cast<uint32_t>(entries.size());
+    if (ngramSkipsGpuPredraft(entries, width)) {
+      gpuPredraftSuppressedEpoch_ = arenaEpoch_;
+      ++counters.gpuPredraftsSuppressed;
+      if (draftDebug_)
+        fprintf(stderr, "chained predraft suppressed lanes=%u\n", width);
+      return;
+    }
+    gpuPredraftSuppressedEpoch_ = 0;
     GpuPredraft predraft;
     for (uint32_t lane = 0; lane < width; ++lane) {
       const Request &entry = *entries[lane];
@@ -495,6 +529,7 @@ namespace richengine::model {
     predraft.epoch = arenaEpoch_;
     predraft.lanes = width;
     predraft.chained = true;
+    ++counters.gpuPredraftsArmed;
     gpuPredraft_ = std::move(predraft);
     if (draftDebug_)
       fprintf(stderr, "chained predraft armed lanes=%u\n", width);
@@ -503,7 +538,24 @@ namespace richengine::model {
   void Runtime::Impl::completeGpuPredraft(
       std::span<const DecodeLaneResult> lanes,
       std::span<const ModelBatchItem> items) {
+    if (gpuPredraftSuppressedEpoch_) {
+      const bool suppressedThisCycle =
+          gpuPredraftSuppressedEpoch_ == arenaEpoch_;
+      gpuPredraftSuppressedEpoch_ = 0;
+      if (suppressedThisCycle)
+        return;
+    }
     if (!gpuPredraft_.chained) {
+      std::array<Request *, kLaneCount> entries{};
+      const uint32_t width = static_cast<uint32_t>(lanes.size());
+      if (width <= kLaneCount) {
+        for (uint32_t lane = 0; lane < width; ++lane)
+          entries[lane] = lanes[lane].request;
+        if (ngramSkipsGpuPredraft({entries.data(), width}, width)) {
+          ++counters.gpuPredraftsSuppressed;
+          return;
+        }
+      }
       launchDraftPredraft(lanes, items);
       return;
     }

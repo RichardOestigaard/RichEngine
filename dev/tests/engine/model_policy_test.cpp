@@ -33,7 +33,9 @@ int main() {
         "RICHENGINE_PROPOSAL_CAP", "RICHENGINE_CANVAS_PROFILE",
         "RICHENGINE_ADAPTIVE_PROPOSALS", "RICHENGINE_NGRAM_PREDRAFT",
         "RICHENGINE_DRAFT_BYPASS_EXPECT", "RICHENGINE_NGRAM_DRAFT_EXPECT",
-        "RICHENGINE_NGRAM_WARMUP", "RICHENGINE_NGRAM_TREE_MIN"})
+        "RICHENGINE_NGRAM_WARMUP", "RICHENGINE_NGRAM_TREE_MIN",
+        "RICHENGINE_NGRAM_GPU_MIX", "RICHENGINE_NGRAM_GPU_MIX_MIN_WIDTH",
+        "RICHENGINE_NGRAM_MIX_CORPUS_ONLY"})
     unsetenv(name);
 
   ModelTuning maker;
@@ -47,6 +49,9 @@ int main() {
   maker.ngramWarmup = 32;
   maker.proposalCap = 5;
   maker.canvasProfile = "fast";
+  maker.ngramGpuMix = true;
+  maker.ngramGpuMixMinWidth = 2;
+  maker.ngramMixCorpusOnly = true;
 
   const auto resolved = resolveModelPolicy(maker);
   require(resolved.moeUnionCap == 7, "env RICHENGINE_MOE_UNION lost to the maker");
@@ -60,6 +65,11 @@ int main() {
   require(resolved.proposalCap && *resolved.proposalCap == 5,
           "maker proposalCap did not apply");
   require(resolved.canvasProfile == "fast", "maker canvasProfile did not apply");
+  require(resolved.ngramGpuMix, "maker ngramGpuMix did not apply");
+  require(resolved.ngramGpuMixMinWidth == 2,
+          "maker ngramGpuMixMinWidth did not apply");
+  require(resolved.ngramMixCorpusOnly,
+          "maker ngramMixCorpusOnly did not apply");
   // The resolved profile derives the bundled knobs the env leaves unset.
   require(resolved.canvasExitStable == 0.6F,
           "fast profile did not derive canvasExitStable");
@@ -90,6 +100,12 @@ int main() {
           "model swap leaked the previous model's ngramPredraft");
   require(!modelPolicy().proposalCap,
           "model swap leaked the previous model's proposalCap");
+  require(!modelPolicy().ngramGpuMix,
+          "model swap leaked the previous model's ngramGpuMix");
+  require(modelPolicy().ngramGpuMixMinWidth == 1,
+          "model swap leaked the previous model's ngramGpuMixMinWidth");
+  require(!modelPolicy().ngramMixCorpusOnly,
+          "model swap leaked the previous model's ngramMixCorpusOnly");
 
   std::cout << "model_policy_test: ok\n";
   return 0;

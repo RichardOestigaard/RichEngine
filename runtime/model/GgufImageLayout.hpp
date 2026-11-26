@@ -38,6 +38,19 @@ struct GgufTensorDescriptor {
 static_assert(sizeof(GgufTensorDescriptor) == 64 && std::endian::native == std::endian::little,
               "a GGUF tensor descriptor is 64 little-endian bytes");
 
+// A trellis tensor's extended descriptor, immediately after its
+// GgufTensorDescriptor. Payload sections follow in codes, scales, pre, post,
+// pin and pout order; absent gathers state zero bytes and occupy no section.
+struct GgufTrellisDescriptor {
+  uint32_t bits;
+  uint32_t inputBlock;
+  uint32_t outputBlock;
+  uint32_t flags; // bit 0 pin, bit 1 pout, bit 2 vocabulary scatter
+  uint64_t codesBytes, scalesBytes, preBytes, postBytes, pinBytes, poutBytes;
+};
+static_assert(sizeof(GgufTrellisDescriptor) == 64 && std::endian::native == std::endian::little,
+              "a GGUF trellis descriptor is 64 little-endian bytes");
+
 struct GgufPlaneBytes {
   uint64_t plane0, plane1, meta;
 };

@@ -22,11 +22,11 @@ inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uch
                     uint simd_lane, uint simd_group, uint out_stride, uint out_offset, device bfloat *aux = nullptr) {
   const bool owns_rows = simd_group * RowsPerSG < rows;   // uniform per simdgroup
   device bfloat *rows_input = input + ulong(simd_group) * RowsPerSG * input_size;
-  auto acc = staged_accumulator<RowsPerSG, TileN, KS>(rows_input, input_size, stage);
+  auto acc = staged_accumulator<RowsPerSG, TileN, KS, true>(rows_input, input_size, stage);
   gguf_zero(acc);
-  gguf_staged_steps<F, RowsPerSG, TileN, KS, Simdgroups * 32>(rows_input, w0, w1, meta, input_size, output_origin, stage, tl,
-                                                              simd_group * 32 + simd_lane, 0, input_size / KS, 0, owns_rows,
-                                                              acc);
+  gguf_staged_steps<F, RowsPerSG, TileN, KS, Simdgroups * 32, true>(rows_input, w0, w1, meta, input_size, output_origin, stage, tl,
+                                                                    simd_group * 32 + simd_lane, 0, input_size / KS, 0, owns_rows,
+                                                                    acc);
   if (!owns_rows) return;
 #pragma unroll
   for (ushort i = 0; i < acc.get_capacity(); ++i) {
@@ -99,7 +99,8 @@ using GgufDecodeKernel = void(device bfloat *, device uchar *, device uchar *, d
 #define GGUF_DECODE_FORMAT(F, f)                                                                                  \
   GGUF_DECODE_ROWS64(F, f, a, EpNone) GGUF_DECODE_ROWS(F, f, a_f32, EpNone, float)                                \
   GGUF_DECODE(F, f, 64, a_f32, EpNone, float)                                                                     \
-  GGUF_DECODE_ROWS64(F, f, r, EpResidual) GGUF_DECODE_ROWS64(F, f, g, EpUpWithGate)
+  GGUF_DECODE_ROWS64(F, f, r, EpResidual) GGUF_DECODE_ROWS64(F, f, g, EpUpWithGate)                               \
+  GGUF_DECODE_ROWS64(F, f, q, EpReluSquared)
 QUANT_FORMATS(GGUF_DECODE_FORMAT)
 // The fused greedy head: the staged decode with an argmax tail instead of
 // logits stores — one partial per (row, GGUF_TILE_COLUMNS tile), reduced by
@@ -536,7 +537,8 @@ GGUF_DECODE_FUSED(8, _n, true) GGUF_DECODE_FUSED(16, _n, true) GGUF_DECODE_FUSED
                                              p.out_stride, p.out_offset, aux + ulong(first) * p.out_stride);       \
   }
 #define GGUF_PREFILL_FORMAT(F, f) \
-  GGUF_PREFILL(F, f) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual) GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate)
+  GGUF_PREFILL(F, f) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual) GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate) \
+  GGUF_PREFILL_EPILOGUE(F, f, q, EpReluSquared)
 QUANT_FORMATS(GGUF_PREFILL_FORMAT)
 GGUF_PREFILL_FORMAT(FmtMXFP4N, mxfp4n)
 #undef GGUF_PREFILL_FORMAT

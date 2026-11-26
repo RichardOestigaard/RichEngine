@@ -5,6 +5,7 @@
 #include "model/NullDraft.hpp"
 #include "model/DraftCheckpoint.hpp"
 #include "model/GgufTarget.hpp"
+#include "model/LiLiCorrGgufDraft.hpp"
 #include "model/MaxwellMtpDraft.hpp"
 #include "model/NemotronMtpDraft.hpp"
 #include "model/ModelRegistry.hpp"
@@ -77,6 +78,7 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
   const bool dflashV1Draft = result.descriptor.draft.kind == DraftKind::DFlashV1;
   const bool dsparkDraft = result.descriptor.draft.kind == DraftKind::DSpark;
   const bool dspineDraft = result.descriptor.draft.kind == DraftKind::DSpline;
+  const bool lilicorrDraft = result.descriptor.draft.kind == DraftKind::LiLiCorr;
   const bool mtpDraft = result.descriptor.draft.kind == DraftKind::Mtp;
   // Maxwell's MTP reads its block out of the target GGUF; nemotron's is a
   // checkpoint dir like the other drafts.
@@ -90,7 +92,7 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
   std::optional<DSparkCheckpointLoader> dsparkDraftLoader;
   std::optional<DSplineCheckpointLoader> dspineDraftLoader;
   std::optional<NemotronMtpCheckpointLoader> nemotronMtpDraftLoader;
-  if (result.descriptor.draftFromCheckpoint() && !nullDraft &&
+  if (result.descriptor.draftFromCheckpoint() && !nullDraft && !lilicorrDraft &&
       !(mtpDraft && !nemotronMtpDraft)) {
     if (nemotronMtpDraft)
       nemotronMtpDraftLoader.emplace(images, root / "draft",
@@ -206,6 +208,9 @@ ModelPackage loadModelPackage(metal::MetalBackend &backend,
             ? DSplineDraftFiles(std::ref(*dspineDraftLoader))
             : DSplineDraftFiles(PackedDSplineDraftFiles{images, root / "draft", result.descriptor.draft}),
         result.descriptor.draft, &head);
+  } else if (lilicorrDraft) {
+    result.draft = loadLiLiCorrGgufDraftWeights(
+        backend, images, root / "draft", result.descriptor.draft);
   } else if (mtpDraft) {
     if (nemotronMtpDraft) {
       result.draft = loadNemotronMtpDraftWeights(
@@ -260,6 +265,8 @@ VisionLoaderPlan planVisionLoader(const std::filesystem::path &root, const Model
     return std::monostate{};
   if (descriptor.visionTower == VisionTower::Lfm3Vl)
     return std::make_unique<LfmVisionLoader>(root / "vision", descriptor.lfmVision);
+  if (descriptor.visionTower == VisionTower::NemotronOmni)
+    return std::make_unique<NemotronVisionLoader>(root / "vision", descriptor.nemotronVision);
   return std::make_unique<VisionLoader>(root / "vision", descriptor.visionSource, descriptor.vision);
 }
 
@@ -270,6 +277,8 @@ VisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &imag
     return loadQwenVisionWeights(backend, images, **qwen);
   if (const auto *lfm = std::get_if<std::unique_ptr<LfmVisionLoader>>(&loader))
     return loadLfmVisionWeights(backend, images, **lfm);
+  if (const auto *nemotron = std::get_if<std::unique_ptr<NemotronVisionLoader>>(&loader))
+    return loadNemotronVisionWeights(backend, images, **nemotron);
   if (descriptor.visionSource == VisionSource::Packed)
     return loadQwenVisionWeights(backend, images, root / "vision", descriptor.vision);
   return QwenVisionWeights{};
@@ -329,7 +338,9 @@ uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescript
       }
     }
   }
-  if (descriptor.draftFromCheckpoint() &&
+  if (descriptor.draft.kind == DraftKind::LiLiCorr) {
+    bytes += liLiCorrGgufDraftImageBytes(root / "draft", descriptor.draft);
+  } else if (descriptor.draftFromCheckpoint() &&
       descriptor.draft.kind != DraftKind::Null &&
       descriptor.draft.kind != DraftKind::Mtp) {
     auto draftImagesFor = [&descriptor] {
@@ -364,7 +375,9 @@ uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescript
   if (descriptor.visionSource == VisionSource::Mlx || descriptor.visionSource == VisionSource::Gguf)
     bytes += descriptor.visionTower == VisionTower::Lfm3Vl
                  ? lfmVisionImageBytes(descriptor.lfmVision)
-                 : visionImageBytes(descriptor.vision);
+                 : descriptor.visionTower == VisionTower::NemotronOmni
+                       ? nemotronVisionImageBytes(descriptor.nemotronVision)
+                       : visionImageBytes(descriptor.vision);
   if (descriptor.audioSource == AudioSource::Gguf)
     bytes += lfmAudioImageBytes(descriptor.lfmAudio);
   if (descriptor.speechSource == SpeechSource::Gguf)

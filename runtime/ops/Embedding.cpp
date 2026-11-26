@@ -6,6 +6,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/Sampling.h"
+#include "metal/abi/Trellis.h"
 #include "ops/KernelNames.hpp"
 
 #include <algorithm>
@@ -13,16 +14,20 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <cmath>
 
 namespace richengine::ops {
 
 NativeRows::NativeRows(metal::MetalBuffer rows, uint32_t formatId) : rows(std::move(rows)), formatId(formatId) {
   if (!gguf_embedding_format(formatId) && !oq_embedding_format(formatId) &&
-      formatId != QuantizedSegment::kFloat32)
+      formatId != QuantizedSegment::kFloat32 &&
+      (formatId < QuantizedSegment::kTrellisBase + 2 || formatId > QuantizedSegment::kTrellisBase + 6))
     throw std::invalid_argument("unsupported native embedding format");
 }
 const char *NativeRows::name() const noexcept {
-  return formatId == QuantizedSegment::kFloat32 ? "f32" : kQuantFormats[formatId].name;
+  return formatId == QuantizedSegment::kFloat32 ? "f32"
+       : formatId >= QuantizedSegment::kTrellisBase ? "trellis"
+       : kQuantFormats[formatId].name;
 }
 
 void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
@@ -36,6 +41,17 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
     throw std::invalid_argument("embedding buffers are smaller than the gathered rows");
   if (table.layout() == WeightLayout::Block32) {
     const NativeRows &native = table.blocks();
+    if (native.trellis) {
+      const TrellisWeight &t = *native.trellis;
+      if (t.hasPin || t.hasPout || t.bits < 2 || t.bits > 6)
+        throw std::invalid_argument("unsupported trellis token table");
+      graph.add("trellis_embedding_" + std::to_string(t.bits),
+                {std::move(tokens), t.codes, t.scales, t.pre, t.post, std::move(output)},
+                TrellisEmbeddingParams{rows, table.inputSize, t.inputBlock,
+                                       t.inputBlock > 1 ? 1.0f / std::sqrt(float(t.inputBlock)) : 1.0f},
+                {rows, 1, 1}, {256, 1, 1});
+      return;
+    }
     const GgufEmbedParams params{rows, table.outputSize, table.inputSize};
     if (table.rotation) {
       // One threadgroup per rotation block of a row, which gathers the block

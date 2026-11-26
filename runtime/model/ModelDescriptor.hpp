@@ -6,6 +6,7 @@
 #include "ModelTuning.hpp"
 #include "ops/Vision.hpp"
 #include "ops/LfmVision.hpp"
+#include "ops/NemotronVision.hpp"
 #include "ops/LfmAudioEnc.hpp"
 
 #include <cstdint>
@@ -27,8 +28,9 @@ enum class AudioSource : uint8_t { Gguf, None };
 enum class SpeechSource : uint8_t { Gguf, None };
 // Which tower a vision-capable model serves: the Qwen3.5 tower (its
 // vision_config's projector_type "qwen3vl_merger", or absent on records
-// that predate the field) or LFM3-VL ("lfm3vl", GGUF mmproj only).
-enum class VisionTower : uint8_t { QwenVl, Lfm3Vl };
+// that predate the field), LFM3-VL ("lfm3vl", GGUF mmproj only)
+// or Nemotron Omni ("nemotron_omni", GGUF mmproj only).
+enum class VisionTower : uint8_t { QwenVl, Lfm3Vl, NemotronOmni };
 
 // Package metadata validated before weight buffers are loaded. The engine
 // consumes capabilities; model loading consumes the concrete layouts.
@@ -44,6 +46,8 @@ struct ModelDescriptor final {
   // The LFM3-VL tower's geometry when visionTower is Lfm3Vl; vision stays
   // the Qwen tower's (zeroed but for its projection width otherwise).
   ops::LfmVisionLayout lfmVision;
+  // The Nemotron Omni tower's geometry when visionTower is NemotronOmni.
+  ops::NemotronVisionLayout nemotronVision;
   // The lfm3a audio encoder's geometry when the record's config carries an
   // audio_config; zeroed otherwise.
   ops::LfmAudioLayout lfmAudio;

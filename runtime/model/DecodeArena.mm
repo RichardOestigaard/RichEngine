@@ -1,6 +1,7 @@
 #include "model/DecodeArena.hpp"
 
 #include "metal/abi/Dfa.h"
+#include "metal/abi/LiLiCorr.h"
 #include "ops/DraftSelector.hpp"
 #include "ops/Sampling.hpp"
 
@@ -23,10 +24,12 @@ static uint64_t gdnDecayStride(const RuntimeGeometry &geometry) noexcept {
   return bytesFor<float>(uint64_t{kDecodeRows} * values);
 }
 static uint64_t gdnBetaStride(const RuntimeGeometry &geometry) noexcept {
-  const uint32_t values = geometry.target.gdnValueHeads
-                              ? geometry.target.gdnValueHeads
-                              : geometry.target.mambaHeads;
-  return bytesFor<uint16_t>(uint64_t{kDecodeRows} * values);
+  // Mamba-2 reuses the otherwise unused beta scratch for the split scan's
+  // per-row fp32 decays; GDN's beta itself is bf16.
+  if (!geometry.target.gdnValueHeads)
+    return bytesFor<float>(uint64_t{kDecodeRows} * geometry.target.mambaHeads);
+  return bytesFor<uint16_t>(uint64_t{kDecodeRows} *
+                            geometry.target.gdnValueHeads);
 }
 static uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept {
   // The layer slab covers the wider of the target's two KV geometries.
@@ -220,6 +223,11 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::MoeLatentRows, latentBytes);
   put(DecodeTensor::MoeLatentOutput, latentBytes);
   put(DecodeTensor::MoeZeroLatent, latentBytes);
+  if (geometry.draft.kind == DraftKind::LiLiCorr) {
+    put(DecodeTensor::LiLiCorrScratch, LILICORR_SCRATCH_STRIDE);
+    put(DecodeTensor::LiLiCorrAnchor,
+        bytesFor<uint16_t>(geometry.draft.hiddenSize));
+  }
   put(DecodeTensor::PageTable, bytesFor<RichKvPage>(kMaximumPageTableEntries));
   put(DecodeTensor::IndexTable,
       geometry.target.kvLayout.indexDimension

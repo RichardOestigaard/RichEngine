@@ -202,12 +202,12 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
         [&] {
           const double before = modelRuntime.telemetry().totalPrefillGpuSeconds;
           model::WarmupStepResult result = modelRuntime.warmupPrefill(
-              model::ExecutionLimits::prefillTokenBudget);
+              modelRuntime.maximumPrefillWarmupRows());
           mostRowsMilliseconds =
               1000.0 * (modelRuntime.telemetry().totalPrefillGpuSeconds - before);
           return result;
         });
-    nativeLoop.observePrefill(model::ExecutionLimits::prefillTokenBudget,
+    nativeLoop.observePrefill(modelRuntime.maximumPrefillWarmupRows(),
                              maximumPrefill.wallSeconds * 1000.0);
     report.warmup.maximumPrefillDetail = maximumPrefill.detail;
     const auto &budget = memoryPlan.breakdown();

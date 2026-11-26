@@ -78,7 +78,7 @@ private:
 // gated adjacent writes of each position's predicted feature into its
 // successor; the bridge writes run as the dspline_bridge_* kernels between
 // the plain layers, the serial last-write refinement stays deferred).
-enum class DraftKind : uint8_t { DFlashTwo, DFlashV1, DSpark, DSpline, Mtp, NemotronMtp, Null };
+enum class DraftKind : uint8_t { DFlashTwo, DFlashV1, DSpark, DSpline, Mtp, NemotronMtp, LiLiCorr, Null };
 
 // The kind's user-facing name; Null reads "none" since the n-gram predraft
 // still proposes for a draft-less family.
@@ -90,6 +90,7 @@ inline constexpr std::string_view draftKindName(DraftKind kind) {
   case DraftKind::DSpline: return "DSpline";
   case DraftKind::Mtp: return "MTP";
   case DraftKind::NemotronMtp: return "Nemotron MTP";
+  case DraftKind::LiLiCorr: return "LiLiCorr";
   default: return "none";
   }
 }
@@ -319,12 +320,13 @@ struct DFlashPrefillSpan final {
   uint32_t rows = 0;
   uint32_t startPosition = 0;
   std::span<const DFlashDraftRingLayer> ring;
-  // MaxwellMtpDraft only: the span's first captured row's input row (its
-  // prompt tokens sit at inputRow + i), the sequence's packed input row
-  // end (the last row's rolled token is past it), and — on the span that
-  // covers the sequence tail — the compact row whose streams anchor the
-  // first decode plus that state lane's anchor buffer. anchorRow of ~0u
-  // marks a non-tail span.
+  // inputRow and inputEnd are MaxwellMtpDraft only: the span's first
+  // captured row's input row (its prompt tokens sit at inputRow + i) and
+  // the sequence's packed input row end (the last row's rolled token is
+  // past it). anchorRow and anchor are the MTP drafts' and LiLiCorr's:
+  // on the span that covers the sequence tail, the compact row whose
+  // hidden state anchors the first decode plus that state lane's anchor
+  // buffer. anchorRow of ~0u marks a non-tail span.
   uint32_t inputRow = 0;
   uint32_t inputEnd = 0;
   uint32_t anchorRow = ~0u;

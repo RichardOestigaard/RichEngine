@@ -35,12 +35,70 @@ struct DFlashDraftLayerWeights final {
   metal::MetalBuffer queryNorm;
   metal::MetalBuffer keyNorm;
   ops::Projection outputProjection;
+  // Per-query-head attention-sink logits, empty for DFlash2 checkpoints that
+  // do not train them; LiLiCorr does.
+  metal::MetalBuffer attentionSinks;
   ops::NormWeights postAttentionNorm;
   metal::MetalBuffer mlpConvolution;
   ops::Projection mlpDynamic;
   ops::Projection gateProjection;
   ops::Projection upProjection;
   ops::Projection downProjection;
+};
+
+// LiLiCorr's scorer tensors, kept in their GGUF row order. The f32 matrices
+// are raw fp32 rows; the nvfp4 matrices are raw block_nvfp4 rows and carry
+// their tensor-global scale separately.
+struct LiLiCorrScorerLayerWeights final {
+  metal::MetalBuffer attentionNorm;
+  metal::MetalBuffer attentionIn;
+  metal::MetalBuffer attentionInBias;
+  metal::MetalBuffer attentionOut;
+  metal::MetalBuffer attentionOutBias;
+  metal::MetalBuffer mlpNorm;
+  metal::MetalBuffer mlpUp;
+  metal::MetalBuffer mlpUpBias;
+  metal::MetalBuffer mlpDown;
+  metal::MetalBuffer mlpDownBias;
+  float attentionOutScale = 1.0F;
+  float mlpUpScale = 1.0F;
+  float mlpDownScale = 1.0F;
+};
+
+struct LiLiCorrScorerWeights final {
+  metal::MetalBuffer tokenProjection;
+  metal::MetalBuffer tokenBias;
+  metal::MetalBuffer passProjection;
+  metal::MetalBuffer passBias;
+  metal::MetalBuffer contextProjection;
+  metal::MetalBuffer contextBias;
+  metal::MetalBuffer featureNorm;
+  metal::MetalBuffer featureNormBias;
+  metal::MetalBuffer featureUp;
+  metal::MetalBuffer featureUpBias;
+  metal::MetalBuffer featureDown;
+  metal::MetalBuffer featureDownBias;
+  metal::MetalBuffer slotEmbedding;
+  metal::MetalBuffer rankEmbedding;
+  metal::MetalBuffer attentionBias;
+  metal::MetalBuffer outputNorm;
+  metal::MetalBuffer anchorNorm;
+  metal::MetalBuffer factorInput;
+  metal::MetalBuffer factorInputBias;
+  metal::MetalBuffer outHead;
+  metal::MetalBuffer outHeadBias;
+  metal::MetalBuffer inHead;
+  metal::MetalBuffer inHeadBias;
+  metal::MetalBuffer anchorOutHead;
+  metal::MetalBuffer anchorOutHeadBias;
+  std::vector<LiLiCorrScorerLayerWeights> layers;
+  float tokenScale = 1.0F;
+  float passScale = 1.0F;
+  float contextScale = 1.0F;
+  float vectorEpsilon = 1e-4F;
+  float logitScale = 8.0F;
+  float rmsEpsilon = 1e-6F;
+  bool present = false;
 };
 
 struct DFlashDraftWeights final {
@@ -52,6 +110,7 @@ struct DFlashDraftWeights final {
   ops::Projection selectorProjection;
   metal::MetalBuffer predecessorCodebook;
   metal::MetalBuffer successorCodebook;
+  LiLiCorrScorerWeights lilicorr;
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
 };

@@ -737,7 +737,8 @@ void TargetModel::addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden,
 }
 
 metal::MetalBuffer TargetModel::addPrefillMixer(PrefillStep &step, const AttentionMixerWeights &mixer,
-                                               const ops::NormWeights &norm, metal::MetalBuffer input) const {
+                                               const ops::NormWeights &norm, metal::MetalBuffer input,
+                                               metal::MetalBuffer destination) const {
   const TargetModelPrefillBuffers &b = step.buffers;
   const uint32_t layer = step.attentionLayer++;
   addPrefillNorm(step, input, norm, mixer.inputProjection.layout());
@@ -823,8 +824,9 @@ metal::MetalBuffer TargetModel::addPrefillMixer(PrefillStep &step, const Attenti
       }
     }
   }
-  addPrefillOutput(step, b.attentionHidden, mixer.outputProjection, input, b.attentionOutput);
-  return b.attentionOutput;
+  const metal::MetalBuffer output = destination ? destination : b.attentionOutput;
+  addPrefillOutput(step, b.attentionHidden, mixer.outputProjection, input, output);
+  return output;
 }
 
 // The layer's FFN: the dense triple (on `step.aneFfn` when the split takes
@@ -990,7 +992,8 @@ void TargetModel::addVerify(
 }
 
 metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const AttentionMixerWeights &mixer,
-                                              const ops::NormWeights &norm, metal::MetalBuffer input) const {
+                                              const ops::NormWeights &norm, metal::MetalBuffer input,
+                                              metal::MetalBuffer destination) const {
   const TargetModelVerifyBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.attentionLayer++;
@@ -1051,12 +1054,13 @@ metal::MetalBuffer TargetModel::addVerifyMixer(VerifyStep &step, const Attention
         geometry_.kvLayout, step.lanes, b.linearScratch, outputPlan.input(),
         geometry_.attentionQueryGate, step.rowCapacity);
   }
+  const metal::MetalBuffer output = destination ? destination : b.attentionOutput;
   linear.add(step.graph,
-             {.input = b.attentionHidden, .output = b.attentionOutput, .residual = input,
+             {.input = b.attentionHidden, .output = output, .residual = input,
               .scratch = b.linearScratch, .prepared = hidden},
              mixer.outputProjection, outputPlan);
   step.graph.endBakedSpan();
-  return b.attentionOutput;
+  return output;
 }
 
 void TargetModel::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &norm,

@@ -67,6 +67,7 @@ class Metadata:
         each tensor's type."""
         self.values = {}
         self.tensors = {}
+        self.tensor_dims = {}
         self.consumed = 0
         with (
             Path(source).open("rb")
@@ -89,12 +90,13 @@ class Metadata:
                 dimensions = self.scalar("I")
                 if dimensions > self.MAX_DIMENSIONS:
                     raise ModelError("invalid GGUF tensor rank: " + name)
-                self.read(dimensions * struct.calcsize("<Q"))  # Its extents.
+                extents = struct.unpack("<" + "Q" * dimensions, self.read(dimensions * 8))
                 kind = self.scalar("I")
                 self.scalar("Q")  # Data offset; the payload is never read here.
                 if name in self.tensors:
                     raise ModelError("duplicate GGUF tensor: " + name)
                 self.tensors[name] = kind
+                self.tensor_dims[name] = extents
 
     def read(self, size):
         if size > self.MAX_BYTES - self.consumed:
@@ -951,6 +953,8 @@ def vision_config(vision):
     )
     if projector == "lfm3vl":
         return _lfm3vl_vision_config(vision)
+    if projector == "nemotron_omni":
+        return _nemotron_omni_vision_config(vision)
     if (
         projector != "qwen3vl_merger"
         or vision.require("clip.use_gelu", bool) is not True
@@ -1030,6 +1034,48 @@ def _lfm3vl_vision_config(vision):
     return result
 
 
+def _nemotron_omni_vision_config(vision):
+    """Nemotron Omni's clip section: a 32-block C-RADIO ViT with ten register
+    tokens, a learned 128x128 position table, biased attention and GELU(erf)
+    FFNs, then a 2x2 pixel-unshuffle and RMSNorm + relu-squared projector."""
+    if (
+        vision.require("clip.use_gelu", bool) is not True
+        or vision.require("clip.vision.nemotron_omni", bool) is not True
+        or vision.positive("clip.vision.projector.scale_factor") != 2
+    ):
+        raise ModelError("unsupported GGUF vision architecture")
+    epsilon = vision.require("clip.vision.attention.layer_norm_epsilon", float)
+    if abs(epsilon - 1e-6) > 1e-12:
+        raise ModelError("unsupported GGUF vision norm epsilon")
+    fields = {
+        "depth": "block_count",
+        "hidden_size": "embedding_length",
+        "num_heads": "attention.head_count",
+        "intermediate_size": "feed_forward_length",
+        "out_hidden_size": "projection_dim",
+        "patch_size": "patch_size",
+        "spatial_merge_size": "projector.scale_factor",
+    }
+    result = {
+        name: vision.positive("clip.vision." + key) for name, key in fields.items()
+    }
+    if result["hidden_size"] % result["num_heads"]:
+        raise ModelError("invalid GGUF vision head count")
+    merged = result["hidden_size"] * result["spatial_merge_size"] ** 2
+    result.update(
+        projector_type="nemotron_omni",
+        temporal_patch_size=1,
+        in_channels=3,
+        num_position_embeddings=128 * 128,
+        num_registers=10,
+        projector_hidden_size=4 * merged,
+        hidden_act="gelu_erf",
+        min_pixels=vision.positive("clip.vision.image_min_pixels"),
+        max_pixels=vision.positive("clip.vision.image_max_pixels"),
+    )
+    return result
+
+
 def processor_config(vision):
     config = vision_config(vision)
     return {
@@ -1068,6 +1114,13 @@ TENSOR_TYPES = {
     30: "BF16",
     39: "MXFP4",
     40: "NVFP4",
+    44: "TRL1",
+    45: "TRL2",
+    46: "TRL3",
+    47: "TRL4",
+    48: "TRL5",
+    49: "TRL6",
+    26: "I32",
     142: "PQ2_0",
 }
 QUANTIZED_TYPES = {
@@ -1091,6 +1144,11 @@ QUANTIZED_TYPES = {
     "MXFP4",
     "NVFP4",
     "PQ2_0",
+    "TRL2",
+    "TRL3",
+    "TRL4",
+    "TRL5",
+    "TRL6",
 }
 # The token rows the embedding kernels gather (gguf_embedding_format in
 # runtime/metal/abi/Gguf.h).
@@ -1107,6 +1165,11 @@ EMBEDDING_TYPES = {
     "IQ4_NL",
     "IQ4_XS",
     "PQ2_0",
+    "TRL2",
+    "TRL3",
+    "TRL4",
+    "TRL5",
+    "TRL6",
 }
 # The tensors the native loader reads from a target, and the types it accepts
 # for each (runtime/model/GgufImage.cpp): quantized projections; F32 norms,
@@ -1981,13 +2044,102 @@ def require_rotation(metadata):
         )
 
 
+def require_trellis(metadata):
+    """Validate the NariQ subset RichEngine implements.
+
+    Returns whether the GGUF is trellis-coded. The published Qwen3.8 NariQ
+    artifacts use TRL2-TRL6, 16x16 tiles, identity or block Sylvester
+    Hadamard sides, and a banded output head.
+    """
+    trl_types = {44, 45, 46, 47, 48, 49}
+    version = metadata.values.get("trellis.version")
+    if version is None:
+        if any(kind in trl_types for kind in metadata.tensors.values()):
+            raise ModelError("trellis-coded tensors require trellis metadata")
+        return False
+    if version != 1 or text_architecture(metadata) != "qwen35":
+        raise ModelError("this GGUF uses an unsupported trellis format")
+    if "trellis.embed_bands" in metadata.values:
+        raise ModelError("banded trellis embeddings are not supported")
+
+    coded = [name for name, kind in metadata.tensors.items() if kind in trl_types]
+    if not coded:
+        raise ModelError("trellis metadata names no supported coded tensors")
+    for name in sorted(coded):
+        dims = metadata.tensor_dims.get(name, ())
+        if len(dims) != 2 or dims[0] % 16 or dims[1] % 16:
+            raise ModelError("invalid trellis tensor shape: " + name)
+        inputs, outputs = dims
+        if metadata.tensors.get(name) == 44:
+            raise ModelError("TRL1 trellis tensors are not supported")
+        base = name[:-7] if name.endswith(".weight") else name
+        desc = metadata.values.get("trellis.desc." + base)
+        if not isinstance(desc, list) or len(desc) != 8 or not all(
+            type(value) is int for value in desc
+        ):
+            raise ModelError("missing or invalid trellis descriptor: " + name)
+        rows_kind, rows_block, rows_shards, cols_kind, cols_block, cols_shards, parts, part0 = desc
+        if rows_shards != 1 or cols_shards != 1 or parts != 1 or part0 != outputs:
+            raise ModelError("unsupported trellis transform partitioning: " + name)
+        for length, kind, block in (
+            (outputs, rows_kind, rows_block),
+            (inputs, cols_kind, cols_block),
+        ):
+            if kind == 0:
+                continue
+            if kind != 1 or block < 2 or block & (block - 1) or length % block:
+                raise ModelError("unsupported trellis transform: " + name)
+
+        required = (
+            (base + ".trellis_s16", 1, (inputs // 16,)),
+            (base + ".trellis_pre", 0, (inputs,)),
+            (base + ".trellis_post", 0, (outputs,)),
+        )
+        for side, kind, dims in required:
+            if metadata.tensors.get(side) != kind or metadata.tensor_dims.get(side) != dims:
+                raise ModelError("missing or invalid trellis side tensor: " + side)
+        for suffix, length in ((".trellis_pin", inputs), (".trellis_pout", outputs)):
+            side = base + suffix
+            if side in metadata.tensors and (
+                metadata.tensors[side] != 26 or metadata.tensor_dims.get(side) != (length,)
+            ):
+                raise ModelError("invalid trellis gather tensor: " + side)
+
+    embedding = metadata.values.get("trellis.desc.token_embd")
+    if embedding and embedding[0] != 0:
+        raise ModelError("rotated trellis embeddings are not supported")
+
+    bands = metadata.values.get("trellis.lm_head_bands")
+    if bands is not None:
+        embedding_dims = metadata.tensor_dims.get("token_embd.weight", ())
+        if len(embedding_dims) != 2:
+            raise ModelError("missing trellis token embedding")
+        vocab = embedding_dims[1]
+        if type(bands) is not int or not 1 <= bands <= 256:
+            raise ModelError("invalid trellis.lm_head_bands")
+        total = 0
+        for band in range(bands):
+            name = f"output.band{band:02d}.weight"
+            if name not in coded:
+                raise ModelError("missing trellis output band: " + name)
+            total += metadata.tensor_dims[name][1]
+        gather = "output.vocab_gather"
+        if total != vocab or metadata.tensors.get(gather) != 26 or metadata.tensor_dims.get(gather) != (vocab,):
+            raise ModelError("invalid trellis output vocabulary gather")
+    return True
+
+
 def require_loadable(metadata):
     """Reject a target the native loader cannot read, from its header alone,
     so an unusable file is never downloaded: every tensor it reads must be
     present, with a type it accepts for that tensor."""
     require_rotation(metadata)
+    trellis = require_trellis(metadata)
     unsupported = collections.Counter()
-    for name, types in loaded_tensors(metadata).items():
+    expected = loaded_tensors(metadata)
+    if trellis and "trellis.lm_head_bands" in metadata.values:
+        expected.pop("output.weight", None)
+    for name, types in expected.items():
         kind = metadata.tensors.get(name)
         found = "missing" if kind is None else TENSOR_TYPES.get(kind, f"type {kind}")
         if found not in types:

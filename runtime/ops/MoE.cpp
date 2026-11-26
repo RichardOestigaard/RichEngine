@@ -504,6 +504,11 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeBuffers &buffers,
                                       : std::string(kMoeExpertGgufSg);
     const std::string suffix =
         packed ? "_p" : plan.configuration().mxfp4Native ? "_n" : "";
+    const std::string precision =
+        !packed && !table16 && plan.phase() == MoePhase::Prefill &&
+                plan.tileRows() == 32
+            ? "_relaxed"
+            : "";
     // The split needs every segment on the packed tile: a segment it does
     // not serve runs whole-K on one partition while the rest exit early.
     const uint32_t splits =
@@ -513,7 +518,7 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeBuffers &buffers,
             ? kMoeExpertSplits
             : 1;
     const uint32_t columns = n / GGUF_TILE_COLUMNS;
-    dispatch(kernel + epilogue + suffix, std::move(bindings),
+    dispatch(kernel + epilogue + suffix + precision, std::move(bindings),
              MoeGgufExpertParams{k, n, geometry.experts, projection.routed.formatId,
                                  shared.formatId, splits, ggufTileMajor},
              ggufTileMajor ? metal::DispatchSize{tiles * splits, columns, 1}
@@ -544,7 +549,8 @@ void addGgufExperts(metal::CommandGraph &graph, const MoeBuffers &buffers,
       // agree on; down reads it back into expertOutput's shared rows.
       const uint32_t sharedInter = shape.sharedIntermediate();
       const std::string kernel =
-          std::string(kMoeSharedGgufM) + std::to_string(tileRows);
+          std::string(kMoeSharedGgufM) + std::to_string(tileRows) +
+          (plan.phase() == MoePhase::Prefill && tileRows == 32 ? "_relaxed" : "");
       const uint32_t sharedRowBlocks = (rows + tileRows - 1) / tileRows;
       const QuantizedSegment &up = weights.up.shared;
       const QuantizedSegment &down = weights.down.shared;

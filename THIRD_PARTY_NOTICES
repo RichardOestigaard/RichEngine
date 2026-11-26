@@ -5,10 +5,11 @@ The SemIf code in server/judgments.py carries its MIT notice in that file.
 
 llama.cpp (https://github.com/ggml-org/llama.cpp)
 
-The IQ4_NL and MXFP4 values and the IQ1, IQ2 and IQ3 grids in
-runtime/metal/abi/QuantTables.h are ggml's kvalues_iq4nl, kvalues_mxfp4,
-iq1s_grid_gpu, iq2xxs_grid, iq2xs_grid, iq2s_grid, iq3xxs_grid and iq3s_grid
-(ggml/src/ggml-common.h), and the GGUF decoding in
+dev/omni-reference/llamacpp mirrors llama.cpp's LFM3 multimodal reference
+files for development comparisons. The IQ4_NL and MXFP4 values and the IQ1,
+IQ2 and IQ3 grids in runtime/metal/abi/QuantTables.h are ggml's kvalues_iq4nl,
+kvalues_mxfp4, iq1s_grid_gpu, iq2xxs_grid, iq2xs_grid, iq2s_grid, iq3xxs_grid
+and iq3s_grid (ggml/src/ggml-common.h), and the GGUF decoding in
 runtime/metal/kernels/common/quant_formats.h and the GGUF kernels built on it
 follow ggml's Metal dequantize.h and mul_mm.metal. They are compiled into
 richengine.metallib. The tests' CPU reference,
@@ -36,3 +37,16 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+Hugging Face transformers / Liquid AI LFM3 reference code
+(https://github.com/huggingface/transformers)
+
+The Python files in dev/omni-reference/hf mirror the LFM3-Omni remote-code
+reference implementation for development comparisons. They are not compiled
+into the runtime. Each copied source file carries this notice:
+
+Copyright 2026 The HuggingFace Team. All rights reserved.
+
+Licensed under the Apache License, Version 2.0; see LICENSE. Model weights and
+other upstream model-repository assets remain under their own licenses.

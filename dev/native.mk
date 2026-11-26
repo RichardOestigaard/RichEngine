@@ -76,10 +76,12 @@ TEST_ANE_FFN_STARTUP := $(ENGINE_TEST_BUILD)/ane-ffn-startup
 TEST_ANE_PROGRAM_FAULTS := $(ENGINE_TEST_BUILD)/ane-program-faults
 TEST_GGUF_DEQUANT := $(ENGINE_TEST_BUILD)/gguf-dequant
 TEST_GGUF_ROTATION := $(ENGINE_TEST_BUILD)/gguf-rotation
+TEST_TRELLIS := $(ENGINE_TEST_BUILD)/trellis
 TEST_GGUF_MOE := $(ENGINE_TEST_BUILD)/gguf-moe
 TEST_GGUF_REFERENCE := $(ENGINE_TEST_BUILD)/gguf-reference
 TEST_GGUF_PLANNER := $(ENGINE_TEST_BUILD)/gguf-planner
 TEST_GGUF_PREPARATION := $(ENGINE_TEST_BUILD)/gguf-preparation
+TEST_GGUF_TRELLIS_IMAGE := $(ENGINE_TEST_BUILD)/gguf-trellis-image
 TEST_GGUF_DEQUANT_AIR := $(ENGINE_TEST_BUILD)/gguf-dequant.air
 TEST_GGUF_DEQUANT_LIB := $(ENGINE_TEST_BUILD)/gguf-dequant.metallib
 # The oQ (oMLX) format checks dispatch both production and dequant test
@@ -156,6 +158,9 @@ TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
 TEST_GDN_CHUNKED_BENCH := $(ENGINE_TEST_BUILD)/gdn-chunked-bench
 TEST_GGUF_PROJECTION_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-projection-benchmark
+TEST_GGUF_PREFILL_TILE_BENCH := $(ENGINE_TEST_BUILD)/gguf-prefill-tile-bench
+TEST_GGUF_PREFILL_TILE_AIR := $(ENGINE_TEST_BUILD)/gguf-prefill-tile-bench.air
+TEST_GGUF_PREFILL_TILE_LIB := $(ENGINE_TEST_BUILD)/gguf-prefill-tile-bench.metallib
 TEST_GGUF_MOE_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-moe-benchmark
 TEST_ANE_MOE_BENCHMARK := $(ENGINE_TEST_BUILD)/ane-moe-benchmark
 TEST_ANE_FORWARD_BENCHMARK := $(ENGINE_TEST_BUILD)/ane-forward-benchmark
@@ -264,8 +269,10 @@ TEST_METAL_TARGETS := $(TEST_AFFINE_PREPARATION) \
 	$(TEST_GGUF_DEQUANT) \
 	$(TEST_OQ_FORMATS) \
 	$(TEST_GGUF_ROTATION) \
+	$(TEST_TRELLIS) \
 	$(TEST_GGUF_MOE) \
 	$(TEST_GGUF_PREPARATION) \
+	$(TEST_GGUF_TRELLIS_IMAGE) \
 	$(TEST_LINEAR_TUNING) \
 	$(TEST_ATTENTION_PLAN) \
 	$(TEST_HD512_ATTENTION) \
@@ -320,7 +327,8 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_MET
 	$(TEST_MPP_ATTENTION_TEST) $(TEST_MPP_ATTENTION_AIR) $(TEST_MPP_ATTENTION_LIB) \
 	$(TEST_ACC16_PROBE_TEST) $(TEST_ACC16_PROBE_AIR) $(TEST_ACC16_PROBE_LIB) \
 	$(TEST_STAGE_BARRIER_TEST) $(TEST_STAGE_BARRIER_AIR) $(TEST_STAGE_BARRIER_LIB) \
-	$(TEST_MOE_PREFILL_BENCH) $(TEST_MOE_PREFILL_AIR) $(TEST_MOE_PREFILL_LIB)
+	$(TEST_MOE_PREFILL_BENCH) $(TEST_MOE_PREFILL_AIR) $(TEST_MOE_PREFILL_LIB) \
+	$(TEST_GGUF_PREFILL_TILE_BENCH) $(TEST_GGUF_PREFILL_TILE_AIR) $(TEST_GGUF_PREFILL_TILE_LIB)
 # Benchmarks and the tuning tool that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_Q4_PREFILL_PROFILE) $(TEST_Q4_DECODE_PROFILE) \
 	$(TEST_I8_PREFILL_AB) \
@@ -380,7 +388,7 @@ $(TEST_AFFINE_PREPARATION): dev/tests/engine/affine_preparation_test.mm $(ENGINE
 $(TEST_VISION_PREPARATION): dev/tests/engine/vision_preparation_test.cpp $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $< $(ENGINE_LIBRARY) $(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
 
-$(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp runtime/model/WeightSource.cpp \
+$(TEST_GGUF_FILE): dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp runtime/model/GgufTrellis.cpp runtime/model/WeightSource.cpp \
 		| $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) $(TEST_INPUTS) -o $@
 
@@ -416,6 +424,9 @@ $(TEST_GGUF_DEQUANT): dev/tests/engine/gguf_dequant_test.mm $(ENGINE_LIBRARY) | 
 $(TEST_GGUF_ROTATION): dev/tests/engine/gguf_rotation_test.mm $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
 
+$(TEST_TRELLIS): dev/tests/engine/trellis_test.mm $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
+
 $(TEST_GGUF_REFERENCE): dev/tests/engine/gguf_reference_test.mm $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
 
@@ -423,6 +434,9 @@ $(TEST_GGUF_PLANNER): dev/tests/engine/gguf_planner_test.mm $(ENGINE_LIBRARY) | 
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
 
 $(TEST_GGUF_PREPARATION): dev/tests/engine/gguf_preparation_test.mm $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
+
+$(TEST_GGUF_TRELLIS_IMAGE): dev/tests/engine/gguf_trellis_image_test.mm $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< $(ENGINE_LIBRARY) $(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
 
 # Production flags, not TEST_METALFLAGS: gguf-dequant checks the shipped
@@ -950,6 +964,21 @@ $(TEST_GGUF_PROJECTION_BENCHMARK): dev/benchmarks/gguf_projection_benchmark.mm \
 		$(ENGINE_LIBRARY) \
 		$(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
 
+# The prefill tile-shape sweep: bench-only variant kernels of
+# dev/benchmarks/gguf_prefill_tile_bench.metal (production flags, as the
+# kernels they mirror) dispatched directly by the harness.
+$(TEST_GGUF_PREFILL_TILE_AIR): dev/benchmarks/gguf_prefill_tile_bench.metal \
+		$(KERNEL_HEADERS) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $< -o $@
+
+$(TEST_GGUF_PREFILL_TILE_LIB): $(TEST_GGUF_PREFILL_TILE_AIR)
+	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
+
+$(TEST_GGUF_PREFILL_TILE_BENCH): dev/benchmarks/gguf_prefill_tile_bench.mm \
+		| $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		-framework Foundation -framework Metal -o $@
+
 $(TEST_GGUF_MOE_BENCHMARK): dev/benchmarks/gguf_moe_benchmark.mm \
 		dev/benchmarks/DispatchReplay.hpp \
 		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
@@ -1083,9 +1112,11 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(BUILD_ID_PYTHON) dev/tests/engine/run_affine_preparation.py $(TEST_AFFINE_PREPARATION) $(LIB) \
 		$(WEIGHT_GOLDENS)
 	$(METAL_TEST_ENV) $(TEST_GGUF_PREPARATION) $(LIB) $(WEIGHT_GOLDENS)
+	$(METAL_TEST_ENV) $(TEST_GGUF_TRELLIS_IMAGE) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_DEQUANT) $(TEST_GGUF_DEQUANT_LIB)
 	$(METAL_TEST_ENV) $(TEST_OQ_FORMATS) $(TEST_OQ_FORMATS_LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_ROTATION) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_TRELLIS) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_PROJECTION) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_PREFILL_INT8) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_ANE_FFN) $(LIB) kernels
@@ -1158,7 +1189,7 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 
 .PHONY: benchmark-prefill benchmark-decode benchmark-backend benchmark-dfa \
 	benchmark-decode-profile benchmark-attention-sweep \
-	benchmark-gguf-projection benchmark-gguf-moe benchmark-gdn-chunked
+	benchmark-gguf-projection benchmark-gguf-prefill-tile benchmark-gguf-moe benchmark-gdn-chunked
 benchmark-prefill: all $(TEST_Q4_PREFILL_PROFILE)
 	$(TEST_Q4_PREFILL_PROFILE) $(LIB)
 
@@ -1188,6 +1219,12 @@ benchmark-attention-sweep: $(TEST_ATTENTION_SWEEP) $(LIB)
 GGUF_PROJECTION_ARGS ?= q4k 5120 8192
 benchmark-gguf-projection: $(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB)
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB) $(GGUF_PROJECTION_ARGS)
+
+# The gguf_prefill_tile shape sweep (dev/benchmarks/gguf_prefill_tile_bench.mm):
+# GGUF_PREFILL_TILE_ARGS passes <fmt> <N> <K> <rows[,rows...]> [rounds] [check].
+GGUF_PREFILL_TILE_ARGS ?= nvfp4 512 512 200,512 4 check
+benchmark-gguf-prefill-tile: $(TEST_GGUF_PREFILL_TILE_BENCH) $(TEST_GGUF_PREFILL_TILE_LIB)
+	$(TEST_GGUF_PREFILL_TILE_BENCH) $(TEST_GGUF_PREFILL_TILE_LIB) $(GGUF_PREFILL_TILE_ARGS)
 
 # One MoE layer at the 35B shape, GGUF against affine Q4, on the device's
 # plans and the other GGUF tile (ops/MoE.cpp); GGUF_MOE_ARGS passes [rounds]

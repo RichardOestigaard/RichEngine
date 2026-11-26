@@ -147,10 +147,13 @@ def select_gguf(files, variant):
 # narrower exponent than BF16, so an F16 projector has already rounded small
 # weights, as a quantized one has. lfm3vl quantizes its blocks (Q8_0 with F32
 # norms and depthwise kernels, F16 patch embeddings); the weights are already
-# rounded, and the loader dequantizes into the same BF16 image.
+# rounded, and the loader dequantizes into the same BF16 image. nemotron_omni
+# ships F32 tables, norms and biases beside BF16 matrices; its loader rounds
+# those F32 values once into the BF16 tower image.
 PROJECTOR_TYPES = {
     "qwen3vl_merger": {"BF16", "F32"},
     "lfm3vl": {"Q8_0", "F16", "F32", "BF16"},
+    "nemotron_omni": {"BF16", "F32"},
 }
 
 
@@ -814,11 +817,21 @@ def _at(repo):
 
 
 def _draft_files(repo, family):
-    """The family's DFlash2 checkpoint in repo, downloaded, by assembly path:
-    config.json and the safetensors weights, model.safetensors or the shards
-    its index names, at the root of the repository or --draft-model
-    directory, as a DFlash2 release holds them. Its configuration must state
-    the family's draft signature."""
+    """The family's draft in repo, downloaded, by assembly path: a GGUF
+    draft's single .gguf, or config.json and the safetensors weights of a
+    DFlash2/DSpark checkpoint. A checkpoint configuration must state the
+    family's draft signature; the runtime validates a GGUF's metadata."""
+    if family.draft.format == "gguf":
+        names = sorted(
+            name for name in repo.files
+            if name.endswith(".gguf") and "/" not in name
+        )
+        if len(names) != 1:
+            raise models.ModelError(
+                f"{repo.name} does not contain one root GGUF draft for {family.name}"
+            )
+        downloaded = repo.download({names[0]})
+        return {layout.DRAFT + "/" + names[0]: downloaded[names[0]]}
     try:
         if "config.json" not in repo.files:
             raise models.ModelError("no config.json")

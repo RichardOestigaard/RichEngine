@@ -1,7 +1,8 @@
 {
   "name": "Qwen3.8-27B",
   "repos": [
-    "mlx-community/Qwen3.8-27B-4bit"
+    "mlx-community/Qwen3.8-27B-4bit",
+    "nari-labs/Qwen3.8-27B-NariQ-GGUF"
   ],
   "signature": {
     "model_type": "qwen3_5_text",

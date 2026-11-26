@@ -221,6 +221,9 @@ struct RuntimeRequest final {
   // Next generatedTokens count at which a gated-off lane may probe again.
   uint32_t ngramProbeAt = 0;
   bool ngramInFlight = false;
+  // A drafted lane whose rows the per-lane n-gram mix overwrote this step;
+  // budget isolation uses it to keep those outcomes out of draft learning.
+  bool ngramMixedInFlight = false;
   // Cross-request corpus eligibility (RICHENGINE_NGRAM_CORPUS): armed at
   // admission for every lane in mode 1, by the hint flag or a tail-probe
   // hit in mode 2, and later by the starvation probe when the lane's own

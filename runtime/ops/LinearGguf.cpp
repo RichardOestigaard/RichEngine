@@ -9,6 +9,7 @@
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
+#include "metal/abi/Trellis.h"
 #include "ops/BufferExtent.hpp"
 
 #include <algorithm>
@@ -133,6 +134,17 @@ void requireSegments(const Projection &p, LinearMatrix matrix) {
   if (p.outputSize != matrix.outputSize || p.inputSize != matrix.inputSize)
     throw std::invalid_argument("block projection does not match plan");
   for (const QuantizedSegment &s : p.blocks().segments) {
+    if (s.isTrellis()) {
+      if (s.outputSize % 16 || s.inputSize % 16)
+        throw std::invalid_argument("trellis segments do not fill whole coded tiles");
+      const TrellisWeight &t = *s.trellisData;
+      requireBytes(t.pre, uint64_t{s.inputSize} * 4, "trellis pre");
+      requireBytes(t.post, uint64_t{s.outputSize} * 4, "trellis post");
+      requireBytes(t.scales, uint64_t{s.inputSize / 16} * 2, "trellis scales");
+      if (t.hasPin) requireBytes(t.pin, uint64_t{s.inputSize} * 4, "trellis pin");
+      if (t.hasPout) requireBytes(t.pout, uint64_t{s.outputSize} * 4, "trellis pout");
+      continue;
+    }
     if (s.outputSize % (s.isFloat() ? 8u : GGUF_TILE_COLUMNS))
       throw std::invalid_argument("block segments do not fill whole column tiles");
     if (!s.isFloat()) {
@@ -159,18 +171,25 @@ uint32_t segmentColumns(const Projection &p) {
 bool ggufInt8Prefill(LinearEpilogue epilogue) {
   static const bool on = model::modelPolicy().prefillFastInt8;
   static const uint32_t skip = envUint("RICHENGINE_PREFILL_I8_SKIP", 0);
+  // The int8 tiles instantiate no relu² epilogue; the bf16 tile runs it.
+  if (epilogue == LinearEpilogue::ReluSquared) return false;
   return on && !(skip & (1u << uint32_t(epilogue)));
 }
 
 // The kernel name suffix of an epilogue and the buffer it reads besides the
 // input (the output for a plain projection, which reads none): 'r' adds the
-// residual, 'g' multiplies silu(gate) from the gate scratch.
+// residual, 'g' multiplies silu(gate) from the gate scratch, 'q' squares the
+// relu of the sum and reads no auxiliary buffer.
 char epilogueSuffix(LinearEpilogue epilogue) noexcept {
-  return epilogue == LinearEpilogue::None ? 'a' : epilogue == LinearEpilogue::Residual ? 'r' : 'g';
+  return epilogue == LinearEpilogue::None        ? 'a'
+       : epilogue == LinearEpilogue::Residual    ? 'r'
+       : epilogue == LinearEpilogue::ReluSquared ? 'q'
+                                                 : 'g';
 }
 const metal::MetalBuffer &epilogueInput(const LinearBuffers &b, LinearEpilogue epilogue) noexcept {
   return epilogue == LinearEpilogue::Residual ? b.residual
        : epilogue == LinearEpilogue::None     ? b.output
+       : epilogue == LinearEpilogue::ReluSquared ? b.output
                                               : b.gateScratch;
 }
 
@@ -355,6 +374,13 @@ LinearScratchSize LinearPlan::blockScratchSize() const noexcept {
 
 LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *const> projections) const {
   const auto [n, k] = w.matrix;
+  bool trellis = false;
+  for (const Projection *p : projections)
+    if (p)
+      for (const QuantizedSegment &s : p->blocks().segments) trellis |= s.isTrellis();
+  if (trellis)
+    return {.tile = w.phase == LinearPhase::Prefill && w.rows > kMaximumStagedPrefillRows ? LinearTile::GgufPrefill : LinearTile::GgufStaged,
+            .splits = 1};
   // The install's own kernel-pass measurement outranks every rule below.
   if (const auto measured = measuredLinearPlan(policy_, w))
     return fitBlockSplits(*measured, k);
@@ -391,12 +417,16 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // slower on the affine formats (gguf-projection-benchmark, 20-core
   // M5 Pro). Its one-pass gate/up kernel is 5.5x slower than the two-pass
   // staged pair at 64 rows, so decode beyond 32 rows keeps the pair.
-  if (w.rows > 32 &&
+  // The relu² epilogue instantiates on the staged tile alone, which holds
+  // every decode step's rows, so its plans never take the register tile.
+  if (w.epilogue != LinearEpilogue::ReluSquared &&
+      w.rows > 32 &&
       !(policy_.family == 10 && w.rows <= kMaximumStagedPrefillRows))
     return fitBlockSplits(registerDecode(policy_, n, k), k);
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names.
-  if (policy_.isApple9() && !apple9Stages(w, projections))
+  if (w.epilogue != LinearEpilogue::ReluSquared &&
+      policy_.isApple9() && !apple9Stages(w, projections))
     return fitBlockSplits(registerDecode(policy_, n, k), k);
   const bool spreads = spreadsStagedDecode(policy_);
   const bool onePass =
@@ -407,7 +437,8 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // threads too few; every segment must take the tile's coefficient units.
   const ProjectionShape shape =
       projections.empty() || !projections.front() ? ProjectionShape{} : projections.front()->shape();
-  if (shape.registerFormats && everyQuantizedSegment(projections, registerTileTakes) &&
+  if (w.epilogue != LinearEpilogue::ReluSquared && shape.registerFormats &&
+      everyQuantizedSegment(projections, registerTileTakes) &&
       apple10Registers(policy_, w.rows, onePass ? 2 * n : n,
                        shape.fourBits && everyQuantizedSegment(projections, fourBitsPerWeight)))
     return fitBlockSplits(registerDecode(policy_, n, k), k);
@@ -503,9 +534,6 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   requireSegments(p, w.matrix);
   if (gate) requireSegments(*gate, w.matrix);
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
-  // The fused kernels have no fp32 instance.
-  if (plan.destination() == FloatOutput::Float32 && segments.size() > 1)
-    throw std::invalid_argument("an fp32 destination takes a single-tensor block projection");
   if (std::any_of(segments.begin(), segments.end(), [](const QuantizedSegment &s) { return s.isFloat(); })) {
     // The quantized segments, which precede the float ones, run the plan's tiles.
     addGgufFloatSegments(graph, b, p, plan);
@@ -518,6 +546,75 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     }
     return;
   }
+  bool hasTrellis = false;
+  for (const QuantizedSegment &s : p.blocks().segments) hasTrellis |= s.isTrellis();
+  if (hasTrellis) {
+    if (!std::all_of(segments.begin(), segments.end(), [](const QuantizedSegment &s) { return s.isTrellis(); }))
+      throw std::invalid_argument("trellis projections cannot mix ordinary segments");
+    if (w.epilogue == LinearEpilogue::ReluSquared)
+      throw std::invalid_argument("trellis projections take no relu-squared epilogue");
+    const uint32_t rows = w.rows;
+    const metal::MetalBuffer x = b.scratch.input, y = b.scratch.partials;
+    const auto run = [&](const Projection &projection, const metal::MetalBuffer &destination, uint32_t epilogueFlags,
+                         const metal::MetalBuffer &epilogueInput) {
+      for (const QuantizedSegment &s : projection.blocks().segments) {
+        if (!s.isTrellis()) throw std::invalid_argument("trellis projections cannot mix ordinary segments");
+        const TrellisWeight &t = *s.trellisData;
+        const uint32_t flags = (t.hasPin ? 1u : 0u) | (t.hasPout ? 2u : 0u) | (t.hasScatter ? 4u : 0u) | epilogueFlags;
+        const TrellisParams params{s.inputSize, s.outputSize, rows, projection.outputSize, s.columnOffset,
+                                   t.inputBlock, t.outputBlock, flags};
+        graph.add("trellis_input", {b.input, t.pre, t.hasPin ? t.pin : t.pre, x}, params,
+                  {(s.inputSize + 255) / 256, rows, 1}, {256, 1, 1});
+        if (t.inputBlock > 1)
+          graph.add("trellis_fwht", {x}, TrellisTransformParams{s.inputSize, t.inputBlock,
+                                                                1.0f / std::sqrt(float(t.inputBlock)), 0},
+                    {s.inputSize / t.inputBlock, rows, 1}, {256, 1, 1});
+        if (rows > 8 || s.outputSize < 256) {
+          const bool wide = rows > 16;
+          graph.add("trellis_product_mm16x32_" + std::to_string(t.bits) + (wide ? "_32" : "_16"), {t.codes, t.scales, x, y}, params,
+                    {(s.outputSize + 31) / 32, wide ? (rows + 31) / 32 : (rows + 15) / 16, 1}, {128, 1, 1});
+        } else if (rows > 4) {
+          graph.add("trellis_zero", {y}, params, {(rows * s.outputSize + 255) / 256, 1, 1}, {256, 1, 1});
+          const std::string kernel = t.bits == 3 && policy_.family == 10 ? "trellis_product_mm8_anchors_3" :
+              "trellis_product_mm8_" + std::to_string(t.bits);
+          graph.add(kernel, {t.codes, t.scales, x, y}, params,
+                    {(s.outputSize + 31) / 32, (rows + 7) / 8, 4}, {128, 1, 1});
+        } else if (s.outputSize >= 256) {
+          const uint32_t columns = rows == 1 ? 1 : rows == 2 ? 2 : 4;
+          graph.add("trellis_product_mv_" + std::to_string(t.bits) + "_" + std::to_string(columns),
+                    {t.codes, t.scales, x, y}, params, {s.outputSize / 16, 1, 1}, {32, 4, 1});
+        } else {
+          const uint32_t columns = rows == 1 ? 1 : 4;
+          graph.add("trellis_product_" + std::to_string(t.bits) + "_" + std::to_string(columns),
+                    {t.codes, t.scales, x, y}, params,
+                    {s.outputSize / 4, (rows + columns - 1) / columns, 1}, {128, 1, 1});
+        }
+        if (t.outputBlock > 1)
+          graph.add("trellis_fwht", {y}, TrellisTransformParams{s.outputSize, t.outputBlock,
+                                                                1.0f / std::sqrt(float(t.outputBlock)), 0},
+                    {s.outputSize / t.outputBlock, rows, 1}, {256, 1, 1});
+        graph.add(plan.destination() == FloatOutput::Float32 ? "trellis_output_f32" : "trellis_output_bf16",
+                  {y, t.post, t.hasPout ? t.pout : t.post, t.hasScatter ? t.scatter : t.post, destination,
+                   epilogueInput},
+                  params, {(s.outputSize + 255) / 256, rows, 1}, {256, 1, 1});
+      }
+    };
+    if (w.epilogue == LinearEpilogue::GateUp) {
+      if (!gate) throw std::invalid_argument("trellis gate/up requires a gate projection");
+      run(*gate, b.gateScratch, 0, b.gateScratch);
+      run(p, b.output, 16, b.gateScratch);
+    } else if (w.epilogue == LinearEpilogue::UpWithGate) {
+      run(p, b.output, 16, b.gateScratch);
+    } else if (w.epilogue == LinearEpilogue::Residual) {
+      run(p, b.output, 8, b.residual);
+    } else {
+      run(p, b.output, 0, b.output);
+    }
+    return;
+  }
+  // The fused kernels have no fp32 instance.
+  if (plan.destination() == FloatOutput::Float32 && segments.size() > 1)
+    throw std::invalid_argument("an fp32 destination takes a single-tensor block projection");
   if (p.rotation) {
     // Weights stored for rotated inputs (InputRotation): the quantized
     // segments, and a gate/up pair's gate too, read H (D x) from the scratch,
@@ -592,6 +689,9 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   // keep the staged decode, and the test compares their outputs against the
   // 128-row prefill tile's.
   const auto format = [&](const QuantizedSegment &s) {
+    // The multiplane and packed-operand decode tiles instantiate no relu²
+    // epilogue; the staged tile of the format runs it.
+    if (w.epilogue == LinearEpilogue::ReluSquared) return kernelFormat(policy_, s);
     if (w.phase == LinearPhase::Decode) {
       if (packs && s.formatId == GGUF_FMT_MXFP4) return "mxfp4p";
       return decodeFormat(policy_, s, rows);
@@ -716,7 +816,7 @@ bool Linear::addGgufHeadArgmax(metal::CommandGraph &graph, metal::MetalBuffer in
                                const HeadArgmaxParams &headParams, LinearScratch scratch,
                                uint32_t verifyRows) const {
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
-  if (segments.size() != 1 || segments.front().isFloat()) return false;
+  if (segments.size() != 1 || segments.front().isFloat() || segments.front().isTrellis()) return false;
   const QuantizedSegment &s = segments.front();
   if (p.outputSize % GGUF_TILE_COLUMNS || p.inputSize % GGUF_TABLE16_SPAN_INPUTS) return false;
   const LinearPlan plan = decodePlan(p, lanes, LinearEpilogue::None, nullptr, verifyRows);
@@ -771,7 +871,7 @@ bool Linear::addGgufHeadColumns(metal::CommandGraph &graph,
   // A partial tail tile's run would read rows the plane does not hold; the
   // MXFP4 and packed-operand tiles read their planes in another layout this
   // path does not shift.
-  if (s.isFloat() || s.formatId == GGUF_FMT_MXFP4 ||
+  if (s.isFloat() || s.isTrellis() || s.formatId == GGUF_FMT_MXFP4 ||
       decodeFormat(policy_, s, rows) != kernelFormat(policy_, s) ||
       s.outputSize % QUANT_TILE_ROWS)
     return false;
@@ -873,7 +973,7 @@ bool Linear::addGgufHeadGather(
   // restrictions of addGgufHeadColumns do not apply; a native-layout
   // segment (MXFP4, whose packed rows the meta unit does not span as one
   // coefficient) keeps its own kernels.
-  if (s.isFloat() || s.formatId == GGUF_FMT_MXFP4 || !s.meta || k % 32)
+  if (s.isFloat() || s.isTrellis() || s.formatId == GGUF_FMT_MXFP4 || !s.meta || k % 32)
     return false;
   requireBytes(input, uint64_t{lanes} * laneRows * k * 2, "score input");
   requireBytes(output, uint64_t{lanes} * laneRows * p.outputSize * sizeof(float),
@@ -1134,11 +1234,11 @@ QuantizedSegment QuantizedSegment::planes(uint32_t formatId, uint32_t outputSize
                                           metal::MetalBuffer plane0, metal::MetalBuffer plane1,
                                           metal::MetalBuffer meta) {
   if (formatId >= GGUF_FMT_COUNT) throw std::invalid_argument("unknown GGUF segment format");
-  return {std::move(plane0), std::move(plane1), std::move(meta), outputSize, inputSize, 0, formatId};
+  return {std::move(plane0), std::move(plane1), std::move(meta), outputSize, inputSize, 0, formatId, {}};
 }
 const QuantFormat &QuantizedSegment::format() const noexcept { return kQuantFormats[formatId]; }
 const char *QuantizedSegment::name() const noexcept {
-  return isFloat() ? (formatId == kBfloat16 ? "wbf16" : "f32") : format().name;
+  return isTrellis() ? "trellis" : isFloat() ? (formatId == kBfloat16 ? "wbf16" : "f32") : format().name;
 }
 
 } // namespace richengine::ops

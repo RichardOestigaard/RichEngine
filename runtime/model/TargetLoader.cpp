@@ -16,6 +16,18 @@ ops::Projection BlockTargetFormat::fused(WeightFile &file, uint32_t outputSize, 
     offset += s.outputSize;
     weights.segments.push_back(std::move(s));
   }
+  // Trellis beta and alpha are separate coded tensors but one logical tail
+  // segment of the fused GDN projection. Ordinary GGUFs repack them into one
+  // padded tensor instead, so only the trellis form consumes a second section.
+  if (tensors.size() == 3 && *(tensors.end() - 1) == "gdn-ab" &&
+      !weights.segments.empty() && weights.segments.back().isTrellis()) {
+    ops::QuantizedSegment alpha = readQuantizedSegment(file, "gdn-alpha");
+    if (!alpha.isTrellis() || alpha.outputSize > outputSize - offset)
+      throw WeightStoreError("GGUF trellis alpha/beta segments do not fit the projection");
+    alpha.columnOffset = offset;
+    offset += alpha.outputSize;
+    weights.segments.push_back(std::move(alpha));
+  }
   return {outputSize, inputSize, std::move(weights)};
 }
 

@@ -5,6 +5,7 @@
 
 #include <compare>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -32,6 +33,9 @@ struct ProjectionShape final {
   bool registerFormats = false;
   bool fourBits = false;
   bool underFourAndHalfBits = false;
+  bool trellis = false;
+  // The largest trellis segment's rows; scratch need not cover a banded head's whole vocabulary.
+  uint32_t trellisSegmentOutput = 0;
   auto operator<=>(const ProjectionShape &) const = default;
 };
 
@@ -77,6 +81,25 @@ struct ExpertProjection final {
   uint64_t expertStrideBytes = 0;
 };
 
+// The side data of a NariQ trellis-coded tensor (nariq/FORMAT.md). The
+// coded payload stays compressed in its 16x16 tiles; inputBlock/outputBlock
+// are the normalized Sylvester block sizes, 1 for identity.
+struct TrellisWeight final {
+  metal::MetalBuffer codes;
+  metal::MetalBuffer scales;
+  metal::MetalBuffer pre;
+  metal::MetalBuffer post;
+  metal::MetalBuffer pin;
+  metal::MetalBuffer pout;
+  metal::MetalBuffer scatter;
+  uint32_t bits = 0;
+  uint32_t inputBlock = 1;
+  uint32_t outputBlock = 1;
+  bool hasPin = false;
+  bool hasPout = false;
+  bool hasScatter = false;
+};
+
 // A prepared GGUF tensor occupying a projection's output columns
 // [columnOffset, columnOffset + outputSize): repacked planes in the GGUF_FMT_*
 // format formatId (metal/abi/QuantFormat.h), or a float tensor the GGUF keeps
@@ -90,13 +113,21 @@ struct QuantizedSegment final {
   // repacked at load, RICHENGINE_DRAFT_WBF16): the same kernels with a
   // half-size weight operand.
   static constexpr uint32_t kBfloat16 = 0xfffffffe;
+  // Trellis-coded segments, one id per TRL bit width.
+  static constexpr uint32_t kTrellisBase = 0xffffff00;
 
   [[nodiscard]] static QuantizedSegment planes(uint32_t formatId, uint32_t outputSize, uint32_t inputSize,
                                                metal::MetalBuffer plane0, metal::MetalBuffer plane1,
                                                metal::MetalBuffer meta);
   [[nodiscard]] static QuantizedSegment floats(uint32_t outputSize, uint32_t inputSize,
                                                metal::MetalBuffer values) {
-    return {std::move(values), {}, {}, outputSize, inputSize, 0, kFloat32};
+    return {std::move(values), {}, {}, outputSize, inputSize, 0, kFloat32, {}};
+  }
+  [[nodiscard]] static QuantizedSegment trellis(TrellisWeight weight, uint32_t outputSize, uint32_t inputSize) {
+    const uint32_t bits = weight.bits;
+    QuantizedSegment segment{weight.codes, weight.scales, weight.pre, outputSize, inputSize, 0, kTrellisBase + bits, {}};
+    segment.trellisData = std::move(weight);
+    return segment;
   }
 
   metal::MetalBuffer plane0;
@@ -106,7 +137,9 @@ struct QuantizedSegment final {
   uint32_t inputSize = 0;
   uint32_t columnOffset = 0;
   uint32_t formatId = kFloat32;
+  std::optional<TrellisWeight> trellisData;
 
+  [[nodiscard]] bool isTrellis() const noexcept { return trellisData.has_value(); }
   [[nodiscard]] bool isFloat() const noexcept {
     return formatId == kFloat32 || formatId == kBfloat16;
   }
@@ -176,16 +209,20 @@ public:
   [[nodiscard]] ProjectionShape shape() const noexcept {
     ProjectionShape result{outputSize, inputSize, layout(), static_cast<bool>(rotation)};
     if (layout() == WeightLayout::Block32) {
+      for (const QuantizedSegment &s : blocks().segments) {
+        result.trellis |= s.isTrellis();
+        if (s.isTrellis()) result.trellisSegmentOutput = std::max(result.trellisSegmentOutput, s.outputSize);
+      }
       result.registerFormats = true;
       result.fourBits = true;
       result.underFourAndHalfBits = true;
       for (const QuantizedSegment &s : blocks().segments) {
         result.registerFormats &=
-            s.isFloat() || quant_register_tensor(s.formatId, s.inputSize);
+            !s.isTrellis() && (s.isFloat() || quant_register_tensor(s.formatId, s.inputSize));
         result.fourBits &=
-            s.isFloat() || quant_four_bits(s.formatId);
+            !s.isTrellis() && (s.isFloat() || quant_four_bits(s.formatId));
         result.underFourAndHalfBits &=
-            s.isFloat() ||
+            s.isTrellis() || s.isFloat() ||
             8 * kQuantFormats[s.formatId].block_bytes <
                 9 * kQuantFormats[s.formatId].block_elements;
       }
@@ -244,6 +281,7 @@ struct NativeRows final {
   NativeRows(metal::MetalBuffer rows, uint32_t formatId);
   metal::MetalBuffer rows;
   uint32_t formatId;
+  std::optional<TrellisWeight> trellis;
   [[nodiscard]] const char *name() const noexcept;
 };
 

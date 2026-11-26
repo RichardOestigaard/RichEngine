@@ -124,6 +124,9 @@ ModelDescriptor qwen38Descriptor(std::string name) {
   // loses tail tokens: measured ~10 tok/s slower at B1 on M5 Pro.
   // RICHENGINE_ADAPTIVE_PROPOSALS=1 restores it.
   descriptor.tuning.adaptiveProposals = false;
+  descriptor.tuning.ngramGpuMix = true;
+  descriptor.tuning.ngramGpuMixMinWidth = 2;
+  descriptor.tuning.ngramMixCorpusOnly = true;
   // The in-command chained predraft removes the second submission's host
   // gap on this target (~5 ms per decode cycle on the 20-core M5 Pro —
   // 3.5percentgap.md). The DFlashV1/DSpark device-pack selectors it needs
@@ -141,8 +144,13 @@ ModelDescriptor qwen36Descriptor(std::string name) {
   // 4*ordinal+head set. Ornith-1.5-35B-A3B shares the layout and carries
   // the same mask from its own probe.
   target.duoAttention = {128, 1024, 0x322ULL};
-  return makeModelDescriptor(std::move(name), target, qwen36DraftLayout(),
-                             qwenVisionLayout(target.hiddenSize));
+  ModelDescriptor descriptor =
+      makeModelDescriptor(std::move(name), target, qwen36DraftLayout(),
+                          qwenVisionLayout(target.hiddenSize));
+  descriptor.tuning.ngramGpuMix = true;
+  descriptor.tuning.ngramGpuMixMinWidth = 2;
+  descriptor.tuning.ngramMixCorpusOnly = true;
+  return descriptor;
 }
 
 // Ornith's own policy on the same qwen3_6moe target: measured on its
@@ -164,6 +172,9 @@ ModelDescriptor ornith36Descriptor(std::string name) {
                           qwenVisionLayout(target.hiddenSize));
   descriptor.tuning.proposalCap = 8;
   descriptor.tuning.icbOff = true;
+  descriptor.tuning.ngramGpuMix = true;
+  descriptor.tuning.ngramGpuMixMinWidth = 2;
+  descriptor.tuning.ngramMixCorpusOnly = true;
   // The in-command chained predraft: neutral-to-good here (the host gap a
   // second command would overlap is thin), a measured -2..4% on Ornith-9B
   // whose ANE FFN handoff widens that gap — so it is opt-in per family.

@@ -104,6 +104,7 @@ const char *epilogueName(LinearEpilogue e) {
     case LinearEpilogue::Residual: return "residual";
     case LinearEpilogue::GateUp: return "gate/up";
     case LinearEpilogue::UpWithGate: return "up-with-gate";
+    case LinearEpilogue::ReluSquared: return "relu-squared";
   }
   return "?";
 }
@@ -242,6 +243,14 @@ Interval withGate(Interval up, float gate) {
   return {lo, hi};
 }
 
+// fl(bf16(relu(bf16(v))^2)) of the projection's interval: relu, the square
+// and both roundings are monotonic, so the ends' values bound it — zero
+// included where the interval crosses it.
+Interval withReluSquared(Interval p) {
+  const double lo = std::max(double(bf16(p.lo)), 0.0), hi = std::max(double(bf16(p.hi)), 0.0);
+  return {float(lo * lo), float(hi * hi)};
+}
+
 // ---------------------------------------------------------------- running a plan
 // A buffer of `bytes` followed by a guard band that no dispatch may write.
 struct Guarded {
@@ -364,6 +373,7 @@ void checkValues(const Outcome &out, const std::vector<Dot> &dots, const std::ve
           check("the output", i, out.output[i], withResidual(p, bf16ToFloat(aux[i])));
           break;
         case LinearEpilogue::UpWithGate: check("the output", i, out.output[i], withGate(p, bf16ToFloat(aux[i]))); break;
+        case LinearEpilogue::ReluSquared: check("the output", i, out.output[i], withReluSquared(p)); break;
         case LinearEpilogue::GateUp:
           check("the gate", i, out.gate[i], projected(gateDots[i], staged));
           check("the output", i, out.output[i], withGate(p, bf16ToFloat(out.gate[i])));
@@ -431,9 +441,10 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile) {
       const std::vector<float> residual = residuals(kMaximumRows, columns);
       const std::vector<Dot> dots = products({&w}, columns, x, kMaximumRows);
       const std::vector<Dot> gateDots = products({&g}, columns, x, kMaximumRows);
-      for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
+      for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp,
+                                            LinearEpilogue::ReluSquared})
         for (const uint32_t splits : kSplits) {
-          if (tile == LinearTile::GgufRegister && K / 256 < splits) continue;
+          if (tile == LinearTile::GgufRegister && (K / 256 < splits || epilogue == LinearEpilogue::ReluSquared)) continue;
           const std::string what = std::string(fmtName(formats[fi])) + (inputs == Inputs::Sparse ? " sparse " : " dense ") +
                                    epilogueName(epilogue) + " S=" + std::to_string(splits);
           const Projection *gated = epilogue == LinearEpilogue::GateUp ? &gate : nullptr;
@@ -617,7 +628,8 @@ void prefill(MetalBackend &backend, const Linear &linear) {
   for (int fi = 0; fi < FMT_COUNT; ++fi) {
     const Tensor w = tensor(backend, Fmt(fi), 1024, K);
     const Projection p = projection({&w}, w.N);
-    for (const LinearEpilogue e : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
+    for (const LinearEpilogue e : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate,
+                                   LinearEpilogue::ReluSquared})
       chunks(p, {&w}, e, fmtName(fi));
     const Tensor b = tensor(backend, Fmt((fi + 3) % FMT_COUNT), 256, K), c = tensor(backend, Fmt((fi + 5) % FMT_COUNT),
                                                                                    256, K);

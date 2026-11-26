@@ -741,6 +741,8 @@ public:
 
   [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;
+  [[nodiscard]] const ops::EmbeddingWeights &
+  tokenEmbedding() const noexcept { return weightsBase_.tokenEmbedding; }
   // Lanes of storage the tensors of a decode step of `lanes` lanes bind: a
   // linear tile may hold more rows than the step (LinearPlan::storageRows;
   // a three-lane GGUF step on the staged tile runs its 32-row tile over four
@@ -868,8 +870,13 @@ private:
                         metal::MetalBuffer input, metal::MetalBuffer output) const;
   metal::MetalBuffer addPrefillMixer(PrefillStep &step, const GdnMixerWeights &mixer, const ops::NormWeights &norm,
                                      metal::MetalBuffer input) const;
+  // `destination`, when set, is the residual output projection's output
+  // instead of the attention scratch: nemotron's attention layers hold no
+  // FFN, so their mixer output is the layer output and the copy into it
+  // elides. The standard encoder leaves it unset.
   metal::MetalBuffer addPrefillMixer(PrefillStep &step, const AttentionMixerWeights &mixer,
-                                     const ops::NormWeights &norm, metal::MetalBuffer input) const;
+                                     const ops::NormWeights &norm, metal::MetalBuffer input,
+                                     metal::MetalBuffer destination = {}) const;
   metal::MetalBuffer addPrefillMixer(PrefillStep &step, const LfmConvWeights &mixer,
                                      const ops::NormWeights &norm, metal::MetalBuffer input) const;
   // The FFN of layer `index`; the dense FFN runs on `step.aneFfn` when set.
@@ -878,7 +885,8 @@ private:
   metal::MetalBuffer addVerifyMixer(VerifyStep &step, const GdnMixerWeights &mixer, const ops::NormWeights &norm,
                                     metal::MetalBuffer input) const;
   metal::MetalBuffer addVerifyMixer(VerifyStep &step, const AttentionMixerWeights &mixer,
-                                    const ops::NormWeights &norm, metal::MetalBuffer input) const;
+                                    const ops::NormWeights &norm, metal::MetalBuffer input,
+                                    metal::MetalBuffer destination = {}) const;
   metal::MetalBuffer addVerifyMixer(VerifyStep &step, const LfmConvWeights &mixer,
                                     const ops::NormWeights &norm, metal::MetalBuffer input) const;
   void addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &norm,

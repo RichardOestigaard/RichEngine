@@ -135,6 +135,9 @@ inline constexpr std::string_view kPrefillMamba2Scan = "prefill_mamba2_scan";
 inline constexpr std::string_view kPrefillMamba2Gate = "prefill_mamba2_gate";
 inline constexpr std::string_view kPrefillMamba2GateSums = "prefill_mamba2_gate_sums";
 inline constexpr std::string_view kVerifyMamba2Fused = "verify_mamba2_fused";
+inline constexpr std::string_view kVerifyMamba2Prepare = "verify_mamba2_prepare";
+inline constexpr std::string_view kVerifyMamba2Scan = "verify_mamba2_scan";
+inline constexpr std::string_view kVerifyMamba2Gate = "verify_mamba2_gate";
 inline constexpr std::string_view kVerifyTreeMamba2Fused = "verify_tree_mamba2_fused";
 inline constexpr std::string_view kVerifyMamba2Commit = "verify_mamba2_commit";
 inline constexpr std::string_view kVerifyMamba2CommitTree = "verify_mamba2_commit_tree";
@@ -165,8 +168,10 @@ inline constexpr std::string_view kVisionAttentionPack = "vision_attention_pack"
 inline constexpr std::string_view kVisionGemmM64n128 = "vision_gemm_m64n128";
 inline constexpr std::string_view kVisionGemmM64n128Residual = "vision_gemm_m64n128_residual";
 inline constexpr std::string_view kVisionGemmM64n128GeluTanh = "vision_gemm_m64n128_gelu_tanh";
+inline constexpr std::string_view kVisionGemmM64n128GeluErf = "vision_gemm_m64n128_gelu_erf";
 inline constexpr std::string_view kVisionGemmM32n256 = "vision_gemm_m32n256";
 inline constexpr std::string_view kVisionGemmM32n256GeluErf = "vision_gemm_m32n256_gelu_erf";
+inline constexpr std::string_view kVisionGemmM32n256ReluSquared = "vision_gemm_m32n256_relu_squared";
 
 // The LFM3-VL tower (lfm_vision.metal); its dense GEMMs and the projector's
 // input LayerNorm reuse the vision_* pipelines above.
@@ -178,6 +183,15 @@ inline constexpr std::string_view kLfmVisionQkvPrepare = "lfm_vision_qkv_prepare
 inline constexpr std::string_view kLfmVisionAttention = "lfm_vision_attention";
 inline constexpr std::string_view kLfmVisionAttentionPack = "lfm_vision_attention_pack";
 inline constexpr std::string_view kLfmVisionConv2d = "lfm_vision_conv2d";
+
+// The Nemotron Omni tower (nemotron_vision.metal); its dense GEMMs,
+// LayerNorm and projector RMSNorm reuse the vision/lfm pipelines above.
+inline constexpr std::string_view kNemotronVisionPatchify = "nemotron_vision_patchify";
+inline constexpr std::string_view kNemotronVisionPrepare = "nemotron_vision_prepare";
+inline constexpr std::string_view kNemotronVisionQkvPrepare = "nemotron_vision_qkv_prepare";
+inline constexpr std::string_view kNemotronVisionAttention = "nemotron_vision_attention";
+inline constexpr std::string_view kNemotronVisionAttentionPack = "nemotron_vision_attention_pack";
+inline constexpr std::string_view kNemotronVisionMerge = "nemotron_vision_merge";
 inline constexpr std::string_view kLfmVisionSiluMul = "lfm_vision_silu_mul";
 inline constexpr std::string_view kLfmVisionGemmM64n128SiluUp = "lfm_vision_gemm_m64n128_silu_up";
 inline constexpr std::string_view kLfmVisionGemmQkv = "lfm_vision_gemm_qkv";

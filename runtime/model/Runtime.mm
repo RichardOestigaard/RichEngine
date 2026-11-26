@@ -971,15 +971,56 @@ Runtime::decodeAsync(const BatchPlan &plan,
   impl_->ngram_.predraftedTree_ = false;
   impl_->ngram_.mixMask_ = 0;
   impl_->ngram_.mixCorpusMask_ = 0;
+  impl_->ngram_.suppressMask_ = 0;
+  impl_->ngram_.resetEvaluation();
+  const bool predraftEligible = !constrained || nullDraft;
+  const bool gpuPredraftArmed = impl_->gpuPredraft_.lanes != 0;
   const bool gpuPredrafted =
-      (!constrained || nullDraft) &&
+      predraftEligible &&
       impl_->adoptGpuPredraft(entries, items, width, !treeBatch);
-  const bool predrafted =
-      (!constrained || nullDraft) &&
-      (gpuPredrafted || impl_->applyAnePredraft(entries, items, width) ||
-       impl_->applyNgramPredraft(
-           entries, width,
-           (nullDraft || impl_->ngram_.ngramTreeDrafted_) && treeBatch));
+  if (gpuPredraftArmed) {
+    if (gpuPredrafted)
+      ++impl_->counters.gpuPredraftsAdopted;
+    else
+      ++impl_->counters.gpuPredraftsRejected;
+  }
+  // O1: once a GPU predraft is adopted its draft cost is sunk. Evaluate
+  // n-grams in mix-only mode so stronger lanes can overwrite rows on the
+  // GPU; mixOnly performs no racy host writes to the shared proposal arena.
+  const bool gpuMixAllowed =
+      impl_->ngram_.gpuMix_ && width >= impl_->ngram_.gpuMixMinWidth_;
+  if (gpuPredrafted && (gpuMixAllowed || impl_->ngram_.skipGpuPredraft_)) {
+    impl_->applyNgramPredraft(entries, width, false, true);
+    if (!gpuMixAllowed) {
+      impl_->ngram_.mixMask_ = 0;
+      impl_->ngram_.mixCorpusMask_ = 0;
+    }
+  } else if (gpuPredrafted) {
+    ++impl_->counters.ngramSkippedGpuPredraft;
+  }
+  bool ngramPredrafted = false;
+  bool anePredrafted = false;
+  if (predraftEligible && !gpuPredrafted) {
+    anePredrafted = impl_->applyAnePredraft(entries, items, width);
+    if (!anePredrafted)
+      ngramPredrafted = impl_->applyNgramPredraft(
+          entries, width,
+          (nullDraft || impl_->ngram_.ngramTreeDrafted_) && treeBatch);
+  }
+  const bool predrafted = gpuPredrafted || anePredrafted || ngramPredrafted;
+  // NullDraft self-suppression: lanes the predraft proved dead verify their
+  // anchor alone — the same shape a sampled Null lane already takes — so a
+  // proposer that never lands costs no verify rows. The probe cadence
+  // re-arms the lane inside applyNgramPredraft.
+  if (nullDraft && impl_->ngram_.suppressMask_) {
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      if (!(impl_->ngram_.suppressMask_ & (uint32_t{1} << lane)))
+        continue;
+      proposals[lane] = 0;
+      liveRows[lane] = 1;
+      lanes[lane].proposals = 0;
+    }
+  }
   // Adaptive draft bypass: when every lane's acceptance EWMA sits below the
   // draft's break-even cost, the batch decodes anchor-only — the draft
   // forward, its vocabulary head read and the selector all skip. A lane
@@ -1076,6 +1117,30 @@ Runtime::decodeAsync(const BatchPlan &plan,
         entry.dfa.has_value() && !Impl::samplingEnabled(entry) &&
         impl_->dfaForcedSpan(entry.stateLane).tokens >= proposals[lane];
   }
+  // O2: n-gram chains often end before the neural draft's adaptive width.
+  // Chain verification keeps only the real proposals plus the correction
+  // row; padding rows would route dead expert work. This never widens a
+  // lane beyond the budget/context-scaled row count computed above.
+  if (impl_->ngram_.chainClip_ && !tree && !draftBypassed && !spanSkipDraft) {
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      Impl::Request &entry = *entries[lane];
+      const uint32_t bit = uint32_t{1} << lane;
+      const bool mixed = (impl_->ngram_.mixMask_ & bit) != 0;
+      if (!(ngramPredrafted || mixed))
+        continue;
+      if ((impl_->ngram_.suppressMask_ & bit) ||
+          entry.constraint == ConstraintMode::TokenMask ||
+          Impl::samplingEnabled(entry) || impl_->speechAudioSlot(entry))
+        continue;
+      const uint32_t clipped =
+          std::min(proposals[lane], impl_->ngram_.chainLengths_[lane]);
+      if (clipped < proposals[lane])
+        impl_->counters.ngramVerifyRowsClipped += proposals[lane] - clipped;
+      proposals[lane] = clipped;
+      liveRows[lane] = clipped + 1;
+      lanes[lane].proposals = clipped;
+    }
+  }
   if (!predrafted && !draftBypassed && !spanSkipDraft) {
     impl_->encodeDraftInputEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
                                 DecodeTensor::DraftHidden0, width, 1,
@@ -1090,8 +1155,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
   // comb tables. Bypassed and span-skipped batches keep their rows — the
   // bypass's EWMA bookkeeping and the DFA's forced span both break under
   // an overwrite.
-  if (!tree && !predrafted && !draftBypassed && !spanSkipDraft &&
-      impl_->ngram_.mixMask_)
+  if (!tree && !(predrafted && !gpuPredrafted) && !draftBypassed &&
+      !spanSkipDraft && impl_->ngram_.mixMask_)
     impl_->applyNgramMix(commandGraph, entries, width);
   // Every chain batch chooses its verify rows: a MoE target's by expected
   // tokens per cost (model::VerifyBudget, the selector's confidences), every
@@ -1102,7 +1167,10 @@ Runtime::decodeAsync(const BatchPlan &plan,
     const bool drafted =
         !predrafted && !draftBypassed && !spanSkipDraft && !nullDraft;
     ops::VerifyRowsModel verify;
-    if (drafted && !impl_->everyVerifyRow_ &&
+    const bool budgetedConfidence =
+        drafted || (gpuPredrafted && impl_->ngram_.pseudoConf_ &&
+                    impl_->ngram_.mixMask_);
+    if (budgetedConfidence && !impl_->everyVerifyRow_ &&
         impl_->geometry.target.ffnKind == FfnKind::SparseMoe &&
         !impl_->verifyBudget_.explores(width, constrained)) {
       const VerifyBudget::Acceptance &acceptance =
@@ -1110,17 +1178,39 @@ Runtime::decodeAsync(const BatchPlan &plan,
       verify = {acceptance.slope, acceptance.intercepts,
                 impl_->verifyBudget_.costs(width, constrained), false};
     }
-    for (uint32_t lane = 0; lane < width; ++lane)
-      lanes[lane].verifyLabels = drafted;
-    // RICHENGINE_DRAFT_CONF_MIN prunes to a lane's confidence-head prefix
-    // — valid only on a cycle whose draft graph just scored it (this
-    // step's or an adopted GPU predraft's). Constrained lanes can replace
-    // the proposals the score described with a forced span, so they keep
-    // the unpruned rows. Other predrafts leave stale confidences.
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      // Adopted GPU predrafts carry real DSpark confidences too. Once O4
+      // lets the row model consume them, non-mixed lanes may train it;
+      // budget isolation still excludes rows whose proposer was replaced.
+      lanes[lane].verifyLabels = budgetedConfidence;
+      if (impl_->ngram_.budgetIsolation_ &&
+          entries[lane]->ngramMixedInFlight)
+        lanes[lane].verifyLabels = false;
+    }
+    // RICHENGINE_DRAFT_CONF_MIN prunes DSpark's confidence-head prefix and
+    // RICHENGINE_LILICORR_PMIN LiLiCorr's lattice-walk prefix — valid only
+    // on a cycle whose draft graph just scored it (this step's or an
+    // adopted GPU predraft's). Constrained lanes can replace the proposals
+    // the score described with a forced span, so they keep unpruned rows;
+    // a sampled lane's LiLiCorr walk never ran, so its confidence rows are
+    // the selector's instead and stay unpruned too.
+    bool lilicorrScored = impl_->geometry.draft.kind == DraftKind::LiLiCorr;
+    for (uint32_t lane = 0; lilicorrScored && lane < width; ++lane) {
+      const ops::SamplingPolicy policy = Impl::samplingPolicy(*entries[lane]);
+      // The scorer runs only for a chain selection without any tree lane.
+      if (policy.samples() ||
+          (impl_->treeDraftCapable() &&
+           entries[lane]->constraint != ConstraintMode::TokenMask &&
+           !policy.penalties.active()))
+        lilicorrScored = false;
+    }
     const float confMin =
-        std::holds_alternative<DSparkDraft>(impl_->draftModel) &&
-                !constrained && (drafted || gpuPredrafted)
-            ? static_cast<float>(modelPolicy().draftConfMin)
+        !constrained && !impl_->ngram_.mixMask_ && (drafted || gpuPredrafted)
+            ? (std::holds_alternative<DSparkDraft>(impl_->draftModel)
+                   ? static_cast<float>(modelPolicy().draftConfMin)
+               : lilicorrScored
+                   ? static_cast<float>(modelPolicy().lilicorrPmin)
+                   : 0.0F)
             : 0.0F;
     ops::DraftSelector::addVerifyRows(
         commandGraph,
@@ -1583,6 +1673,12 @@ void Runtime::prepareWarmupDecode(uint64_t requestId, uint32_t anchor) {
   auto &entry = impl_->request(requestId);
   entry.pendingToken = anchor;
   entry.generatedTokens = 0;
+}
+
+uint32_t Runtime::maximumPrefillWarmupRows() const noexcept {
+  for (const ops::ProjectionShape &shape : impl_->geometry.target.prefillProjections)
+    if (shape.trellis) return 64;
+  return ExecutionLimits::prefillTokenBudget;
 }
 
 WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {

@@ -512,6 +512,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   std::unique_ptr<AnePredictor> anePredraft_;
   MetalBuffer aneLeafTokens_;  // [kLaneCount][RICHENGINE_DRAFT_PROPOSAL_TOKENS]
   MetalBuffer ngramMixTokens_; // staged chains for the per-lane mix
+  MetalBuffer ngramMixConfidence_; // staged confidence rows for mixed chains
   MetalBuffer aneFlag_;        // one u32: the medusa serial last published
   // Three u32s the mask-grid kernel fills under RICHENGINE_GPU_DECODE_GRID:
   // the DFA mask pass's MTLDispatchThreadgroupsIndirectArguments.
@@ -630,14 +631,50 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     // Whether a displaced drafted batch may emit the n-gram comb tree
     // (RICHENGINE_NGRAM_TREE_DRAFTED).
     const bool ngramTreeDrafted_ = modelPolicy().ngramTreeDrafted;
+    // Experiment gates. All default off until their server A/Bs pass.
+    const bool gpuMix_ = modelPolicy().ngramGpuMix;
+    // GPU mixing may be restricted to concurrent batches. Width-one agentic
+    // traffic keeps the neural draft's stronger open-context proposals;
+    // multi-lane waves benefit most from cross-request exact reuse.
+    const uint32_t gpuMixMinWidth_ = modelPolicy().ngramGpuMixMinWidth;
+    const bool mixCorpusOnly_ = modelPolicy().ngramMixCorpusOnly;
+    const bool chainClip_ = modelPolicy().ngramChainClip;
+    const bool budgetIsolation_ = modelPolicy().ngramBudgetIsolation;
+    const bool pseudoConf_ = modelPolicy().ngramPseudoConf;
+    const bool skipGpuPredraft_ = modelPolicy().ngramSkipGpuPredraft;
+    const uint32_t skipMinChain_ =
+        envUint("RICHENGINE_NGRAM_SKIP_MIN_CHAIN", 4);
+    const bool draftAgreement_ = modelPolicy().ngramDraftAgreement;
+    const bool stepScore_ = modelPolicy().ngramStepScore;
+    const double scoreBlend_ = envDouble("RICHENGINE_NGRAM_SCORE_BLEND", 0.5);
+    enum class ChainSource : uint8_t { None, Self, Lookup, Corpus };
+    // The current evaluation's chain facts, populated whether the batch
+    // displaces the draft or only arms per-lane mixing.
+    std::array<uint32_t, kLaneCount> chainLengths_{};
+    std::array<double, kLaneCount> chainScores_{};
+    std::array<uint32_t, kLaneCount> chainPatterns_{};
+    std::array<ChainSource, kLaneCount> chainSources_{};
     // Armed by applyNgramPredraft: lanes whose n-gram score beat the
     // draft's EWMA while the batch stayed drafted. applyNgramMix consumes
     // and the per-cycle reset in the decode path clears.
     uint32_t mixMask_ = 0;
+    // NullDraft self-suppression: lanes whose post-warmup acceptance EWMA
+    // sits under kNgramSuppressAcceptance verify their anchor alone until
+    // the probe cadence (kNgramProbeTokens) owes them a measurement round.
+    // applyNgramPredraft arms the mask; the decode path zeroes their
+    // proposal rows so a dead proposer burns no verify width.
+    uint32_t suppressMask_ = 0;
+    static constexpr double kNgramSuppressAcceptance = 0.02;
     // The mixMask_ lanes whose chain came from the corpus — finalizeDecode
     // credits their acceptance to corpusAcceptedAvg.
     uint32_t mixCorpusMask_ = 0;
     ngram::Corpus ngramCorpusDocs_;
+    void resetEvaluation() noexcept {
+      chainLengths_.fill(0);
+      chainScores_.fill(0.0);
+      chainPatterns_.fill(0);
+      chainSources_.fill(ChainSource::None);
+    }
     // Whether a lane may consult the corpus this step. Arming happens at
     // admission (seedNgramHistory) and through the starvation probe in
     // applyNgramPredraft — the flag is a prior, the probes are proof.
@@ -688,6 +725,10 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
     uint64_t waitValue = 0;
   };
   GpuPredraft gpuPredraft_;
+  // Arena epoch of a chained-predraft encode suppressed for exact n-gram
+  // repetition; the same cycle's finalize hook must not replace it with the
+  // host-launched second command. Zero means no suppression.
+  uint64_t gpuPredraftSuppressedEpoch_ = 0;
   SharedEvent predraftEvent_;
   uint64_t predraftEventValue_ = 0;
   // RICHENGINE_PREDRAFT_OVERLAP keeps the second-command predraft in
@@ -785,6 +826,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   bool adoptGpuPredraft(std::span<Request *const> entries,
                         std::span<const ModelBatchItem> items, uint32_t width,
                         bool allowed);
+  // O5: exact n-gram repetition stronger than the draft's EWMA makes the
+  // next speculative draft pass redundant. Every lane must satisfy the
+  // chain-length and score bars because the draft launch is batch-wide.
+  [[nodiscard]] bool ngramSkipsGpuPredraft(
+      std::span<Request *const> entries, uint32_t width) const;
   // Adaptive draft bypass (default on): when every lane's acceptance EWMA
   // falls below the draft's break-even cost — the draft's per-step weight
   // traffic as a share of the whole step — the batch decodes anchor-only
@@ -2017,8 +2063,11 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         if (capture.absoluteEnd ==
             part.logicalPosition + part.tokenCount) {
           span.anchorRow = span.compactRow + span.rows - 1;
-          span.anchor = decodeArena->get(sequence.entry->stateLane,
-                                         DecodeTensor::MtpAnchor);
+          span.anchor = decodeArena->get(
+              sequence.entry->stateLane,
+              geometry.draft.kind == DraftKind::LiLiCorr
+                  ? DecodeTensor::LiLiCorrAnchor
+                  : DecodeTensor::MtpAnchor);
         }
       }
     }
@@ -2341,6 +2390,12 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // no match contributes nothing; a lane still warming up or due a probe
   // is scored at the draft's expected rate so it can prove itself; after
   // that its observed EWMA speaks.
+  uint32_t ngramScoringDepth(const Request &entry, uint32_t found) const;
+  // Candidate rows the GPU draft selector produced for an adopted predraft:
+  // DFlash uses Candidates at a 16-token stride, DSpark TopPartialIds at its
+  // wider shard-pool stride. Empty means the current step has no valid rows.
+  uint32_t draftCandidateStride() const;
+  std::span<const uint32_t> draftCandidateRow(uint32_t lane, uint32_t width) const;
   double ngramLaneScore(const Request &entry, bool found,
                         bool drafted) const;
   // The learning-free predraft: each lane's chain comes from the followers
@@ -2353,7 +2408,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // one sibling leaf per proposal position that has a distinct alternate —
   // and ngram_.predraftedTree_ reports whether the batch left as a tree.
   bool applyNgramPredraft(std::span<Request *const> entries,
-                          uint32_t width, bool emitTree);
+                          uint32_t width, bool emitTree, bool mixOnly = false);
   // Per-lane mix behind applyNgramPredraft (RICHENGINE_NGRAM_MIX): when the
   // batch stayed drafted, lanes whose n-gram score beat the draft EWMA get
   // their ProposedTokens rows overwritten with the staged n-gram chain —
@@ -2371,6 +2426,15 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
           kLaneCount * RICHENGINE_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t),
           BufferStorage::Shared, "ngram-mix");
     return ngramMixTokens_;
+  }
+  // [kLaneCount][RICHENGINE_DRAFT_PROPOSAL_TOKENS] floats, host-filled beside
+  // ngramMixTokens for lanes whose mixed chain needs its own row evidence.
+  [[nodiscard]] const MetalBuffer &ngramMixConfidence() {
+    if (!ngramMixConfidence_)
+      ngramMixConfidence_ = backend.allocateBuffer(
+          kLaneCount * RICHENGINE_DRAFT_PROPOSAL_TOKENS * sizeof(float),
+          BufferStorage::Shared, "ngram-mix-confidence");
+    return ngramMixConfidence_;
   }
   // Mid-decode boundary capture (SuffixReplay): the host-written per-lane
   // retained counts reaching each lane's page boundary, and a dummy cell
@@ -3875,6 +3939,12 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
       }
     }
 
+    if (!tree) {
+      for (uint32_t lane = 0; lane < items.size(); ++lane) {
+        counters.verifyRowsTotal += lanes[lane].verifyRows;
+        ++counters.verifyRowLanes;
+      }
+    }
     const auto f1 = richengine::AwakeClock::now();
     std::vector<ModelStepResult> results;
     results.reserve(items.size());
@@ -3886,6 +3956,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         // the request.
         entry.maskWords.clear();
         entry.ngramInFlight = false;
+        entry.ngramMixedInFlight = false;
         entry.corpusInFlight = false;
         entry.lookupInFlight = false;
         entry.lookupSourced = false;
@@ -4008,6 +4079,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
                               nextLength, items[lane].logicalPosition,
                               nextLength, false, geometry.draft.draftWindow()));
       entry.generatedTokens += laneResult.retained;
+      const bool ngramMixedStep = entry.ngramMixedInFlight;
+      entry.ngramMixedInFlight = false;
       if (entry.draftBypassed) {
         // A bypassed step offered no draft proposals: a fake zero would
         // poison the EWMA, so only the next probe is scheduled.
@@ -4021,7 +4094,8 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
         if (!entry.ngramInFlight)
           entry.proposalAcceptedAvg =
               0.75 * entry.proposalAcceptedAvg + 0.25 * laneResult.accepted;
-        if (adaptiveProposals_ && !tree) {
+        if (adaptiveProposals_ && !tree &&
+            !(ngram_.budgetIsolation_ && ngramMixedStep)) {
           if (laneResult.accepted >= entry.proposalBudget) {
             // A capped count can't show how much further the chain would
             // have run; widen until the trained block's cap stops binding.

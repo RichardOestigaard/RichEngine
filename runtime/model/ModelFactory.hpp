@@ -10,12 +10,14 @@
 #include "TargetWeights.hpp"
 #include "QwenVision.hpp"
 #include "LfmVision.hpp"
+#include "NemotronVision.hpp"
 #include "LfmAudio.hpp"
 #include "model/NullDraft.hpp"
 #include "model/MaxwellMtpDraft.hpp"
 #include "model/NemotronMtpDraft.hpp"
 #include "VisionLoader.hpp"
 #include "LfmVisionLoader.hpp"
+#include "NemotronVisionLoader.hpp"
 #include "LfmAudioLoader.hpp"
 #include "LfmGenLoader.hpp"
 #include "LfmGen.hpp"
@@ -46,7 +48,7 @@ using DraftWeights =
 
 // The vision tower's weights, whichever tower the model serves; the default
 // alternative is the empty Qwen weights a text-only model carries.
-using VisionWeights = std::variant<QwenVisionWeights, LfmVisionWeights>;
+using VisionWeights = std::variant<QwenVisionWeights, LfmVisionWeights, NemotronVisionWeights>;
 
 // The lfm3a audio encoder's weights; monostate for every model without one.
 using AudioWeights = std::variant<std::monostate, LfmAudioWeights>;
@@ -173,11 +175,12 @@ void requireCompatibleModelPackage(const ModelPackage &package);
                                         bool preferBlockWeights = false);
 
 // The vision role's upstream source, planned: a Qwen loader for the
-// qwen3vl_merger tower, an LFM loader for lfm3vl, monostate for a packed
-// vision file or a model without vision.
+// qwen3vl_merger tower, an LFM loader for lfm3vl, a Nemotron loader for
+// nemotron_omni, monostate for a packed vision file or no vision.
 using VisionLoaderPlan =
     std::variant<std::monostate, std::unique_ptr<VisionLoader>,
-                 std::unique_ptr<LfmVisionLoader>>;
+                 std::unique_ptr<LfmVisionLoader>,
+                 std::unique_ptr<NemotronVisionLoader>>;
 [[nodiscard]] VisionLoaderPlan
 planVisionLoader(const std::filesystem::path &root, const ModelDescriptor &descriptor);
 // The vision role: written by the plan's loader when there is one, else the

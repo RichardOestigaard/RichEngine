@@ -275,6 +275,17 @@ class UpstreamTest(unittest.TestCase):
             ["draft/config.json", "draft/model.safetensors"],
         )
 
+    def test_bolt_gguf_draft_files(self):
+        family = families.named("Nemotron-3.5-Bolt-74B-A9B")
+        root = self.root / "bolt-draft-repo"
+        root.mkdir()
+        (root / "lilicorr.gguf").write_bytes(b"GGUF")
+        repo = hub.Repository.local_directory(root)
+        self.assertEqual(
+            sorted(upstream._draft_files(repo, family)),
+            ["draft/lilicorr.gguf"],
+        )
+
     def test_diffusiongemma_family_is_disabled(self):
         # DiffusionGemma is disabled for v1.0.0 (docs/diffusion_issue.md):
         # its family file sits loader-skipped as _diffusiongemma-26b-a4b.json,
@@ -410,6 +421,21 @@ class UpstreamTest(unittest.TestCase):
                     ),
                 )
         # No variant still asks for one rather than picking a draft.
+        with self.assertRaisesRegex(models.ModelError, "select a GGUF"):
+            upstream.select_gguf(files, None)
+
+    def test_nariq_gguf_selection(self):
+        files = {
+            "Qwen3.8-27B-NariQ-2.5bpw.gguf",
+            "Qwen3.8-27B-NariQ-3.0bpw.gguf",
+            "Qwen3.8-27B-NariQ-mmproj-BF16.gguf",
+        }
+        for variant in ("2.5bpw", "3.0bpw"):
+            with self.subTest(variant=variant):
+                self.assertEqual(
+                    upstream.select_gguf(files, variant),
+                    (f"Qwen3.8-27B-NariQ-{variant}.gguf", False),
+                )
         with self.assertRaisesRegex(models.ModelError, "select a GGUF"):
             upstream.select_gguf(files, None)
 

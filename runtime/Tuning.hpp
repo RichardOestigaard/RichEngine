@@ -247,6 +247,9 @@ struct Tuning {
   // proposal suffix before verify (draft_conf_score + VerifyRowsParams's
   // conf_min). 0 disables.
   double draftConfMin = 0.0;        // RICHENGINE_DRAFT_CONF_MIN
+  // LiLiCorr's lattice-walk softmax confidence floor: the first proposal
+  // under it cuts the lane's suffix before verify. 0 disables.
+  double lilicorrPmin = 0.0;        // RICHENGINE_LILICORR_PMIN
   uint32_t ngramWarmup = 8;         // RICHENGINE_NGRAM_WARMUP
   double ngramTreeMin = 1.0;        // RICHENGINE_NGRAM_TREE_MIN
   // The cross-request corpus (model/NgramIndex.hpp): 0 keeps it off, 1
@@ -264,6 +267,9 @@ struct Tuning {
   // whose n-gram score beats the draft EWMA still gets the n-gram chain —
   // the draft forward ran anyway, so the better proposal set is free.
   bool ngramMix = true;             // RICHENGINE_NGRAM_MIX
+  // Backward-extension scan cap for exact-match chains. UINT32_MAX preserves
+  // the uncapped legacy scan; experiments set 64 or another finite bound.
+  uint32_t ngramExtensionCap = UINT32_MAX; // RICHENGINE_NGRAM_EXTENSION_CAP
   // The draft forward's share of a drafted step (ρ): all-ngram
   // displacement clears the mixed total discounted by it — a proposer
   // slightly under the draft's score can still win because skipping the
@@ -278,6 +284,7 @@ struct Tuning {
   // value is the default and an explicitly set variable overrides it.
   bool draftBypassExpectSet = false;
   bool draftConfMinSet = false;
+  bool lilicorrPminSet = false;
   bool ngramDraftExpectSet = false;
   bool ngramWarmupSet = false;
   bool ngramTreeMinSet = false;
@@ -491,6 +498,8 @@ inline Tuning makeTuning() {
   t.ngramDraftExpect = envDouble("RICHENGINE_NGRAM_DRAFT_EXPECT", 4.0);
   t.draftConfMinSet = envFlag("RICHENGINE_DRAFT_CONF_MIN");
   t.draftConfMin = envDouble("RICHENGINE_DRAFT_CONF_MIN", 0.0);
+  t.lilicorrPminSet = envFlag("RICHENGINE_LILICORR_PMIN");
+  t.lilicorrPmin = envDouble("RICHENGINE_LILICORR_PMIN", 0.0);
   t.ngramWarmupSet = envFlag("RICHENGINE_NGRAM_WARMUP");
   t.ngramWarmup = envUint("RICHENGINE_NGRAM_WARMUP", 8);
   t.ngramTreeMinSet = envFlag("RICHENGINE_NGRAM_TREE_MIN");
@@ -510,6 +519,8 @@ inline Tuning makeTuning() {
   // concurrent lanes can draft from it; =0 pushes only at request end.
   t.ngramCorpusLive = envUint("RICHENGINE_NGRAM_CORPUS_LIVE", 1) != 0;
   t.ngramMix = envUint("RICHENGINE_NGRAM_MIX", 1) != 0;
+  t.ngramExtensionCap =
+      envUint("RICHENGINE_NGRAM_EXTENSION_CAP", UINT32_MAX);
   t.ngramDraftCost = envDouble("RICHENGINE_NGRAM_DRAFT_COST", 0.1);
   t.ngramTreeDrafted = envFlag("RICHENGINE_NGRAM_TREE_DRAFTED");
   t.treeAcceptMinSet = envFlag("RICHENGINE_TREE_ACCEPT_MIN");

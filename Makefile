@@ -363,6 +363,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/wire/Status.cpp \
 	runtime/model/WeightStore.cpp \
 	runtime/model/GgufFile.cpp \
+	runtime/model/GgufTrellis.cpp \
 	runtime/model/GgufImage.cpp \
 	runtime/model/GgufTarget.cpp \
 	runtime/model/AffineTarget.cpp \
@@ -394,6 +395,8 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/Ornith9B.cpp \
 	runtime/model/LfmVision.cpp \
 	runtime/model/LfmVisionLoader.cpp \
+	runtime/model/NemotronVision.cpp \
+	runtime/model/NemotronVisionLoader.cpp \
 	runtime/model/LfmAudio.cpp \
 	runtime/model/LfmAudioLoader.cpp \
 	runtime/model/LfmGen.cpp \
@@ -409,6 +412,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/LookupProposals.cpp \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/DFlashTwoDraft.cpp \
+	runtime/model/LiLiCorrGgufDraft.cpp \
 	runtime/model/DFlashTwo8width.cpp \
 	runtime/model/DFlashTwo16width.cpp \
 	runtime/model/DSparkDraft.cpp \
@@ -455,6 +459,7 @@ ENGINE_MM_SOURCES := \
 	runtime/metal/MetalArena.mm \
 	runtime/metal/MetalEncode.mm \
 	runtime/ops/LfmVision.mm \
+	runtime/ops/NemotronVision.mm \
 	runtime/ops/LfmAudioEnc.mm \
 	runtime/ops/Vision.mm \
 	runtime/ops/PageStorage.mm \

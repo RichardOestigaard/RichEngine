@@ -32,7 +32,7 @@ namespace {
 constexpr model::GdnStateLayout kTargetState{48, 3, 10'240, 48, 128, 128};
 constexpr model::DraftStateLayout kDraftState{5, 8, 128, 2048};
 constexpr model::CompositeStateLayout kStateLayout{kTargetState, kDraftState};
-constexpr uint64_t kStateSlotBytes = model::SlotFile::slotBytesFor(kStateLayout.cachedBytes());
+const uint64_t kStateSlotBytes = model::SlotFile::slotBytesFor(kStateLayout.exactBytes());
 
 using richengine::test::require;
 
@@ -120,7 +120,7 @@ void testLayoutFormulas() {
                   kStateLayout.laneBytes() ==
               1'568'669'696,
           "four-lane byte formula is wrong");
-  require(kStateLayout.cachedBytes() == 238'026'752,
+  require(model::CompositeStateStorage::storedBytes(kStateLayout) == 127'139'840,
           "prefix byte formula is wrong");
 }
 
@@ -129,7 +129,7 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
                           queryHostAvailableMemory, 0);
   constexpr model::CompositeStateLayout layout{{1, 3, 128, 1, 128, 128},
                                                {1, 1, 4, 2048}};
-  const uint64_t slotBytes = model::SlotFile::slotBytesFor(layout.cachedBytes());
+  const uint64_t slotBytes = model::SlotFile::slotBytesFor(model::CompositeStateStorage::storedBytes(layout));
   auto budget = std::make_shared<model::DiskBudget>(3 * slotBytes);
   auto file = std::make_shared<model::SlotFile>(slotBytes, budget);
   model::CompositeStateStorage storage(backend, governor.allocationAdmission(), layout, file);
@@ -137,7 +137,7 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
   storage.updateLengths(0, {4096, 2048, 2048});
   auto source = storage.snapshot(0);
   auto held = file->acquire();
-  std::vector<std::byte> bytes(layout.cachedBytes());
+  std::vector<std::byte> bytes(model::CompositeStateStorage::storedBytes(layout));
   struct Result {
     bool failed;
     std::unique_ptr<StateOffload> transfer;
@@ -240,7 +240,7 @@ void testDiskRestore(metal::MetalBackend &backend) {
               storage.metadata(0).lengths.draftBase == 4096,
           "skipped draft restore retained stale context");
   auto promoted = read->snapshot();
-  require(promoted && promoted->residentBytes() == kStateLayout.cachedBytes(),
+  require(promoted && promoted->residentBytes() == model::CompositeStateStorage::storedBytes(kStateLayout),
           "completed disk restore could not create a resident snapshot");
   require(storage.metadata(0).lengths.draftLength == 0,
           "promotion changed the executing request's draft plan");
@@ -301,7 +301,7 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
               storage.idleRings() == 0,
           "direct disk snapshot took a cache slot");
   auto disk = write->state();
-  require(disk && !disk->residentBytes() && disk->bytes() == kStateLayout.cachedBytes(),
+  require(disk && !disk->residentBytes() && disk->bytes() == model::CompositeStateStorage::storedBytes(kStateLayout),
           "the ticket does not carry a disk copy");
   // The write reads staging, so the lane may move on at once.
   word(current.stateBase) = 0;
@@ -339,11 +339,11 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
 void testStateSmallerThanSlot(metal::MetalBackend &backend) {
   constexpr model::GdnStateLayout target{1, 3, 128, 1, 128, 128};
   constexpr model::CompositeStateLayout layout{target, {1, 1, 4, 2048}};
-  static_assert(layout.cachedBytes() % kHostPageBytes == 0);
+  static_assert(layout.exactBytes() % kHostPageBytes == 0);
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1,
                           queryHostAvailableMemory, 0);
   for (const auto &[testLayout, slotBytes] :
-       {std::pair{layout, layout.cachedBytes() + kHostPageBytes}}) {
+       {std::pair{layout, layout.exactBytes() + kHostPageBytes}}) {
     model::CompositeStateStorage storage(backend, governor.allocationAdmission(), testLayout,
                                     std::make_shared<model::SlotFile>(
                                         slotBytes, std::make_shared<model::DiskBudget>(slotBytes)));
@@ -433,7 +433,7 @@ void testPersistentStateComesBack(metal::MetalBackend &backend) {
   auto intact = storage.adopt(records[0], 4096);
   auto changed = storage.adopt(records[1], 4096);
   file->finishAdoption();
-  require(intact && !intact->residentBytes() && intact->bytes() == kStateLayout.cachedBytes(),
+  require(intact && !intact->residentBytes() && intact->bytes() == model::CompositeStateStorage::storedBytes(kStateLayout),
           "a state taken back is not a disk copy of the layout");
   require(static_cast<bool>(storage.tryActivateLane(0, 6)), "lane activation failed");
   fill(storage.current(0).stateBase, 99);
@@ -471,7 +471,7 @@ void testPersistKeepsTheRamCopy(metal::MetalBackend &backend) {
   const uint64_t allocated = storage.actualAllocatedBytes();
   auto write = source->persist({});
   require(write && !write->state()->residentBytes() &&
-              source->residentBytes() == kStateLayout.cachedBytes() &&
+              source->residentBytes() == model::CompositeStateStorage::storedBytes(kStateLayout) &&
               storage.actualAllocatedBytes() == allocated,
           "a persisted state staged its write or gave up its RAM copy");
   require(!source->persist({}), "a second copy was admitted past the quota");
@@ -602,9 +602,9 @@ void run(const std::string &metallib) {
     std::shared_ptr<const CompositeStateImpl> prefix = storage.snapshot(0);
     require(prefix != nullptr, "snapshot could not obtain a cache slot");
     observedPrefixActual = backend.memoryStats().allocatedBytes - beforePrefix;
-    require(prefix->bytes() == kStateLayout.cachedBytes(),
+    require(prefix->bytes() == model::CompositeStateStorage::storedBytes(kStateLayout),
             "cached state footprint is not the declared cached bytes");
-    require(observedPrefixActual >= kStateLayout.cachedBytes() &&
+    require(observedPrefixActual >= model::CompositeStateStorage::storedBytes(kStateLayout) &&
                 storage.actualAllocatedBytes() ==
                     storageBeforePrefix + observedPrefixActual,
             "cache slot allocation is below declared bytes or unaccounted");
@@ -751,7 +751,7 @@ void run(const std::string &metallib) {
     admitNewAllocations = false;
     std::shared_ptr<const CompositeStateImpl> pooled = storage.snapshot(0);
     require(pooled != nullptr, "snapshot did not reuse the pooled cache slot");
-    require(pooled->bytes() == kStateLayout.cachedBytes() &&
+    require(pooled->bytes() == model::CompositeStateStorage::storedBytes(kStateLayout) &&
                 storage.actualAllocatedBytes() == beforeDrop &&
                 backend.memoryStats().allocatedBytes == backendBeforeDrop,
             "pooled cache slot reuse allocated new buffers");
@@ -871,7 +871,7 @@ void run(const std::string &metallib) {
             << uint64_t{model::ExecutionLimits::maximumBatchWidth} *
                    kStateLayout.laneBytes()
             << " four_lanes_actual=" << observedStorageActual
-            << " composite_declared=" << kStateLayout.cachedBytes()
+            << " composite_declared=" << model::CompositeStateStorage::storedBytes(kStateLayout)
             << " prefix_actual=" << observedPrefixActual << '\n';
 }
 

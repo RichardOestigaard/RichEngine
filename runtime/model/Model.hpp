@@ -607,6 +607,31 @@ struct ModelTelemetry final {
   // window — together the signal for a variable-order matcher.
   uint64_t corpusWeakMatches = 0;
   uint64_t corpusDroppedStarts = 0;
+  // N-gram/draft interaction counters for /status. Chain-length buckets cover
+  // lanes whose evaluation found 0, 1-3, 4-7 or 8-15 proposal tokens.
+  uint64_t gpuPredraftsArmed = 0;
+  uint64_t gpuPredraftsAdopted = 0;
+  uint64_t gpuPredraftsRejected = 0;
+  uint64_t gpuPredraftsSuppressed = 0;
+  uint64_t ngramEvaluations = 0;
+  uint64_t ngramSkippedGpuPredraft = 0;
+  uint64_t ngramPredraftedBatches = 0;
+  uint64_t ngramMixedLanes = 0;
+  uint64_t ngramMixedSelfLanes = 0;
+  uint64_t ngramMixedLookupLanes = 0;
+  uint64_t ngramMixedCorpusLanes = 0;
+  uint64_t ngramChainTokens = 0;
+  uint64_t ngramVerifyRowsClipped = 0;
+  // Chain-cycle rows the GPU actually verified, anchors included.
+  uint64_t verifyRowsTotal = 0;
+  uint64_t verifyRowLanes = 0;
+  uint64_t ngramHostMicroseconds = 0;
+  uint64_t ngramHostEvaluations = 0;
+  uint64_t ngramChainLength0 = 0;
+  uint64_t ngramChainLength1To3 = 0;
+  uint64_t ngramChainLength4To7 = 0;
+  uint64_t ngramChainLength8To15 = 0;
+  uint64_t ngramChainLengthsExact[16] = {};
 };
 
 // One warmup lane's observable outcome: its step result, the anchor the step
@@ -765,6 +790,9 @@ public:
 
   // Actual rows, not padded dispatch rows; valid range is 1..prefillTokenBudget.
   virtual WarmupStepResult warmupPrefill(uint32_t rows) = 0;
+  [[nodiscard]] virtual uint32_t maximumPrefillWarmupRows() const noexcept {
+    return ExecutionLimits::prefillTokenBudget;
+  }
   virtual WarmupStepResult warmupDecodeBatch(uint32_t width) = 0;
   virtual WarmupStepResult warmupCompositeStateRestore() = 0;
   [[nodiscard]] virtual ModelMemoryActual actualRuntimeMemory() const = 0;

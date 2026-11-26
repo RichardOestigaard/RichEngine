@@ -35,20 +35,30 @@ inline void column_dot_rows(uint rows, uint input_size, device uchar *w0, device
     sums[r] = 0.0f;
     row[r] = r < rows ? row_base(r) : row_base(0);
   }
-  typename F::Payload w =
+  // The payloads of the next two groups in two slots alternating by parity, each loaded two groups ahead so its
+  // DRAM round trip overlaps two dequantize-multiply iterations rather than one: at one or two rows the round
+  // trip, not the FMA chain, is the longer of the two.
+  typename F::Payload wa =
       F::load(tw0 + ulong(g_begin) * QUANT_TILE_ROWS * F::P0, tw1 + ulong(g_begin) * QUANT_TILE_ROWS * F::P1);
-  typename F::Meta m = F::loadMeta(tmeta + ulong(g_begin / F::MetaGroups) * QUANT_TILE_ROWS * F::MetaBytes);
-  for (uint g = g_begin; g < g_end; ++g) {
+  typename F::Meta ma = F::loadMeta(tmeta + ulong(g_begin / F::MetaGroups) * QUANT_TILE_ROWS * F::MetaBytes);
+  typename F::Payload wb = wa;
+  typename F::Meta mb = ma;
+  if (g_begin + 1 < g_end) {
+    wb = F::load(tw0 + ulong(g_begin + 1) * QUANT_TILE_ROWS * F::P0, tw1 + ulong(g_begin + 1) * QUANT_TILE_ROWS * F::P1);
+    mb = F::loadMeta(tmeta + ulong((g_begin + 1) / F::MetaGroups) * QUANT_TILE_ROWS * F::MetaBytes);
+  }
+  // One group: decode its slot to v, load the group two ahead into the slot just freed, multiply the rows.
+  const auto run_group = [&](typename F::Payload &w, typename F::Meta &m, uint g) __attribute__((always_inline)) {
     half4 v[8];   // v[i]: elements 4i..4i+3 of the group
     dequant32_chunks<F>(w, m, ushort(g % F::MetaGroups), tl,
                         [&](ushort c, half4 lo, half4 hi) __attribute__((always_inline)) {
                           v[c] = lo;
                           v[4 + c] = hi;
                         });
-    if (g + 1 < g_end) {
-      w = F::load(tw0 + ulong(g + 1) * QUANT_TILE_ROWS * F::P0, tw1 + ulong(g + 1) * QUANT_TILE_ROWS * F::P1);
-      if ((g + 1) / F::MetaGroups != g / F::MetaGroups)
-        m = F::loadMeta(tmeta + ulong((g + 1) / F::MetaGroups) * QUANT_TILE_ROWS * F::MetaBytes);
+    if (g + 2 < g_end) {
+      w = F::load(tw0 + ulong(g + 2) * QUANT_TILE_ROWS * F::P0, tw1 + ulong(g + 2) * QUANT_TILE_ROWS * F::P1);
+      if ((g + 2) / F::MetaGroups != g / F::MetaGroups)
+        m = F::loadMeta(tmeta + ulong((g + 2) / F::MetaGroups) * QUANT_TILE_ROWS * F::MetaBytes);
     }
 #pragma unroll
     for (ushort r = 0; r < Rows; ++r) {
@@ -66,7 +76,13 @@ inline void column_dot_rows(uint rows, uint input_size, device uchar *w0, device
       }
       sums[r] += sum;
     }
+  };
+  uint g = g_begin;
+  for (; g + 2 <= g_end; g += 2) {
+    run_group(wa, ma, g);
+    run_group(wb, mb, g + 1);
   }
+  if (g < g_end) run_group(wa, ma, g);
 }
 
 template <class F, ushort Rows>

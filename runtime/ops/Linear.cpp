@@ -74,6 +74,9 @@ void validate(LinearWorkload w) {
         std::to_string(w.matrix.inputSize) + " rows=" + std::to_string(w.rows) +
         " layout=" + std::to_string(int(w.weightLayout)) +
         " phase=" + std::to_string(int(w.phase)));
+  // The GGUF tiles alone instantiate the relu² store epilogue.
+  if (w.epilogue == LinearEpilogue::ReluSquared && w.weightLayout != WeightLayout::Block32)
+    throw std::invalid_argument("the relu-squared epilogue takes a block projection");
   if (w.phase == LinearPhase::Prefill) {
     if (!w.rows || w.rows > RICHENGINE_PREFILL_TOKEN_BUDGET ||
         w.epilogue == LinearEpilogue::GateUp)
@@ -178,7 +181,8 @@ bool Projection::takesPlaneViews() const noexcept {
   if (planeInputs_) return false;
   if (layout() == WeightLayout::Affine64) return true;
   const std::vector<QuantizedSegment> &segments = blocks().segments;
-  return segments.size() == 1 && !segments.front().isFloat() && !rotation;
+  return segments.size() == 1 && !segments.front().isFloat() &&
+         !segments.front().isTrellis() && !rotation;
 }
 
 Projection Projection::leadingRows(const metal::MetalBackend &backend, uint32_t rows) const {
@@ -915,8 +919,11 @@ bool fastInt8AffinePrefill() {
 }
 
 bool packsPrefill(const DevicePolicy &device, LinearWorkload w) noexcept {
+  // The pre-packed MXFP4 tiles instantiate no relu² epilogue; the staged
+  // tile of the format runs it instead.
   return packedPrefillEnabled() && !packedTilesDisabled() &&
          device.nativeFormats() && w.phase == LinearPhase::Prefill &&
+         w.epilogue != LinearEpilogue::ReluSquared &&
          w.weightLayout == WeightLayout::Block32;
 }
 bool hasMxfp4(const Projection *p) noexcept {
@@ -932,6 +939,7 @@ bool packsDecode(const DevicePolicy &device, LinearWorkload w, const Projection 
                  const Projection *gate) noexcept {
   return device.nativeFormats() && !packedTilesDisabled() &&
          w.phase == LinearPhase::Decode &&
+         w.epilogue != LinearEpilogue::ReluSquared &&
          w.weightLayout == WeightLayout::Block32 && (hasMxfp4(p) || hasMxfp4(gate));
 }
 
@@ -1009,13 +1017,24 @@ LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogu
 LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
   LinearScratchSize bound;
   for (uint32_t lanes = 1; lanes <= RICHENGINE_MAXIMUM_BATCH_WIDTH; ++lanes)
-    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
+    // ReluSquared is block-only (validate); its plans take the staged tile
+    // where another epilogue may take the register tile, so a block shape
+    // reserves its scratch too.
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp,
+                                LinearEpilogue::ReluSquared}) {
+      if (epilogue == LinearEpilogue::ReluSquared && shape.layout != WeightLayout::Block32) continue;
       LinearWorkload w = decode({shape.outputSize, shape.inputSize}, lanes, epilogue);
       w.weightLayout = shape.layout;
       bound.include(shape.layout == WeightLayout::Block32 ? ggufDecodeScratchSize(w) : plan(w).scratchSize());
     }
   // Decode plans store at most every lane's rows.
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, kMaximumDecodeTileRows);
+  if (shape.trellis) {
+    LinearScratchSize extra{};
+    extra.input = uint64_t{kMaximumDecodeTileRows} * shape.inputSize * sizeof(float);
+    extra.partials = uint64_t{kMaximumDecodeTileRows} * shape.trellisSegmentOutput * sizeof(float);
+    bound.include(extra);
+  }
   return bound;
 }
 
@@ -1043,6 +1062,12 @@ LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
   // Every prefill plan stores at most the token budget.
   static_assert(RICHENGINE_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, RICHENGINE_PREFILL_TOKEN_BUDGET);
+  if (shape.trellis) {
+    LinearScratchSize extra{};
+    extra.input = uint64_t{RICHENGINE_PREFILL_TOKEN_BUDGET} * shape.inputSize * sizeof(float);
+    extra.partials = uint64_t{RICHENGINE_PREFILL_TOKEN_BUDGET} * shape.trellisSegmentOutput * sizeof(float);
+    bound.include(extra);
+  }
   return bound;
 }
 
@@ -1276,6 +1301,13 @@ PreparedInput Linear::addPrefillResidual(metal::CommandGraph &graph, metal::Meta
              {.input = input, .output = output, .sums = sums, .residual = residual, .scratch = scratch,
               .prepared = prepared},
              p, prefillPlan(p, rows, LinearEpilogue::Residual, canvas));
+}
+PreparedInput Linear::addPrefillReluSquared(metal::CommandGraph &graph, metal::MetalBuffer input,
+                                            const Projection &p, metal::MetalBuffer output,
+                                            metal::MetalBuffer sums, uint32_t rows,
+                                            LinearScratch scratch, PreparedInput prepared, bool canvas) const {
+  return add(graph, {.input = input, .output = output, .sums = sums, .scratch = scratch, .prepared = prepared}, p,
+             prefillPlan(p, rows, LinearEpilogue::ReluSquared, canvas));
 }
 void Linear::addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn,
                               const PrefillFfnBuffers &b, metal::MetalBuffer residual, metal::MetalBuffer output,

@@ -62,6 +62,10 @@ class Draft:
     # (a --draft-model override resolves to whichever signature matches;
     # Qwen3.8-27B's DSpine next to its DFlash2).
     alternates: tuple["Draft", ...] = ()
+    # safetensors for the config.json checkpoints pack.py and the native
+    # checkpoint loaders read; gguf for a draft already published as one
+    # GGUF, which the runtime adapts directly.
+    format: str = "safetensors"
 
     @property
     def layers(self):
@@ -164,6 +168,7 @@ def _load():
                     spec["repo"],
                     _pairs(signature),
                     tuple(_draft_spec(alt) for alt in spec.get("alternates", ())),
+                    spec.get("format", "safetensors"),
                 )
 
             draft = _draft_spec(doc["draft"])

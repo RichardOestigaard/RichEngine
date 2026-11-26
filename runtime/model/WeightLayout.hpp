@@ -27,6 +27,8 @@ inline constexpr uint32_t kQ4StorageN = 256;
 inline constexpr std::string_view kVisionMagic = "MDFV0001";
 // The packed LFM3-VL tower (LfmVisionLoader.cpp).
 inline constexpr std::string_view kLfmVisionMagic = "MDFL0001";
+// The packed Nemotron Omni tower (NemotronVisionLoader.cpp).
+inline constexpr std::string_view kNemotronVisionMagic = "MDFN0001";
 // The packed lfm3a audio encoder (LfmAudioLoader.cpp).
 inline constexpr std::string_view kLfmAudioMagic = "MDFA0001";
 

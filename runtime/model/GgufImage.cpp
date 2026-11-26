@@ -2,6 +2,7 @@
 
 #include "metal/abi/Gguf.h"
 #include "model/GgufImageLayout.hpp"
+#include "model/GgufTrellis.hpp"
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
 
@@ -10,6 +11,7 @@
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <cstdio>
 
 namespace richengine::model::gguf {
 namespace {
@@ -38,6 +40,19 @@ bool embeddingType(uint32_t type) { return gguf_embedding_format(gguf_format_of(
 // becomes exactly.
 bool alphaBetaType(uint32_t type) { return quantizedType(type) || type == ggml::kF32 || type == ggml::kBF16; }
 
+uint64_t orderedSourceRow(const RowOrder &order, uint64_t row) {
+  if (row < order.from) return row;
+  if (order.rotaryInterleaved) {
+    const uint64_t head = (row - order.from) / order.headRows;
+    const uint64_t dim = (row - order.from) % order.headRows;
+    const uint64_t half = order.headRows / 2;
+    return order.from + head * order.headRows + 2 * (dim % half) + (dim >= half ? 1 : 0);
+  }
+  const uint64_t head = (row - order.from) / order.headRows;
+  return order.from + ((head % order.valueHeadsPerKey) * order.keyHeads + head / order.valueHeadsPerKey) * order.headRows +
+         (row - order.from) % order.headRows;
+}
+
 // Plans one image. A missing tensor or one of a type this build cannot load
 // is added to `problems` and left out of the image, so the planner can name
 // every such tensor at once; a tensor of the wrong shape throws.
@@ -65,6 +80,10 @@ public:
   // may exceed the tensor's own within one tail tile: a vocabulary that is
   // not a tile multiple pads its head section with zero rows.
   void quantized(const std::string &name, uint64_t rows, uint64_t columns, RowOrder order = {}) {
+    if (const GgufTensor *coded = file_.find(name); coded && ggmlTrellisBits(coded->type)) {
+      trellis(name, rows, columns, order);
+      return;
+    }
     const GgufTensor *tensor = find(name, quantizedType);
     if (!tensor) return;
     if (tensor->rows() > rows || rows - tensor->rows() >= QUANT_TILE_ROWS ||
@@ -93,17 +112,119 @@ public:
     image_.repacks.push_back(std::move(repack));
   }
 
+  // A NariQ trellis tensor, copied compressed with its side tensors. Row
+  // regrouping cannot touch the coded tiles, so it is composed into pout:
+  // image row r reads source logical row source(r), new_pout[r] =
+  // original_pout[source(r)].
+  void trellis(const std::string &name, uint64_t rows, uint64_t columns, RowOrder order = {}) {
+    const GgufTensor *tensor = file_.find(name);
+    if (!tensor || !ggmlTrellisBits(tensor->type)) {
+      reject(name, tensor);
+      return;
+    }
+    TrellisTensorInfo info;
+    try {
+      info = readTrellisTensor(file_, name);
+    } catch (const GgufError &) {
+      reject(name, tensor);
+      return;
+    }
+    if (tensor->rows() != rows || tensor->columns() != columns)
+      throw GgufError("unexpected shape for " + name);
+    descriptor(tensor->type, rows, columns, {}, {tensor->bytes, info.s16->bytes, info.pre->bytes}, name);
+    GgufTrellisDescriptor d{};
+    d.bits = info.bits();
+    d.inputBlock = info.descriptor.colsKind ? info.descriptor.colsBlock : 1;
+    d.outputBlock = info.descriptor.rowsKind ? info.descriptor.rowsBlock : 1;
+    d.codesBytes = tensor->bytes;
+    d.scalesBytes = info.s16->bytes;
+    d.preBytes = info.pre->bytes;
+    d.postBytes = info.post->bytes;
+    d.pinBytes = info.pin ? info.pin->bytes : 0;
+    const bool ordered = order.from != UINT64_MAX;
+    d.poutBytes = info.pout || ordered ? rows * sizeof(int32_t) : 0;
+    d.flags = (d.pinBytes ? 1u : 0u) | (d.poutBytes ? 2u : 0u);
+    std::vector<uint8_t> encoded(sizeof d);
+    std::memcpy(encoded.data(), &d, sizeof d);
+    image_.fills.push_back({section(encoded.size()), std::move(encoded)});
+    copy(tensorRows(*tensor, 1, tensor->bytes));
+    copy(tensorRows(*info.s16, 1, info.s16->bytes));
+    copy(tensorRows(*info.pre, 1, info.pre->bytes));
+    copy(tensorRows(*info.post, 1, info.post->bytes));
+    if (info.pin) copy(tensorRows(*info.pin, 1, info.pin->bytes));
+    if (d.poutBytes) {
+      std::vector<int32_t> original(rows);
+      if (info.pout)
+        file_.source().readData(info.pout->offset, {reinterpret_cast<uint8_t *>(original.data()), info.pout->bytes});
+      else
+        for (uint32_t row = 0; row < rows; ++row) original[row] = static_cast<int32_t>(row);
+      std::vector<int32_t> composed(rows);
+      for (uint64_t row = 0; row < rows; ++row) {
+        const uint64_t source = ordered ? orderedSourceRow(order, row) : row;
+        if (source >= rows || original[source] < 0 || uint64_t(original[source]) >= rows)
+          throw GgufError("invalid trellis output gather: " + name);
+        composed[row] = original[source];
+      }
+      std::vector<uint8_t> bytes(rows * sizeof(int32_t));
+      std::memcpy(bytes.data(), composed.data(), bytes.size());
+      image_.fills.push_back({section(bytes.size()), std::move(bytes)});
+    }
+  }
+
+  // The banded NariQ output head: every band's trellis sections in band
+  // order, then output.vocab_gather.
+  void trellisHead(uint32_t bands, uint64_t rows, uint64_t columns) {
+    uint64_t covered = 0;
+    for (uint32_t band = 0; band < bands; ++band) {
+      char suffix[32];
+      std::snprintf(suffix, sizeof suffix, "output.band%02u.weight", band);
+      const GgufTensor *tensor = file_.find(suffix);
+      if (!tensor) {
+        reject(suffix, nullptr);
+        continue;
+      }
+      trellis(suffix, tensor->rows(), columns);
+      covered += tensor->rows();
+    }
+    if (covered != rows) throw GgufError("trellis output bands do not cover the vocabulary");
+    if (const GgufTensor *gather = file_.find("output.vocab_gather")) {
+      if (gather->type != ggml::kI32 || gather->elements() != rows)
+        throw GgufError("unexpected shape for output.vocab_gather");
+      std::vector<int32_t> original(rows);
+      file_.source().readData(gather->offset, {reinterpret_cast<uint8_t *>(original.data()), gather->bytes});
+      std::vector<int32_t> inverse(rows, -1);
+      for (uint64_t row = 0; row < rows; ++row) {
+        if (original[row] < 0 || uint64_t(original[row]) >= rows || inverse[static_cast<uint32_t>(original[row])] != -1)
+          throw GgufError("output.vocab_gather is not a permutation");
+        inverse[static_cast<uint32_t>(original[row])] = static_cast<int32_t>(row);
+      }
+      std::vector<uint8_t> bytes(rows * sizeof(int32_t));
+      std::memcpy(bytes.data(), inverse.data(), bytes.size());
+      image_.fills.push_back({section(bytes.size()), std::move(bytes)});
+    } else {
+      reject("output.vocab_gather", nullptr);
+    }
+  }
+
   // beta (value heads rows) | alpha (value heads rows), rows in grouped head
   // order: one 256-row tensor of their format padded with zero rows, or F32 as
   // one float tensor, which BF16 is widened to exactly.
   void alphaBeta(const std::string &betaName, const std::string &alphaName) {
     const GgufTensor *beta = file_.find(betaName), *alpha = file_.find(alphaName);
-    if (!beta || !alpha || beta->type != alpha->type || !alphaBetaType(beta->type)) {
+    const bool trellisPair = beta && alpha && ggmlTrellisBits(beta->type) && beta->type == alpha->type;
+    if (!beta || !alpha || beta->type != alpha->type || (!trellisPair && !alphaBetaType(beta->type))) {
       reject(betaName, beta);
       reject(alphaName, alpha);
       return;
     }
     const uint32_t heads = geometry_.gdnValueHeads, hidden = geometry_.hiddenSize;
+    if (trellisPair) {
+      if (beta->type != alpha->type)
+        throw GgufError("trellis alpha/beta must share their type: " + betaName);
+      trellis(betaName, heads, hidden, grouped(0, 1));
+      trellis(alphaName, heads, hidden, grouped(0, 1));
+      return;
+    }
     for (const GgufTensor *t : {beta, alpha})
       if (t->rows() != heads || t->columns() != hidden)
         throw GgufError("alpha/beta must be [" + std::to_string(heads) + ", hidden]: " + t->name);
@@ -176,6 +297,12 @@ public:
 
   // Native token rows, gathered by the embedding kernel.
   void embeddingRows(const std::string &name) {
+    if (const GgufTensor *coded = file_.find(name); coded && ggmlTrellisBits(coded->type)) {
+      if (coded->rows() != geometry_.vocabularySize || coded->columns() != geometry_.hiddenSize)
+        throw GgufError("unexpected shape for " + name);
+      trellis(name, coded->rows(), coded->columns());
+      return;
+    }
     const GgufTensor *tensor = find(name, embeddingType);
     if (!tensor) return;
     if (tensor->rows() != geometry_.vocabularySize || tensor->columns() != geometry_.hiddenSize)
@@ -1003,8 +1130,13 @@ std::vector<Image> planImages(const GgufFile &file, const TargetGeometry &geomet
                      ? "token_embd_norm.weight"
                      : "output_norm.weight",
                  geometry.hiddenSize);
-  head.quantized(geometry.tiedOutput ? "token_embd.weight" : "output.weight",
-                 paddedVocabularySize(geometry.vocabularySize), geometry.hiddenSize);
+  if (!geometry.tiedOutput && ggufHasTrellis(file) && ggufTrellisBandCount(file, "trellis.lm_head_bands")) {
+    head.trellisHead(ggufTrellisBandCount(file, "trellis.lm_head_bands"),
+                     paddedVocabularySize(geometry.vocabularySize), geometry.hiddenSize);
+  } else {
+    head.quantized(geometry.tiedOutput ? "token_embd.weight" : "output.weight",
+                   paddedVocabularySize(geometry.vocabularySize), geometry.hiddenSize);
+  }
   images.push_back(head.finish());
   Builder embedding(file, geometry, problems, "embedding.bin", geometry.vocabularySize, geometry.hiddenSize);
   embedding.embeddingRows("token_embd.weight");

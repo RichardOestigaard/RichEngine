@@ -604,6 +604,11 @@ class Frontend:
             if serving is not None and serving.vision is not None
             else IMAGE_PAD_TOKEN
         )
+        self.vision_spec = (
+            serving.vision
+            if serving is not None and serving.vision is not None
+            else serving_mod.VisionSpec()
+        )
         self.audio_pad_token = (
             serving.audio.pad_token
             if serving is not None and serving.audio is not None
@@ -1095,7 +1100,11 @@ class Frontend:
             raise APIError(400, "media count does not match the rendered template")
         return (
             len(prompt_tokens)
-            + sum(image.tokens - 1 for image in prepared)
+            + sum(
+                image.tokens - 1
+                + (2 if self.vision_spec.start_token and self.vision_spec.end_token else 0)
+                for image in prepared
+            )
             + sum(clip.tokens - 1 for clip in audios)
             + sum(len(expansion) - 1 for expansion in video_expansions)
         )
@@ -1209,6 +1218,18 @@ class Frontend:
             expanded.extend(prompt_tokens[cursor:position])
             if kind == "image":
                 image = prepared[index]
+                if self.vision_spec.start_token and self.vision_spec.end_token:
+                    start_id = self.tokenizer.convert_tokens_to_ids(
+                        self.vision_spec.start_token
+                    )
+                    end_id = self.tokenizer.convert_tokens_to_ids(
+                        self.vision_spec.end_token
+                    )
+                    if start_id is None or end_id is None:
+                        raise APIError(
+                            400, "the tokenizer does not define the image span tokens"
+                        )
+                    expanded.append(start_id)
                 image_spans.append(
                     wire.ImageSpan(
                         len(expanded),
@@ -1220,6 +1241,8 @@ class Frontend:
                     )
                 )
                 expanded.extend([pad_id("image_pad_token")] * image.tokens)
+                if self.vision_spec.start_token and self.vision_spec.end_token:
+                    expanded.append(end_id)
             elif kind == "audio":
                 clip = audios[index]
                 audio_spans.append(

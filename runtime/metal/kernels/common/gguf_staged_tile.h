@@ -18,10 +18,10 @@ constant constexpr uint kStagedStages = GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS 
 
 // The destination of a Rows-row tile, zeroed by the caller: returning an initialized cooperative tensor loses its
 // initial values on Apple9 in runtime-format kernels (also with shader validation).
-template <ushort Rows, ushort Cols, ushort KS>
+template <ushort Rows, ushort Cols, ushort KS, bool Relaxed = false>
 inline auto staged_accumulator(device bfloat *input, uint input_size, threadgroup half *stage) {
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
-  constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, Relaxed, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<descriptor, execution_simdgroups<1>> operation;
   auto a0 = a.template slice<KS, Rows>(0, 0);
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
@@ -95,13 +95,13 @@ inline typename F::Meta gguf_meta_at(device uchar *meta, device uchar *meta2, ul
 // payload while the step's matmul runs, and so its meta unit when the next step enters a new one (a unit spans
 // F::MetaGroups groups): both DRAM round trips overlap a matmul. Both go to the registers the step has just
 // dequantized from, so the prefetch holds no second meta unit.
-template <class F, ushort Rows, ushort Cols, ushort KS, ushort Threads, class Acc>
+template <class F, ushort Rows, ushort Cols, ushort KS, ushort Threads, bool Relaxed = false, class Acc>
 inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size,
                               uint output_origin, threadgroup half *stage, threadgroup half2 *tl, uint thread_index,
                               uint step_begin, uint step_end, uint step_first, bool matmuls, thread Acc &acc) {
   constexpr ushort GPS = KS / 32, Items = Cols * GPS, IPT = (Items + Threads - 1) / Threads;
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
-  constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, Relaxed, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<descriptor, execution_simdgroups<1>> operation;
   const uint groups = input_size / 32, units = groups / F::MetaGroups;
   const uint plane_tile = output_origin / QUANT_TILE_ROWS, plane_row = output_origin % QUANT_TILE_ROWS;
@@ -168,12 +168,12 @@ inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uch
 
 // The decode tile loop of one simdgroup without the store: its Cols columns over steps [step_begin, step_end) of K
 // from step_first.
-template <class F, ushort Rows, ushort Cols, ushort KS, class Acc>
+template <class F, ushort Rows, ushort Cols, ushort KS, bool Relaxed = false, class Acc>
 inline void staged_accumulate(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint output_origin,
                      threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint step_begin, uint step_end,
                      uint step_first, thread Acc &acc) {
-  gguf_staged_steps<F, Rows, Cols, KS, 32>(input, w0, w1, meta, input_size, output_origin, stage, tl, simd_lane, step_begin,
-                                           step_end, step_first, true, acc);
+  gguf_staged_steps<F, Rows, Cols, KS, 32, Relaxed>(input, w0, w1, meta, input_size, output_origin, stage, tl, simd_lane, step_begin,
+                                                    step_end, step_first, true, acc);
   simdgroup_barrier(mem_flags::mem_threadgroup, memory_order_acq_rel,
                     thread_scope_simdgroup);   // the stage may be reused by a following accumulate
 }
@@ -258,25 +258,25 @@ inline void gguf_staged_pair_steps(device bfloat *input, device uchar *gw0, devi
 
 // runtime dequantizer selection (uniform per threadgroup): the format's pair table, which every thread of the
 // threadgroup fills, then its tile loop
-template <ushort Rows, ushort Cols, ushort KS, class Acc>
+template <ushort Rows, ushort Cols, ushort KS, bool Relaxed = false, class Acc>
 inline void staged_accumulate_any(uint fmt, device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint origin,
                            threadgroup half *stage, threadgroup half2 *tl, uint thread_index, uint simd_lane, uint sb, uint se,
                            uint sf, thread Acc &acc) {
   quant_format_switch(fmt, [&](auto format) {
     typedef decltype(format) F;
     quant_pair_table<F>(tl, thread_index, GGUF_STAGED_THREADS);
-    staged_accumulate<F, Rows, Cols, KS>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, sf, acc);
+    staged_accumulate<F, Rows, Cols, KS, Relaxed>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, sf, acc);
   });
 }
 // NativeMxfp4 selects the `n` kernels' switch (quant_format_switch_native).
-template <ushort Rows, ushort Cols, ushort KS, bool NativeMxfp4, class Acc>
+template <ushort Rows, ushort Cols, ushort KS, bool NativeMxfp4, bool Relaxed = false, class Acc>
 inline void staged_accumulate_any_native(uint fmt, device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint origin,
                            threadgroup half *stage, threadgroup half2 *tl, uint thread_index, uint simd_lane, uint sb, uint se,
                            uint sf, thread Acc &acc) {
   const auto body = [&](auto format) {
     typedef decltype(format) F;
     quant_pair_table<F>(tl, thread_index, GGUF_STAGED_THREADS);
-    staged_accumulate<F, Rows, Cols, KS>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, sf, acc);
+    staged_accumulate<F, Rows, Cols, KS, Relaxed>(input, w0, w1, meta, input_size, origin, stage, tl, simd_lane, sb, se, sf, acc);
   };
   if constexpr (NativeMxfp4) quant_format_switch_native(fmt, body);
   else quant_format_switch(fmt, body);
