@@ -87,7 +87,7 @@ void dumpOpTimings() {
   double total = 0.0;
   for (const auto &[name, seconds] : rows) total += seconds;
   fprintf(stderr, "op timings (cumulative %.1fms):\n", total * 1000.0);
-  for (size_t i = 0; i < rows.size() && i < 24; ++i)
+  for (size_t i = 0; i < rows.size() && i < 96; ++i)
     fprintf(stderr, "  %8.3fms  %s\n", rows[i].second * 1000.0,
             rows[i].first.c_str());
 }

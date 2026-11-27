@@ -523,6 +523,7 @@ void Scheduler::commit(const BatchPlan &plan, std::span<const uint64_t> excluded
   if (plan.kind == WorkKind::Prefill) {
     prefillDispatchOrder_ = decodeDispatchOrder_;
     ++counters_.prefillBatches;
+    ++counters_.prefillBatchesByWidth[plan.width() - 1];
     for (const BatchItem &item : plan.items)
       counters_.prefillRows += item.tokenCount;
     uint64_t youngestServed = 0;

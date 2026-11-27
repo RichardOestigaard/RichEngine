@@ -490,9 +490,21 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // accepted-token cap tracks its rolling acceptance EWMA, so a lane that
   // keeps rejecting pays for fewer live verify rows — GDN scan depth and
   // the per-row vocabulary/argmax sweeps — instead of the fixed eight.
-  // On by default; RICHENGINE_ADAPTIVE_PROPOSALS=0 disables.
+  // RICHENGINE_ADAPTIVE_PROPOSALS=0 disables.
+  // Sparse MoE engages the controller by default: the dense case for leaving
+  // width pinned — a saved verify row costs nearly nothing — inverts on a
+  // sparse target, where each row grows the step's expert union at a
+  // measured ~1.3 ms (Ornith-1.5-35B-A3B, M5 Pro). There width must track
+  // what acceptance earns: cold lanes measured 25% slower at the pinned
+  // cap than at acceptance-priced width, while hot copy lanes saturated
+  // and held full width either way. Note the family tuning half of the AND
+  // currently vetoes every shipping model — no descriptor enables it — so
+  // the env knob alone never engaged the controller before this wiring.
   const bool adaptiveProposals_ =
-      modelPolicy().adaptiveProposals && geometry.tuning.adaptiveProposals;
+      (modelPolicy().adaptiveProposals && geometry.tuning.adaptiveProposals) ||
+      (geometry.target.ffnKind == FfnKind::SparseMoe &&
+       !(envFlag("RICHENGINE_ADAPTIVE_PROPOSALS") &&
+         !tuning().adaptiveProposals));
   // Per-step debug gates, read once: getenv scans environ linearly and these
   // ran inside the decode/finalize paths on every command.
   const bool treeDebug_ = tuning().treeDebug;

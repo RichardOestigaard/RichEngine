@@ -343,6 +343,11 @@ std::string runtimeStatusJson(
       << ",\"terminal\":" << scheduler.terminal
       << ",\"prefill_batches\":" << scheduler.prefillBatches
       << ",\"prefill_rows\":" << scheduler.prefillRows
+      << ",\"prefill_batches_by_width\":{\"b1\":"
+      << scheduler.prefillBatchesByWidth[0]
+      << ",\"b2\":" << scheduler.prefillBatchesByWidth[1]
+      << ",\"b3\":" << scheduler.prefillBatchesByWidth[2]
+      << ",\"b4\":" << scheduler.prefillBatchesByWidth[3] << "}"
       << ",\"decode_batches\":" << scheduler.decodeBatches
       << ",\"decode_batches_by_width\":{\"b1\":"
       << scheduler.decodeBatchesByWidth[0]

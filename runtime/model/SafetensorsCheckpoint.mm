@@ -7,8 +7,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <map>
+#include <set>
 
 namespace richengine::model {
 namespace {
@@ -312,5 +314,112 @@ void SafetensorsCheckpoint::requireLayerTypeMask(uint32_t layers, uint64_t atten
   }
 }
 void SafetensorsCheckpoint::checkUnchanged() const { for (const auto &source : impl_->files) source->checkUnchanged(); }
+
+namespace {
+
+// A quantization entry as C++ state the thin resolver's lambda can own: the
+// fields a per-module or the global entry declares, each absent when the
+// configuration omits it.
+struct ThinQuantEntry {
+  std::optional<uint32_t> bits;
+  std::optional<uint32_t> groupSize;
+  std::optional<std::string> mode;
+};
+
+std::optional<uint32_t> optionalNumber(id value) {
+  if (!value) return std::nullopt;
+  return static_cast<uint32_t>(number(value));
+}
+
+// The quantization dictionary as C++: its global entry and one entry per
+// module key, the same shape quantization() resolves against.
+struct ThinQuantization {
+  ThinQuantEntry global;
+  std::map<std::string, ThinQuantEntry, std::less<>> modules;
+};
+
+ThinQuantization thinQuantizationOf(NSDictionary *quantization) {
+  ThinQuantization result;
+  if (![quantization isKindOfClass:[NSDictionary class]]) return result;
+  @autoreleasepool {
+    result.global.bits = optionalNumber(quantization[@"bits"]);
+    result.global.groupSize = optionalNumber(quantization[@"group_size"]);
+    if ([quantization[@"mode"] isKindOfClass:[NSString class]])
+      result.global.mode = [quantization[@"mode"] UTF8String];
+    for (id key in quantization) {
+      id entry = quantization[key];
+      if (![key isKindOfClass:[NSString class]] || ![entry isKindOfClass:[NSDictionary class]]) continue;
+      ThinQuantEntry module;
+      module.bits = optionalNumber(entry[@"bits"]);
+      module.groupSize = optionalNumber(entry[@"group_size"]);
+      if ([entry[@"mode"] isKindOfClass:[NSString class]]) module.mode = [entry[@"mode"] UTF8String];
+      result.modules.emplace([key UTF8String], std::move(module));
+    }
+  }
+  return result;
+}
+
+} // namespace
+
+std::function<std::optional<SafetensorsCheckpoint::QuantSpec>(std::string_view)>
+SafetensorsCheckpoint::thinQuantizationResolver(const std::filesystem::path &directory) {
+  // The surviving documents of a thin target: config.json's quantization
+  // dictionary, and the tensor index packed-manifest.json preserved at
+  // installation. Eager, so a missing or corrupt document fails the plan
+  // before anything loads — as opening the checkpoint itself would.
+  ThinQuantization quantization;
+  std::set<std::string, std::less<>> names;
+  @autoreleasepool {
+    Impl impl;
+    impl.readConfiguration(directory / "config.json");
+    quantization = thinQuantizationOf(impl.quantization);
+    const std::filesystem::path manifestPath = directory / "packed-manifest.json";
+    std::error_code error;
+    if (!std::filesystem::exists(manifestPath, error) ||
+        std::filesystem::file_size(manifestPath, error) > 64 * 1024 * 1024)
+      throw WeightStoreError("cannot read " + manifestPath.string());
+    NSData *manifest = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:manifestPath.c_str()]];
+    NSDictionary *document = manifest ? object(manifest) : nil;
+    if (![document isKindOfClass:[NSDictionary class]] ||
+        ![document[@"shards"] isKindOfClass:[NSArray class]])
+      throw WeightStoreError("invalid thin target manifest");
+    for (id shard in document[@"shards"]) {
+      if (![shard isKindOfClass:[NSDictionary class]] ||
+          ![shard[@"tensors"] isKindOfClass:[NSDictionary class]])
+        throw WeightStoreError("invalid thin target manifest");
+      for (id tensor in shard[@"tensors"]) {
+        if (![tensor isKindOfClass:[NSString class]]) throw WeightStoreError("invalid thin target manifest");
+        if (names.size() == 65536) throw WeightStoreError("source tensor metadata exceeds bounds");
+        names.emplace([tensor UTF8String]);
+      }
+    }
+  }
+  return [quantization = std::move(quantization),
+          names = std::move(names)](std::string_view module) mutable -> std::optional<SafetensorsCheckpoint::QuantSpec> {
+    // quantization()'s resolution exactly: a module without a `.scales`
+    // tensor is unquantized whatever the dictionary declares, and both the
+    // tensor probe and the per-module entry retry without the
+    // "language_model." prefix some exports nest under.
+    const std::string scales = std::string(module) + ".scales";
+    bool found = names.find(scales) != names.end();
+    if (!found && scales.starts_with("language_model."))
+      found = names.find(scales.substr(std::string_view("language_model.").size())) != names.end();
+    if (!found) return std::nullopt;
+    auto entry = quantization.modules.find(module);
+    if (entry == quantization.modules.end() && module.starts_with("language_model."))
+      entry = quantization.modules.find(module.substr(std::string_view("language_model.").size()));
+    const ThinQuantEntry fallback = quantization.global;
+    const ThinQuantEntry &spec = entry == quantization.modules.end() ? fallback : entry->second;
+    const std::optional<uint32_t> bits = spec.bits ? spec.bits : fallback.bits;
+    const std::optional<uint32_t> groupSize = spec.groupSize ? spec.groupSize : fallback.groupSize;
+    if (!bits || !groupSize) return std::nullopt;
+    SafetensorsCheckpoint::QuantSpec result;
+    result.bits = *bits;
+    result.groupSize = *groupSize;
+    if (spec.mode) result.mode = *spec.mode;
+    else if (fallback.mode) result.mode = *fallback.mode;
+    return result;
+  };
+}
 
 } // namespace richengine::model

@@ -2,11 +2,13 @@ import contextlib
 import dataclasses
 import errno
 import fcntl
+import hashlib
 import io
 import json
 import os
 import re
 import shutil
+import struct
 import tempfile
 import unittest
 from pathlib import Path
@@ -842,6 +844,10 @@ class UpstreamTest(unittest.TestCase):
         self.assertIs(record["thin"], True)
         self.assertTrue((chosen.link / "target/packed-manifest.json").is_file())
         self.assertTrue((chosen.link / "target/packed-sources").is_file())
+        self.assertEqual(
+            {entry["ctime_ns"] for entry in record["files"].values()}, {0}
+        )
+        digest = chosen.link.resolve().name
         payload = chosen.link / "target/model.safetensors"
         blob = payload.readlink()
         self.assertEqual(blob.parent.name, ".blobs")
@@ -894,7 +900,10 @@ class UpstreamTest(unittest.TestCase):
 
         # Losing the packed cache makes verification fail again; the next
         # prepare redownloads/rebuilds the source-backed assembly, after
-        # which the runtime can pack and validate a new cache.
+        # which the runtime can pack and validate a new cache. The rebuilt
+        # record is byte-identical — the relinked blobs' volatile ctime is
+        # not in it — so the assembly keeps its digest and the runtime's
+        # owner and validation markers still name it.
         shutil.rmtree(cache_root)
         with mock.patch.dict(
             os.environ, {"RICHENGINE_PACKED_CACHE_ROOT": str(cache_root)}
@@ -902,8 +911,87 @@ class UpstreamTest(unittest.TestCase):
             self.prepare(chosen)
             assembly.verify(chosen.link)
         self.assertTrue(payload.is_file())
+        self.assertEqual(chosen.link.resolve().name, digest)
 
-    def test_thin_rejects_mixed_quantization_sources(self):
+    def test_thin_drop_keeps_blobs_shared_with_vision_entries(self):
+        # Qwen3.8-27B's layout: one repository shard holds both language and
+        # vision_tower tensors, so target/ and vision/ link the same file.
+        # Dropping the thin target payloads must not unlink the blob the
+        # vision entry of the same record still references.
+        shards = {
+            "vision_tower.blocks.0.attn.qkv.weight": "model-00001-of-00002.safetensors",
+            "language_model.model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+            "language_model.lm_head.weight": "model-00002-of-00002.safetensors",
+        }
+
+        def target(root):
+            mlx_target(root, DENSE)
+            (root / "model.safetensors").unlink()
+            (root / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": shards})
+            )
+            header = b"{}"
+            for name in set(shards.values()):
+                # Distinct data bytes per shard: the two files are different
+                # blobs, as the real checkpoint's are.
+                (root / name).write_bytes(
+                    struct.pack("<Q", len(header)) + header + name.encode()
+                )
+            (root / "preprocessor_config.json").write_text(json.dumps(PROCESSOR))
+
+        fake = FakeHub(self, self.cache)
+        fake.publish(MODEL, "a" * 40, target)
+        fake.publish(DENSE.draft.repo, DRAFT_COMMIT, lambda path: draft_dir(path, DENSE))
+        chosen = selection(self.root, thin=True, language_only=False)
+        self.prepare(chosen)
+        record = assembly.verify(chosen.link)
+        self.assertIs(record["thin"], True)
+        shared = record["files"]["vision/model-00001-of-00002.safetensors"]["path"]
+        self.assertEqual(
+            record["files"]["target/model-00001-of-00002.safetensors"]["path"], shared
+        )
+        blob = Path(shared)
+        self.assertEqual(blob.parent.name, ".blobs")
+
+        cache_root = self.root / "packed-cache"
+        entry = cache_root / "cache-key"
+        (entry / ".validated").mkdir(parents=True)
+        (entry / "layer-0.bin").write_bytes(b"weights")
+        (entry / ".packed").write_text("layer-0.bin 0 0 0 7\n")
+        (entry / ".validated" / chosen.link.resolve().name).write_text(
+            "assembly\nfingerprint\n"
+        )
+        with (
+            mock.patch.dict(
+                os.environ, {"RICHENGINE_PACKED_CACHE_ROOT": str(cache_root)}
+            ),
+            mock.patch.object(
+                assembly, "_engine_fingerprint_text", return_value="fingerprint"
+            ),
+        ):
+            self.assertIsNone(upstream._retain_installed(chosen))
+        # Both target payloads are dropped; the shared blob stays for vision,
+        # the shard only the target used is gone, and the record verifies.
+        self.assertFalse((chosen.link / "target/model-00001-of-00002.safetensors").exists())
+        self.assertFalse((chosen.link / "target/model-00002-of-00002.safetensors").exists())
+        self.assertTrue((chosen.link / "vision/model-00001-of-00002.safetensors").is_file())
+        self.assertTrue(blob.exists())
+        target_only = Path(
+            record["files"]["target/model-00002-of-00002.safetensors"]["path"]
+        )
+        self.assertFalse(target_only.exists())
+        with mock.patch.object(
+            assembly, "_engine_fingerprint_text", return_value="fingerprint"
+        ):
+            with mock.patch.dict(
+                os.environ, {"RICHENGINE_PACKED_CACHE_ROOT": str(cache_root)}
+            ):
+                assembly.verify(chosen.link)
+
+    def test_thin_installs_mixed_quantization_sources(self):
+        # Per-module oQ overrides thin as a uniform affine target does: the
+        # manifest the install writes preserves the tensor index the runtime
+        # replans the per-module specs from after the payload is dropped.
         fake = FakeHub(self, self.cache)
         def oq_target(path):
             mlx_target(path, DENSE)
@@ -917,8 +1005,14 @@ class UpstreamTest(unittest.TestCase):
 
         fake.publish("someone/oq", "e" * 40, oq_target)
         fake.publish(DENSE.draft.repo, DRAFT_COMMIT, lambda path: draft_dir(path, DENSE))
-        with self.assertRaisesRegex(models.ModelError, "mixed-quantization"):
-            self.prepare(selection(self.root, "someone/oq", thin=True))
+        chosen = selection(self.root, "someone/oq", thin=True)
+        output, _ = self.prepare(chosen)
+        self.assertIn("thin: payload links stay until the first successful serve", output)
+        record = assembly.verify(chosen.link)
+        self.assertIs(record["thin"], True)
+        self.assertEqual(record["target_format"], "mlx-affine")
+        self.assertTrue((chosen.link / "target/packed-manifest.json").is_file())
+        self.assertTrue((chosen.link / "target/packed-sources").is_file())
 
     def test_mlx_vision_links_only_the_shards_holding_the_tower(self):
         shards = {
@@ -1548,6 +1642,35 @@ class UpstreamTest(unittest.TestCase):
         assembly.verify(built)
         # The cached snapshot is complete; nothing is downloaded again.
         self.assertNotIn(f"{MODEL}/model.safetensors", fake.downloads)
+
+    def test_reinstall_reuses_an_assembly_of_legacy_ctime_digest(self):
+        # Assemblies installed before ctime was normalized out of the record
+        # are named by a digest of volatile times. Reinstalling one reuses
+        # its directory rather than publishing the same installation at the
+        # canonical digest, so the packed-cache owner and validation markers
+        # the runtime wrote for it keep naming a live assembly.
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        built = chosen.link.resolve()
+        record = json.loads((built / "model.json").read_text())
+        for entry in record["files"].values():
+            entry["ctime_ns"] = 123456789
+        encoded = models.json_bytes(record)
+        (built / "model.json").write_bytes(encoded)
+        legacy = built.parent / hashlib.sha256(encoded).hexdigest()
+        built.rename(legacy)
+        models.link_selection(chosen.link, legacy)
+        self.assertEqual(chosen.link.resolve().name, legacy.name)
+
+        (legacy / "tokenizer/tokenizer.json").unlink()
+        output, _ = self.prepare(chosen)
+        self.assertIn("Reinstalling " + MODEL, output)
+        self.assertEqual(chosen.link.resolve().name, legacy.name)
+        assembly.verify(chosen.link)
+        # The rebuild writes the normalized record into the reused directory.
+        rewritten = json.loads((legacy / "model.json").read_text())
+        self.assertEqual({e["ctime_ns"] for e in rewritten["files"].values()}, {0})
 
     def test_verify_checks_full_content_and_rejects_same_size_changes(self):
         source = self.root / "source"

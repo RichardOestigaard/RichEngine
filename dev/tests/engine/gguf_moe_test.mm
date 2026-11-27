@@ -1008,6 +1008,76 @@ int moeUngated(MetalBackend &backend) {
            100.0 * stats.downFlips / stats.outputs, stats.gateUpWorst, stats.downWorst,
            failures > before ? "FAIL" : "ok");
   }
+  // Explicit packed composition: two unlike sequences, in both orders. Each
+  // sequence also runs alone; every sequence slice must match bitwise.
+  {
+    const UngatedModel m = makeUngatedModel(backend, Q40, Q80);
+    const std::vector<float> originalInput = b.input, originalResidual = b.residual;
+    const auto setRows = [&](std::initializer_list<std::pair<uint32_t, uint32_t>> pieces) {
+      uint32_t rows = 0;
+      for (const auto [source, count] : pieces) rows += count;
+      b.input.assign(uint64_t{rows} * kUngatedHidden, 0.0f);
+      b.residual.assign(uint64_t{rows} * kUngatedHidden, 0.0f);
+      uint32_t at = 0;
+      for (const auto [source, count] : pieces) {
+        std::copy_n(originalInput.begin() + uint64_t{source} * kUngatedHidden,
+                    uint64_t{count} * kUngatedHidden,
+                    b.input.begin() + uint64_t{at} * kUngatedHidden);
+        std::copy_n(originalResidual.begin() + uint64_t{source} * kUngatedHidden,
+                    uint64_t{count} * kUngatedHidden,
+                    b.residual.begin() + uint64_t{at} * kUngatedHidden);
+        at += count;
+      }
+      b.moe.input = bfloatBuffer(backend, b.input, "packed-input");
+      b.moe.residual = bfloatBuffer(backend, b.residual, "packed-residual");
+      return rows;
+    };
+    const auto sliceDiff = [](const std::vector<uint16_t> &packed, uint32_t rowOffset,
+                              const std::vector<uint16_t> &solo, uint32_t rows) {
+      const size_t begin = uint64_t{rowOffset} * kUngatedHidden;
+      const size_t elements = uint64_t{rows} * kUngatedHidden;
+      for (size_t i = 0; i < elements; ++i)
+        if (packed[begin + i] != solo[i]) return begin + i;
+      return begin + elements;
+    };
+    for (const MoeExpertTile tile : {MoeExpertTile::M8, MoeExpertTile::M32}) {
+      Stats stats;
+      const auto planFor = [&](uint32_t rows) {
+        MoeConfig config{tile, moeRouteWideRows(kAssumedGpuCores),
+                         MoeExpertSimdgroups::Eight, MoeGgufTile::Staged};
+        return MoE::prefillPlan(shape, rows, config);
+      };
+      setRows({{0, 16}});
+      const std::vector<uint16_t> soloA =
+          runUngated(backend, m, b, planFor(16), stats, "packed solo A");
+      setRows({{16, 32}});
+      const std::vector<uint16_t> soloB =
+          runUngated(backend, m, b, planFor(32), stats, "packed solo B");
+      setRows({{0, 16}, {16, 32}});
+      const std::vector<uint16_t> packedAB =
+          runUngated(backend, m, b, planFor(48), stats, "packed AB");
+      setRows({{16, 32}, {0, 16}});
+      const std::vector<uint16_t> packedBA =
+          runUngated(backend, m, b, planFor(48), stats, "packed BA");
+      const std::string label = std::string("packed composition ") +
+          (tile == MoeExpertTile::M8 ? "M8" : "M32");
+      const struct {
+        size_t at, end;
+      } checks[4] = {
+          {sliceDiff(packedAB, 0, soloA, 16), 16 * kUngatedHidden},
+          {sliceDiff(packedAB, 16, soloB, 32), 48 * kUngatedHidden},
+          {sliceDiff(packedBA, 0, soloB, 32), 32 * kUngatedHidden},
+          {sliceDiff(packedBA, 32, soloA, 16), 48 * kUngatedHidden},
+      };
+      for (const auto [at, end] : checks) {
+        if (at == end) continue;
+        printf("  %s: first bitwise sequence mismatch at element %zu FAIL\n",
+               label.c_str(), at);
+        ++failures;
+        break;
+      }
+    }
+  }
   return failures;
 }
 

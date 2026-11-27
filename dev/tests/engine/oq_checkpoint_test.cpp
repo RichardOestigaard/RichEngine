@@ -114,6 +114,34 @@ int main() {
               "the declared spec did not resolve verbatim");
     }
 
+    // The thin resolver of the same directory — payload shard dropped, the
+    // installer's packed-manifest.json preserving its tensor index —
+    // resolves every spec the full checkpoint does. The manifest carries
+    // the shard's tensors as installation recorded them.
+    config(root, R"({"quantization":{"bits":4,"group_size":64,"mode":"affine",)"
+              R"("a":{"bits":5},"model.embed_tokens":{"bits":6,"group_size":64}}})");
+    {
+      std::string manifest = R"({"version":1,"shards":[{"name":"model.safetensors","digest":"x","bytes":1,"data_offset":0,"tensors":{)";
+      const char *names[] = {"a.weight", "a.scales", "a.biases", "b.weight", "b.scales", "b.biases",
+                             "plain.weight", "model.embed_tokens.weight", "model.embed_tokens.scales",
+                             "model.embed_tokens.biases"};
+      for (const char *name : names)
+        manifest += "\"" + std::string(name) +
+                    "\":{\"dtype\":\"U32\",\"shape\":[2,2],\"data_offsets\":[0,16]},";
+      manifest.back() = '}';
+      manifest += "}]}";
+      richengine::test::writeFile(root / "packed-manifest.json", manifest);
+      const auto resolve = SafetensorsCheckpoint::thinQuantizationResolver(root);
+      require(resolve("a") == QuantSpec{5, 64, "affine"},
+              "a thin per-module entry did not resolve or inherit");
+      require(resolve("b") == QuantSpec{4, 64, "affine"},
+              "a thin module without an entry did not take the global's");
+      require(resolve("language_model.model.embed_tokens") == QuantSpec{6, 64, "affine"},
+              "the thin prefixed module's entry did not resolve");
+      require(!resolve("plain") && !resolve("language_model.plain"),
+              "a thin plain module resolved as quantized");
+    }
+
     // The probe reports no checkpoint for a directory without a readable
     // config.json (the loader that runs instead reports it).
     const std::filesystem::path empty = root / "empty";
@@ -121,6 +149,8 @@ int main() {
     require(!oqCheckpoint(empty), "an unreadable config probed as an oQ checkpoint");
     rejects([&] { static_cast<void>(SafetensorsCheckpoint::hasMixedQuantization(empty)); },
             "cannot read", "a missing config was accepted");
+    rejects([&] { static_cast<void>(SafetensorsCheckpoint::thinQuantizationResolver(empty)); },
+            "cannot read", "a thin target without documents was accepted");
 
     std::cout << "oq checkpoint: per-module specs, prefix fallback, unquantized modules, probes PASS\n";
   } catch (const std::exception &error) {

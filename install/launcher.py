@@ -194,8 +194,10 @@ def _ensure_installed(selection):
             command[-1:-1] = [flag, value]
     if selection.language_only:
         command.insert(-1, "--language-only")
-    if selection.thin:
+    if selection.thin and not selection.no_thin:
         command.insert(-1, "--thin")
+    if selection.no_thin:
+        command.insert(-1, "--no-thin")
     if _run_held(command, cwd=ROOT):
         raise LauncherError(
             "model download or verification failed",
@@ -521,6 +523,7 @@ def serve(args):
             language_only=args.language_only,
             draft_model=args.draft_model,
             thin=args.thin,
+            no_thin=args.no_thin,
         )
         kind = model_artifacts.installation_kind(selection.link)
         from . import gc as hub_gc
@@ -607,6 +610,7 @@ def serve(args):
                 language_only=args.language_only,
                 draft_model=args.draft_model,
                 thin=args.thin,
+                no_thin=args.no_thin,
             )
             _ensure_installed(selection)
             # A concurrent install may advance the selection link. Keep this
@@ -2097,6 +2101,14 @@ def _build_parser():
             "cache validates; the cache is RICHENGINE_PACKED_CACHE_ROOT or "
             "~/Library/Caches/RichEngine/packed, and losing it downloads and "
             "rebuilds the payload"
+        ),
+    )
+    server.add_argument(
+        "--no-thin",
+        action="store_true",
+        help=(
+            "install the full payload even when only a thin installation of "
+            "the model exists (thin installs are sticky without it)"
         ),
     )
     server.add_argument(

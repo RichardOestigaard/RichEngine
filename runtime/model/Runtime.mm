@@ -872,6 +872,20 @@ Runtime::decodeAsync(const BatchPlan &plan,
     constrained = constrained ||
                   impl_->request(item.requestId).constraint ==
                       ConstraintMode::TokenMask;
+  // Verify rows shrink with context when RICHENGINE_VERIFY_CTX_SCALE is
+  // set: proposals divide by (1 + position/scale). Default off everywhere —
+  // the attention cost it was meant to cover does not exist in the tiled
+  // kernels: every row of a lane shares the same KV reads, so cycle time
+  // measured flat in width at every tested scale on dense (33 ms/cycle
+  // at 1 row versus 7 rows at 57K context on Ornith-9B) while the divisor
+  // starved hot lanes to one or two rows — copy traffic measured 3.8x
+  // faster with it off at 57K, 2.7x at 25K and 2.6x in aggregate at B4,
+  // byte-identical output in every arm. Sparse MoE rows do cost real bytes
+  // (~1.3 ms each, measured) — but width there is now priced by the
+  // adaptive acceptance budget the divisor used to substitute for, and
+  // the positional cap cost hot MoE lanes 2x on copy traffic while cold
+  // lanes are exactly the case the acceptance EWMA shrinks.
+  const double ctxScale = envDouble("RICHENGINE_VERIFY_CTX_SCALE", 0);
   for (uint32_t lane = 0; lane < width; ++lane) {
     const ModelBatchItem &item = items[lane];
     Impl::Request &entry = impl_->request(item.requestId);
@@ -935,12 +949,6 @@ Runtime::decodeAsync(const BatchPlan &plan,
       proposals[lane] = 0;
       liveRows[lane] = 1;
     }
-    // Verify rows shrink with context: proposals divide by
-    // (1 + position/RICHENGINE_VERIFY_CTX_SCALE), so a lane at 2× the scale
-    // verifies half the rows of one at 1×. Covers the attention term the
-    // VerifyBudget cost table does not see. Default 16000; =0 disables.
-    static const double ctxScale =
-        envDouble("RICHENGINE_VERIFY_CTX_SCALE", 16000);
     if (ctxScale > 0)
       proposals[lane] = std::min<uint32_t>(
           proposals[lane],
@@ -1183,6 +1191,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
       lanes[lane].proposals = clipped;
     }
   }
+  commandGraph.setEncodePhase(metal::EncodePhase::Draft);
   if (!predrafted && !draftBypassed && !spanSkipDraft) {
     impl_->encodeDraftInputEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
                                 DecodeTensor::DraftHidden0, width, 1,
@@ -1197,6 +1206,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   // comb tables. Bypassed and span-skipped batches keep their rows — the
   // bypass's EWMA bookkeeping and the DFA's forced span both break under
   // an overwrite.
+  commandGraph.setEncodePhase(metal::EncodePhase::Selector);
   if (!tree && !(predrafted && !gpuPredrafted) && !draftBypassed &&
       !spanSkipDraft && impl_->ngram_.mixMask_)
     impl_->applyNgramMix(commandGraph, entries, width);
@@ -1311,6 +1321,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
           impl_->aneLeafTokens_, impl_->aneFlag_,
           impl_->decodeArena->packed(DecodeTensor::TreeCounts, width),
           impl_->medusaSerial_.load(), width);
+    commandGraph.setEncodePhase(metal::EncodePhase::TargetInput);
     impl_->encodeBatchVerifyTreeInput(commandGraph, entries, items, width);
     impl_->addRopeTables(
         commandGraph,
@@ -1325,15 +1336,19 @@ Runtime::decodeAsync(const BatchPlan &plan,
         impl_->decodeArena->packed(DecodeTensor::RopeSinAlt, 2 * width));
     impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
                                 DecodeTensor::Hidden0, width, 2);
+    commandGraph.setEncodePhase(metal::EncodePhase::TargetForward);
     if (!skipForward)
       impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items,
                                             true);
+    commandGraph.setEncodePhase(metal::EncodePhase::TargetPolicy);
     if (!skipPolicy)
       impl_->encodeTargetVerifyBatchPolicy(commandGraph, entries, true);
+    commandGraph.setEncodePhase(metal::EncodePhase::Acceptance);
     impl_->encodeBatchAcceptance(commandGraph, entries,
                                  {maximumRetained.data(), width}, true);
     if (!skipCommits && !skipKv)
       impl_->encodeBatchTreeKvCompact(commandGraph, entries, items);
+    commandGraph.setEncodePhase(metal::EncodePhase::Commit);
     if (!skipCommits && !skipGdn)
       impl_->encodeBatchGdnCommit(commandGraph, entries, true);
     // A Null draft keeps no context: its capture gather and context commit
@@ -1344,6 +1359,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                {budgets.data(), width},
                                ExecutionLimits::targetVerifyRows);
   } else {
+    commandGraph.setEncodePhase(metal::EncodePhase::TargetInput);
     impl_->encodeBatchVerifyInput(commandGraph, entries, items, width,
                                   {liveRows.data(), width});
     impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
@@ -1363,21 +1379,26 @@ Runtime::decodeAsync(const BatchPlan &plan,
           {0, impl_->geometry.target.hiddenSize, 0}, 1,
           impl_->geometry.target.hiddenSize);
     }
+    commandGraph.setEncodePhase(metal::EncodePhase::TargetForward);
     impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items, false,
                                           {liveRows.data(), width},
                                           targetStride);
+    commandGraph.setEncodePhase(metal::EncodePhase::TargetPolicy);
     impl_->encodeTargetVerifyBatchPolicy(commandGraph, entries, false,
                                          {liveRows.data(), width}, 0,
                                          targetStride);
+    commandGraph.setEncodePhase(metal::EncodePhase::Acceptance);
     impl_->encodeBatchAcceptance(commandGraph, entries,
                                  {maximumRetained.data(), width}, false,
                                  {proposals.data(), width});
+    commandGraph.setEncodePhase(metal::EncodePhase::Commit);
     impl_->encodeBatchGdnCommit(commandGraph, entries);
     impl_->encodeDraftStateCommitBatch(commandGraph, entries, items);
     impl_->encodeBatchStepPack(commandGraph, entries, items,
                                {budgets.data(), width},
                                impl_->geometry.draft.verifyRows());
     // The chained predraft's dispatches follow the pack they read.
+    commandGraph.setEncodePhase(metal::EncodePhase::Predraft);
     impl_->encodeChainedPredraft(commandGraph, entries, items);
   }
 
@@ -1438,6 +1459,82 @@ Runtime::decodeAsync(const BatchPlan &plan,
   // of the shared arena ended, while this host submission already ran
   // during its execution. The event step keeps the command off the baked
   // span replay (MetalEncode.mm), so each dispatch encodes directly.
+  static const bool decodeDispatchStats = envFlag("RICHENGINE_DECODE_DISPATCH_STATS");
+  if (decodeDispatchStats) {
+    struct PhaseStats {
+      uint32_t dispatches = 0, bakeable = 0, gpuSpan = 0, direct = 0;
+      uint64_t groups = 0;
+    };
+    constexpr size_t phaseCount = static_cast<size_t>(metal::EncodePhase::Predraft) + 1;
+    std::array<PhaseStats, phaseCount> phases{};
+    uint64_t groups = 0;
+    uint32_t bakeable = 0, gpuSpan = 0, direct = 0;
+    for (const metal::ComputeDispatch &dispatch : commandGraph.dispatches()) {
+      const size_t phase = static_cast<size_t>(dispatch.encodePhase);
+      PhaseStats &stats = phases[phase];
+      ++stats.dispatches;
+      const uint64_t dispatchGroups = uint64_t{dispatch.threadgroups.x} *
+                                      dispatch.threadgroups.y * dispatch.threadgroups.z;
+      stats.groups += dispatchGroups;
+      groups += dispatchGroups;
+      if (dispatch.bakeable) {
+        ++stats.bakeable;
+        ++bakeable;
+      } else if (dispatch.gpuSpan) {
+        ++stats.gpuSpan;
+        ++gpuSpan;
+      } else {
+        ++stats.direct;
+        ++direct;
+      }
+    }
+    static constexpr std::string_view phaseNames[] = {
+        "other", "draft", "selector", "target_input", "target_forward",
+        "target_policy", "acceptance", "commit", "predraft"};
+    fprintf(stderr,
+            "decode-dispatch width=%u total=%zu groups=%llu bakeable=%u gpu_span=%u direct=%u\n",
+            width, commandGraph.dispatches().size(),
+            static_cast<unsigned long long>(groups), bakeable, gpuSpan, direct);
+    for (size_t phase = 0; phase < phaseCount; ++phase) {
+      const PhaseStats &stats = phases[phase];
+      if (!stats.dispatches) continue;
+      fprintf(stderr,
+              "  %.*s n=%u groups=%llu bake=%u gpu=%u direct=%u\n",
+              static_cast<int>(phaseNames[phase].size()), phaseNames[phase].data(),
+              stats.dispatches, static_cast<unsigned long long>(stats.groups),
+              stats.bakeable, stats.gpuSpan, stats.direct);
+    }
+    static const bool dispatchPipelines =
+        envFlag("RICHENGINE_DECODE_DISPATCH_PIPELINES");
+    static std::atomic<uint32_t> pipelineDumps{0};
+    if (dispatchPipelines && pipelineDumps.fetch_add(1) < 2) {
+      struct PipelineStats {
+        uint32_t dispatches = 0, bakeable = 0, gpuSpan = 0, direct = 0;
+      };
+      std::unordered_map<std::string, PipelineStats> pipelines;
+      for (const metal::ComputeDispatch &dispatch : commandGraph.dispatches()) {
+        const size_t phase = static_cast<size_t>(dispatch.encodePhase);
+        PipelineStats &stats =
+            pipelines[std::string(phaseNames[phase]) + "|" + dispatch.pipelineName];
+        ++stats.dispatches;
+        stats.bakeable += dispatch.bakeable ? 1 : 0;
+        stats.gpuSpan += dispatch.gpuSpan ? 1 : 0;
+        stats.direct += !dispatch.bakeable && !dispatch.gpuSpan ? 1 : 0;
+      }
+      std::vector<std::pair<std::string, PipelineStats>> rows(
+          pipelines.begin(), pipelines.end());
+      std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) {
+        return a.second.dispatches > b.second.dispatches;
+      });
+      for (size_t row = 0; row < rows.size() && row < 48; ++row) {
+        const auto &[name, stats] = rows[row];
+        fprintf(stderr, "  pipeline %s n=%u bake=%u gpu=%u direct=%u\n",
+                name.c_str(), stats.dispatches, stats.bakeable, stats.gpuSpan,
+                stats.direct);
+      }
+    }
+  }
+
   CommandTicket command;
   if (const std::optional<EventStep> wait =
           overlapPredraft ? impl_->inFlightPredraftWait() : std::nullopt) {

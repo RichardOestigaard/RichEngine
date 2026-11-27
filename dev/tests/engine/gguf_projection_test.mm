@@ -89,12 +89,14 @@ void section(const std::string &what) {
 
 const char *tileName(LinearTile tile) { return tile == LinearTile::GgufRegister ? "register" : "staged"; }
 // The formats a tile decodes: all but the register tile's, whose bf16
-// operands cannot hold the oQ AF8 formats' eight-bit codes — the Apple9
-// policy stages them instead (ops/LinearGguf.cpp's apple9StagesFormat).
+// operands cannot hold the oQ AF8 formats' eight-bit codes, and AF4P, whose
+// 64-group plane0 order and separate bias plane the register tile's weight
+// stream and coefficient decode never read — the policy stages them instead
+// (metal/abi/QuantFormat.h's quant_register_format).
 std::vector<uint32_t> tileFormats(LinearTile tile) {
   std::vector<uint32_t> formats;
   for (uint32_t f = 0; f < FMT_COUNT; ++f)
-    if (tile != LinearTile::GgufRegister || (f != GGUF_FMT_AF8 && f != GGUF_FMT_AF8G128))
+    if (tile != LinearTile::GgufRegister || (f != GGUF_FMT_AF8 && f != GGUF_FMT_AF8G128 && f != GGUF_FMT_AF4P))
       formats.push_back(f);
   return formats;
 }
@@ -912,6 +914,7 @@ void packedInput(MetalBackend &backend, const Linear &linear) {
 // identical outputs: proves the af4p->af4 plane repack produces what the
 // staged tile reads.
 void af4pRepack(MetalBackend &backend, const Linear &linear, LinearTile tile) {
+  if (tile == LinearTile::GgufRegister) return;   // the register tile never decodes af4p (tileFormats)
   constexpr uint32_t N = 5120, K = 17408, columns = N;
   const uint32_t G = K / 32, units = G / 2;
   const auto deinterleave = [](const uint8_t *in) {

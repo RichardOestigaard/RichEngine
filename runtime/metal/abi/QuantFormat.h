@@ -183,8 +183,14 @@ inline constexpr uint32_t gguf_format_of(uint32_t ggml_type) {
 }
 
 // Whether the Apple9 register tile (kernels/decode/linear_gguf_sgmatrix.metal)
-// takes a format in rows of whole coefficient units.
-inline constexpr bool quant_register_format(uint32_t) { return true; }
+// takes a format in rows of whole coefficient units. AF8's eight-bit codes
+// the bf16(0x4300 + code) operand does not hold exactly past 127, and AF4P's
+// 64-group plane0 order and separate bias plane the tile's weight stream and
+// coefficient decode never read (no code_at/loadMeta2 hooks there) — both
+// stage instead.
+inline constexpr bool quant_register_format(uint32_t format) {
+  return format != GGUF_FMT_AF8 && format != GGUF_FMT_AF8G128 && format != GGUF_FMT_AF4P;
+}
 // The columns the register tile takes in `format`: whole coefficient units —
 // one 64-input span for a format of one group per meta unit, else four.
 inline constexpr bool quant_register_tensor(uint32_t format, uint64_t columns) {

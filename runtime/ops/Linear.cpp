@@ -89,7 +89,12 @@ void validate(LinearWorkload w) {
         !w.rows || w.rows % kDecodeActivationRows ||
         w.rows > RICHENGINE_TARGET_VERIFY_ROWS * RICHENGINE_MAXIMUM_BATCH_WIDTH ||
         w.epilogue == LinearEpilogue::UpWithGate)
-      throw std::invalid_argument("invalid linear decode workload");
+      throw std::invalid_argument(
+          "invalid linear decode workload rows=" + std::to_string(w.rows) +
+          " output=" + std::to_string(w.matrix.outputSize) +
+          " input=" + std::to_string(w.matrix.inputSize) +
+          " layout=" + std::to_string(int(w.weightLayout)) +
+          " epilogue=" + std::to_string(int(w.epilogue)));
   }
 }
 

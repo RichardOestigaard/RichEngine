@@ -155,6 +155,20 @@ struct BytesBinding {
   uint64_t sizeBytes = 0;
 };
 
+// Host-side encode phase metadata for dispatch-chain profiling. It never
+// reaches the GPU and does not participate in baked-span identity.
+enum class EncodePhase : uint8_t {
+  Other,
+  Draft,
+  Selector,
+  TargetInput,
+  TargetForward,
+  TargetPolicy,
+  Acceptance,
+  Commit,
+  Predraft,
+};
+
 struct ComputeDispatch {
   std::string pipelineName;
   std::vector<BufferBinding> buffers;
@@ -195,6 +209,7 @@ struct ComputeDispatch {
   // bakeable it is a commitment, not a candidate: the encoder stages the
   // run's bindings and parameter payloads every submission.
   bool gpuSpan = false;
+  EncodePhase encodePhase = EncodePhase::Other;
 };
 
 // Orders a command against another agent, such as the Neural Engine, after

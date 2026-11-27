@@ -70,6 +70,28 @@ ungated latent MoE stays opt-in: auto never selects it, force it with
 `RICHENGINE_MOE_INDIRECT_DISPATCH=1`. Prefill, canvas, register, packed,
 streamed, int8 and fused indirect-gather plans never take it.
 
+## MoE packed prefill matrix
+
+`gguf-moe-benchmark`'s `packmatrix` mode compares one packed invariant
+staged-GGUF prefill graph with per-sequence invariant graphs over uniform
+and ragged row compositions:
+
+```sh
+make build/engine-tests/gguf-moe-benchmark
+./build/engine-tests/gguf-moe-benchmark build/richengine.metallib packmatrix 5
+./build/engine-tests/gguf-moe-benchmark build/richengine.metallib boltpack 5
+```
+
+`packmatrix` uses the default gated 35B shape; `boltpack` uses Bolt's
+latent routed-layer shapes.
+
+The mode first checks packed/split output bitwise equality, then reports
+ABBA median GPU milliseconds per MoE layer. Use it before changing packing
+policy. Low route occupancy alone does not imply that splitting wins:
+invariant staged tiles already pad sparse expert tiles to their minimum
+matmul width, while splitting repeats routing, gather, combine and expert
+weight streams.
+
 ## Results
 
 Raw results land in `build/release/bench/*.json` (or `--output-dir` under

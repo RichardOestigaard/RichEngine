@@ -146,7 +146,13 @@ def compare_pair(runs: list[dict], control: str, treatment: str) -> dict:
             "ci95": [round(value, 4) for value in ci] if ci else None,
             "win_rate": round(sum(row < 1 for row in rows) / len(rows), 3) if rows else 0,
         }
-    for key in ("wall_tok_s", "decode_gpu_ms_delta"):
+    for key in (
+        "wall_tok_s",
+        "decode_gpu_ms_delta",
+        "decode_gpu_ms_per_token",
+        "decode_wall_ms_per_token",
+        "verify_rows_per_token",
+    ):
         rows = suite_ratios(runs, control, treatment, key)
         result["suite_" + key] = {
             "repetitions": len(rows),
@@ -196,7 +202,15 @@ def main() -> int:
                 artifact = args.out.parent / f"{args.out.stem}-{arm}-rep{rep}.json"
                 print(f"rep {rep + 1}/{args.repeat} arm {arm}", flush=True)
                 try:
-                    payload = run_one(binary, args.model, args, arm, rep, artifact)
+                    payload = None
+                    for attempt in range(3):
+                        payload = run_one(binary, args.model, args, arm, rep, artifact)
+                        reason = payload["summary"].get("invalid_reason") or ""
+                        if not reason:
+                            break
+                        print(f"  invalid: {reason}; retrying arm", flush=True)
+                    else:
+                        raise RuntimeError(f"arm remained invalid after retries: {reason}")
                     runs.append({
                         "arm": arm,
                         "repetition": rep,

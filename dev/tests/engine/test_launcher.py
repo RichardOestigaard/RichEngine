@@ -70,11 +70,17 @@ def server_arguments(argv):
 class LauncherTests(unittest.TestCase):
     def setUp(self):
         # No serve refreshes the catalog from the Hub into the checkout, and
-        # the launcher's defaults ignore the caller's RichEngine settings.
+        # the launcher's defaults ignore the caller's RichEngine settings and
+        # per-user configuration.
         self.refresh = self.enterContext(
             mock.patch.object(launcher.catalog, "spawn_refresh")
         )
         self.enterContext(mock.patch.dict(os.environ))
+        self.enterContext(
+            mock.patch.object(
+                launcher.paths, "_configured_models_dir", return_value=None
+            )
+        )
         for name in (
             "RICHENGINE_PORT",
             "RICHENGINE_API_KEY",

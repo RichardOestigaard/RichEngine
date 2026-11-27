@@ -56,6 +56,8 @@ struct SchedulerSnapshot final {
   uint64_t prefillRows = 0;
   uint64_t decodeBatches = 0;
   std::array<uint64_t, model::ExecutionLimits::maximumBatchWidth>
+      prefillBatchesByWidth{};
+  std::array<uint64_t, model::ExecutionLimits::maximumBatchWidth>
       decodeBatchesByWidth{};
 };
 

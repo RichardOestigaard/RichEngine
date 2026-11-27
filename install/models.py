@@ -305,6 +305,7 @@ class Selection:
     models_root: Path
     thin: bool
     link: Path
+    no_thin: bool = False
 
     @classmethod
     def of(
@@ -316,6 +317,7 @@ class Selection:
         language_only=False,
         draft_model=None,
         thin=False,
+        no_thin=False,
     ):
         path = _local_directory(model)
         if path is not None:
@@ -334,6 +336,19 @@ class Selection:
         if thin:
             options["thin"] = True
         link = selection_link(models_root, link_key, **options)
+        if not thin and not no_thin and not link.is_symlink():
+            # Thin is sticky per model, not per invocation: the install a
+            # --thin start made is what serves later starts without it,
+            # rather than a silent non-thin reinstall beside it. --no-thin
+            # opts out, installing the full payload explicitly.
+            sticky = selection_link(models_root, link_key, **options, thin=True)
+            if installation_kind(sticky) is not None:
+                warn(
+                    f"using the thin installation of {display}; "
+                    "pass --no-thin to reinstall the full payload"
+                )
+                thin = True
+                link = sticky
         return cls(
             display,
             repo_id,
@@ -344,6 +359,7 @@ class Selection:
             models_root,
             thin,
             link,
+            no_thin,
         )
 
 
@@ -488,10 +504,17 @@ def _rewrite_internal_links(source: Path, destination: Path):
     renamed = {}
 
     def inside_source(path):
-        try:
-            return Path(os.path.realpath(path)).relative_to(source_real)
-        except ValueError:
-            return None
+        # A link can point at a path inside the store which itself links out
+        # of it. Test the link's lexical path rather than its final target:
+        # the copy preserves that chain, so the link still belongs to the store.
+        absolute = Path(os.path.abspath(path))
+        roots = (Path(os.path.abspath(source)), source_real)
+        for root in dict.fromkeys(roots):
+            try:
+                return absolute.relative_to(root)
+            except ValueError:
+                pass
+        return None
 
     if resolved.is_dir():
         for assembly_dir in sorted(resolved.iterdir()):
@@ -651,38 +674,49 @@ def migrate_models_root(destination: Path):
             size = file_source.stat().st_size
         except OSError:
             size = 0
-        try:
-            os.link(file_source, file_destination)
-        except FileExistsError:
-            pass
-        except OSError:
-            # Cross-volume copies can sit on one multi-GB weight for minutes:
-            # progress within the file matters more than a file count does.
-            copied_file = 0
-            next_file_report = 256 * 1024 * 1024
-            temporary = tempfile.NamedTemporaryFile(
-                dir=file_destination.parent, prefix=".migrating-", delete=False
-            )
-            temporary_path = Path(temporary.name)
+        assembly_record = (
+            file_source.name == layout.ASSEMBLY_RECORD
+            and file_source.parent.parent.name == layout.RESOLVED
+        )
+        if assembly_record:
+            # Migration rewrites internal paths in copied records. They are
+            # small, so give each copy its own inode: hardlinking one would
+            # make that rewrite overwrite the source root's record as well.
+            shutil.copy2(file_source, file_destination)
+        else:
             try:
-                with temporary as output, file_source.open("rb") as input:
-                    while chunk := input.read(8 * 1024 * 1024):
-                        output.write(chunk)
-                        copied_file += len(chunk)
-                        if copied_file >= next_file_report:
-                            print(
-                                f"migrate: {file_source.name} "
-                                f"{_format_bytes(copied_file)}/{_format_bytes(size)}",
-                                flush=True,
-                            )
-                            next_file_report += 256 * 1024 * 1024
-                    output.flush()
-                    os.fsync(output.fileno())
-                os.replace(temporary_path, file_destination)
-                shutil.copystat(file_source, file_destination)
-            except BaseException:
-                temporary_path.unlink(missing_ok=True)
-                raise
+                os.link(file_source, file_destination)
+            except FileExistsError:
+                pass
+            except OSError:
+                # Cross-volume copies can sit on one multi-GB weight for minutes:
+                # progress within the file matters more than a file count does.
+                copied_file = 0
+                next_file_report = 256 * 1024 * 1024
+                temporary = tempfile.NamedTemporaryFile(
+                    dir=file_destination.parent, prefix=".migrating-", delete=False
+                )
+                temporary_path = Path(temporary.name)
+                try:
+                    with temporary as output, file_source.open("rb") as input:
+                        while chunk := input.read(8 * 1024 * 1024):
+                            output.write(chunk)
+                            copied_file += len(chunk)
+                            if copied_file >= next_file_report:
+                                print(
+                                    f"migrate: {file_source.name} "
+                                    f"{_format_bytes(copied_file)}"
+                                    f"/{_format_bytes(size)}",
+                                    flush=True,
+                                )
+                                next_file_report += 256 * 1024 * 1024
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.replace(temporary_path, file_destination)
+                    shutil.copystat(file_source, file_destination)
+                except BaseException:
+                    temporary_path.unlink(missing_ok=True)
+                    raise
         progress["files"] += 1
         progress["bytes"] += size
         complete = progress["files"] == total_files
@@ -764,6 +798,14 @@ def parse_args(argv=None):
             "rebuilds the payload"
         ),
     )
+    parser.add_argument(
+        "--no-thin",
+        action="store_true",
+        help=(
+            "install the full payload even when only a thin installation of "
+            "the model exists (thin installs are sticky without it)"
+        ),
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare")
     commands.add_parser("verify").add_argument("--full", action="store_true")
@@ -826,6 +868,7 @@ def main(argv=None):
             language_only=args.language_only,
             draft_model=args.draft_model,
             thin=args.thin,
+            no_thin=args.no_thin,
         )
         if args.command == "link":
             print(selection.link)

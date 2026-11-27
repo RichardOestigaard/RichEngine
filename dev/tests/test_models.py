@@ -775,6 +775,42 @@ class ModelArtifactTest(unittest.TestCase):
             link = installer.selection_link(models.resolve(), arguments[1], **options)
             self.assertEqual(output.getvalue(), f"{link}\n")
 
+    def test_a_thin_installation_is_sticky_without_thin(self):
+        # Only a thin install of owner/repo exists: a plain selection uses
+        # it rather than reinstalling the full payload, --no-thin opts out,
+        # and an existing plain install is never displaced.
+        # Selection.of resolves the models root (macOS links /var to
+        # /private/var), so the fixture does too.
+        models = (self.root / "models").resolve()
+        assembly = self.root / "assembly"
+        assembly.mkdir()
+        (assembly / "model.json").write_text("{}")
+        thin_link = installer.selection_link(models, "owner/repo", thin=True)
+        thin_link.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(assembly, thin_link)
+        with contextlib.redirect_stderr(io.StringIO()) as warnings:
+            sticky = installer.Selection.of(models, "owner/repo")
+        self.assertEqual(sticky.link, thin_link)
+        self.assertIs(sticky.thin, True)
+        self.assertIn("thin installation", warnings.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()):
+            plain = installer.Selection.of(models, "owner/repo", no_thin=True)
+        self.assertEqual(plain.link, models / "owner" / "repo")
+        self.assertIs(plain.thin, False)
+        # Nothing redirects when the plain install exists too, nor when no
+        # thin installation does.
+        (models / "owner" / "repo").parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(assembly, models / "owner" / "repo")
+        with contextlib.redirect_stderr(io.StringIO()) as warnings:
+            both = installer.Selection.of(models, "owner/repo")
+        self.assertEqual(both.link, models / "owner" / "repo")
+        self.assertIs(both.thin, False)
+        self.assertNotIn("thin installation", warnings.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()):
+            plain2 = installer.Selection.of(models, "owner/other")
+        self.assertEqual(plain2.link, models / "owner" / "other")
+        self.assertIs(plain2.thin, False)
+
     def test_a_package_takes_no_variant(self):
         snapshot, _ = self.package_fixture()
         self.configure_hub(snapshot)
@@ -1147,6 +1183,12 @@ class ModelsRootTests(unittest.TestCase):
         blob.parent.mkdir(parents=True)
         blob.write_bytes(b"weights")
         (assembly_dir / "weights").symlink_to(blob)
+        outside = self.root / "outside"
+        outside.write_bytes(b"outside")
+        alias = source / "aliases/weight"
+        alias.parent.mkdir(parents=True)
+        alias.symlink_to(outside)
+        (assembly_dir / "indirect").symlink_to(alias)
         record = {
             "version": 1,
             "model": "owner/repo",
@@ -1187,7 +1229,18 @@ class ModelsRootTests(unittest.TestCase):
             (moved_assembly / "weights").readlink().resolve(), copied.resolve()
         )
         self.assertEqual(
+            (moved_assembly / "indirect").readlink(),
+            destination.resolve() / "aliases/weight",
+        )
+        self.assertEqual(
             (destination / "owner/repo").readlink().resolve(), moved_assembly.resolve()
+        )
+        self.assertEqual(
+            (assembly_dir / "model.json").read_bytes(), installer.json_bytes(record)
+        )
+        self.assertNotEqual(
+            (assembly_dir / "model.json").stat().st_ino,
+            (moved_assembly / "model.json").stat().st_ino,
         )
         self.assertTrue(selection_link.exists())
 

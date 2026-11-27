@@ -518,13 +518,27 @@ inline Packed repack(Fmt f, const std::vector<uint8_t> &native, uint32_t N, uint
     for (uint32_t g = 0; g < G; ++g) {
       float vals[32]; uint8_t p0[32], p1[8];
       groupPack(f, row, g, vals, p0, p1);
-      memcpy(p.w0.data() + quant_tile_index(n, g, G) * fi.plane0_bytes, p0, fi.plane0_bytes);
-      if (fi.plane1_bytes) memcpy(p.w1.data() + quant_tile_index(n, g, G) * fi.plane1_bytes, p1, fi.plane1_bytes);
+      // AF4P's planes are the packed manifest's, not the tiled image's: the
+      // 64-element unit's 32 qs bytes verbatim at [tile][unit][row][32B]
+      // (FmtAF4P::code_at) and the bf16 bias at [tile][unit][row][2B] in
+      // plane1 (its loadMeta2). The per-group writes below would land at the
+      // image's slot-order group addresses, which the format never reads.
+      if (f != AF4P) {
+        memcpy(p.w0.data() + quant_tile_index(n, g, G) * fi.plane0_bytes, p0, fi.plane0_bytes);
+        if (fi.plane1_bytes) memcpy(p.w1.data() + quant_tile_index(n, g, G) * fi.plane1_bytes, p1, fi.plane1_bytes);
+      }
       if (Wf) for (int k = 0; k < 32; ++k) (*Wf)[(size_t)n * K + g * 32 + k] = vals[k];
       if (Ws) for (int k = 0; k < 32; ++k) (*Ws)[(size_t)n * K + g * 32 + k] = h2f(f2h(vals[k]));
     }
     for (uint32_t u = 0; u < units; ++u)
       metaPack(f, row, u, p.meta.data() + quant_tile_index(n, u, units) * fi.meta_bytes);
+    if (f == AF4P) {
+      for (uint32_t u = 0; u < units; ++u) {
+        const uint8_t *blk = row + u * fi.block_bytes;   // {qs[32], bf16 scale, bf16 bias}
+        memcpy(p.w0.data() + quant_tile_index(n, u, units) * 32, blk, 32);
+        memcpy(p.w1.data() + quant_tile_index(n, u, units) * 2, blk + 34, 2);
+      }
+    }
   }
   return p;
 }

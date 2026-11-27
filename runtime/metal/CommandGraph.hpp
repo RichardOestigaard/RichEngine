@@ -185,6 +185,9 @@ public:
     pendingRange_ = std::move(range);
   }
 
+  // Assigns the host-side encode phase of subsequently added dispatches.
+  void setEncodePhase(EncodePhase phase) noexcept { encodePhase_ = phase; }
+
   // Marks the dispatches added between the calls as one replayable span.
   // Every buffer binding, parameter payload and geometry of the span must be
   // identical on each submission that reuses it; the backend revalidates and
@@ -239,6 +242,7 @@ private:
     dispatch.bakeable =
         bakedSpanDepth_ > 0 && !bakedSpanSuspend_ && !gpuSpanDepth_;
     dispatch.gpuSpan = gpuSpanDepth_ > 0;
+    dispatch.encodePhase = encodePhase_;
     dispatch.indirectRange = std::exchange(pendingRange_, {});
     dispatch.buffers.reserve(buffers.size());
     for (uint32_t index = 0; index < buffers.size(); ++index) {
@@ -256,6 +260,7 @@ private:
   uint32_t bakedSpanSuspend_ = 0;
   uint32_t gpuSpanDepth_ = 0;
   MetalBuffer pendingRange_;
+  EncodePhase encodePhase_ = EncodePhase::Other;
   std::deque<std::vector<std::byte>> payloads_;
   std::vector<ComputeDispatch> dispatches_;
   std::vector<EventStep> events_;

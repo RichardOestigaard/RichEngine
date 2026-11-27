@@ -329,13 +329,14 @@ std::vector<Image> gdnImages(const TargetLayout &layout, const QuantResolver &re
   return result;
 }
 
-// The oQ resolver of a checkpoint: the spec the configuration declares for
-// a module the tensors mark quantized, nullopt for a plain float weight;
-// the oQ formats are the affine-mode ones of 2..8 bits (except 7) over
-// groups of 64 or 128.
-QuantResolver oqResolver(const SafetensorsCheckpoint &source) {
-  return [&source](std::string_view module) -> std::optional<QuantSpec> {
-    const std::optional<QuantSpec> spec = source.quantization(module);
+// The oQ resolver validating a module resolution — of the full checkpoint
+// or of a thin target's surviving documents: the spec the configuration
+// declares for a module the tensors mark quantized, nullopt for a plain
+// float weight; the oQ formats are the affine-mode ones of 2..8 bits
+// (except 7) over groups of 64 or 128.
+QuantResolver oqResolver(std::function<std::optional<SafetensorsCheckpoint::QuantSpec>(std::string_view)> quantization) {
+  return [quantization = std::move(quantization)](std::string_view module) -> std::optional<QuantSpec> {
+    const std::optional<QuantSpec> spec = quantization(module);
     if (!spec) return std::nullopt;
     if ((spec->bits != 2 && spec->bits != 3 && spec->bits != 4 && spec->bits != 5 && spec->bits != 6 &&
          spec->bits != 8) ||
@@ -376,15 +377,22 @@ std::shared_ptr<affine::PlannedCheckpoint> plan(const std::filesystem::path &dir
   for (const auto &entry : std::filesystem::directory_iterator(directory))
     shards = shards || entry.path().extension() == ".safetensors";
   const bool thin = !shards && std::filesystem::exists(directory / "packed-sources");
-  if (thin && oq)
-    throw WeightStoreError("thin oQ sources are not supported");
   auto planned = std::make_shared<affine::PlannedCheckpoint>(directory, thin);
   const AffineArchHooks *hooks = affineHooksFor(layout);
   if (!thin) {
     if (hooks && hooks->validateConfiguration)
       hooks->validateConfiguration(*planned->source, layout);
   }
-  const QuantResolver resolve = oq ? oqResolver(*planned->source) : QuantResolver{};
+  // A thin target resolves the same per-module specs from its surviving
+  // documents: the packed cache the plan keys was written from them, and a
+  // cache miss writes nothing — the loader throws and the installer
+  // rebuilds the payload instead.
+  const QuantResolver resolve =
+      oq ? (thin ? oqResolver(SafetensorsCheckpoint::thinQuantizationResolver(directory))
+                 : oqResolver([source = planned->source.get()](std::string_view module) {
+                     return source->quantization(module);
+                   }))
+         : QuantResolver{};
   planned->images = hooks && hooks->planImages
                         ? hooks->planImages(thin ? nullptr : planned->source.get(), layout, resolve)
                         : gdnImages(layout, resolve);

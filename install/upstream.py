@@ -673,12 +673,11 @@ def _install(selection, repo, installed, draft=None):
         downloaded = repo.download(set(target.files.values()))
     if selection.thin and target.format != "mlx-affine":
         raise models.ModelError("--thin requires an MLX affine target")
-    if selection.thin and any(
-        isinstance(value, dict)
-        for key, value in target.config.get("quantization", {}).items()
-        if key not in {"bits", "group_size", "mode"}
-    ):
-        raise models.ModelError("--thin does not support mixed-quantization oQ targets")
+    # Mixed-quantization oQ targets thin as uniform ones do: the installer's
+    # packed-manifest.json preserves the tensor index, and the runtime
+    # replans the per-module specs from it and config.json after the payload
+    # is dropped. The boundary is the planner's, not the format's: the
+    # registry's arch hooks must keep planning from the resolver alone.
     if target.format in pack.TARGET_FORMATS:
         # The packed-only target: quantize and write the package the
         # runtime loads, under the lock as every models-root write is.

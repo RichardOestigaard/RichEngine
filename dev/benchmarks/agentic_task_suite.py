@@ -259,6 +259,228 @@ def column(rows, index):
         "Inspect the workspace, correct src/table_tools.py, run its unit tests, fix any failure, "
         "and finish concisely. Use relative paths.",
     ))
+
+
+    semver_impl = '''def parse_version(text):
+    return tuple(int(part) for part in text.split("."))
+
+
+def compare_versions(left, right):
+    if left == right:
+        return 0
+    return -1 if left < right else 1
+
+
+def is_compatible(version, minimum):
+    return compare_versions(version, minimum) >= 0
+'''
+    semver_test = unittest_source("semver_tools", '''    def test_parse_padded_version(self):
+        self.assertEqual(parse_version("1.2"), (1, 2, 0))
+
+    def test_compare_numeric_lengths(self):
+        self.assertEqual(compare_versions((1, 10, 0), (1, 9, 9)), 1)
+        self.assertEqual(compare_versions((1, 2, 0), (1, 2)), 0)
+
+    def test_compatible(self):
+        self.assertTrue(is_compatible((2, 0, 0), (1, 9, 0)))''')
+    tasks.append(task(
+        "semver-tools", "src/semver_tools.py",
+        {"src/semver_tools.py": semver_impl, "tests/test_semver_tools.py": semver_test},
+        "Inspect the workspace, fix src/semver_tools.py so version ordering and defaults pass tests, "
+        "run the Python tests, and finish concisely. Use relative paths.",
+    ))
+
+    config_impl = '''def parse_config(text):
+    result = {}
+    for line in text.splitlines():
+        if not line:
+            continue
+        key, value = line.split("=", 1)
+        result[key.strip()] = value.strip()
+    return result
+
+
+def typed_value(value):
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    return value
+'''
+    config_test = unittest_source("config_tools", '''    def test_parse_ignores_comments_and_blanks(self):
+        self.assertEqual(parse_config("# hi\\n\\nport=8000\\n"), {"port": "8000"})
+
+    def test_typed_numbers_and_bools(self):
+        self.assertEqual(typed_value("42"), 42)
+        self.assertEqual(typed_value("3.5"), 3.5)
+        self.assertIs(typed_value("true"), True)
+
+    def test_typed_plain_string(self):
+        self.assertEqual(typed_value("alpha"), "alpha")''')
+    tasks.append(task(
+        "config-tools", "src/config_tools.py",
+        {"src/config_tools.py": config_impl, "tests/test_config_tools.py": config_test},
+        "Inspect the workspace, repair src/config_tools.py, run the real Python tests, iterate on failures, "
+        "and finish concisely. Use relative paths.",
+    ))
+
+    inventory_impl = '''def total_quantity(items):
+    return sum(item["price"] for item in items)
+
+
+def quantities_by_sku(items):
+    result = {}
+    for item in items:
+        result[item["sku"]] = item["quantity"]
+    return result
+
+
+def restock_needed(items, minimum):
+    return [item["sku"] for item in items if item["quantity"] <= minimum]
+'''
+    inventory_test = unittest_source("inventory_tools", '''    def test_total_quantity(self):
+        items = [{"quantity": 2, "price": 5}, {"quantity": 3, "price": 7}]
+        self.assertEqual(total_quantity(items), 5)
+
+    def test_quantities_accumulate(self):
+        items = [{"sku": "a", "quantity": 2}, {"sku": "a", "quantity": 3}]
+        self.assertEqual(quantities_by_sku(items), {"a": 5})
+
+    def test_restock_is_strictly_below(self):
+        items = [{"sku": "a", "quantity": 2}, {"sku": "b", "quantity": 1}]
+        self.assertEqual(restock_needed(items, 2), ["b"])''')
+    tasks.append(task(
+        "inventory-tools", "src/inventory_tools.py",
+        {"src/inventory_tools.py": inventory_impl, "tests/test_inventory_tools.py": inventory_test},
+        "Inspect the workspace, fix src/inventory_tools.py until its tests pass, run them, "
+        "and finish with one concise sentence. Use relative paths.",
+    ))
+
+    slug_impl = '''def slugify(text):
+    return text.lower().replace(" ", "-")
+
+
+def unique_slug(slug, existing):
+    if slug not in existing:
+        return slug
+    return slug + "-2"
+'''
+    slug_test = unittest_source("slug_tools", '''    def test_slugify_punctuation_and_space(self):
+        self.assertEqual(slugify("Hello,  World!"), "hello-world")
+
+    def test_slugify_strips_dashes(self):
+        self.assertEqual(slugify("--Hello--"), "hello")
+
+    def test_unique_slug_increments(self):
+        self.assertEqual(unique_slug("post", {"post", "post-2"}), "post-3")''')
+    tasks.append(task(
+        "slug-tools", "src/slug_tools.py",
+        {"src/slug_tools.py": slug_impl, "tests/test_slug_tools.py": slug_test},
+        "Inspect the workspace, correct src/slug_tools.py, execute its tests, repair failures, "
+        "and finish concisely. Use relative paths.",
+    ))
+
+    xml_impl = '''def escape_xml(text):
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def unescape_xml(text):
+    return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+
+def attribute_escape(text):
+    return escape_xml(text)
+'''
+    xml_test = unittest_source("xml_tools", '''    def test_escape_xml(self):
+        self.assertEqual(escape_xml("a<&>"), "a&lt;&amp;&gt;")
+
+    def test_unescape_xml(self):
+        self.assertEqual(unescape_xml("a&lt;&amp;&gt;"), "a<&>")
+
+    def test_attribute_quotes(self):
+        self.assertEqual(attribute_escape('say "hi"'), "say &quot;hi&quot;")''')
+    tasks.append(task(
+        "xml-tools", "src/xml_tools.py",
+        {"src/xml_tools.py": xml_impl, "tests/test_xml_tools.py": xml_test},
+        "Inspect the workspace, fix src/xml_tools.py, run the unit tests, repair failures, "
+        "and finish with one concise sentence. Use relative paths.",
+    ))
+
+    window_impl = '''def moving_average(values, width):
+    return [sum(values[index:index + width]) / width for index in range(len(values) - width)]
+
+
+def maximum_window(values, width):
+    return [max(values[index:index + width]) for index in range(len(values) - width)]
+'''
+    window_test = unittest_source("window_tools", '''    def test_moving_average(self):
+        self.assertEqual(moving_average([1, 2, 3, 4], 2), [1.5, 2.5, 3.5])
+
+    def test_maximum_window(self):
+        self.assertEqual(maximum_window([1, 5, 2, 4], 2), [5, 5, 4])
+
+    def test_full_width(self):
+        self.assertEqual(moving_average([2, 4], 2), [3.0])''')
+    tasks.append(task(
+        "window-tools", "src/window_tools.py",
+        {"src/window_tools.py": window_impl, "tests/test_window_tools.py": window_test},
+        "Inspect the workspace, correct src/window_tools.py, run its tests, iterate if necessary, "
+        "and finish concisely. Use relative paths.",
+    ))
+
+    score_impl = '''def password_score(password):
+    score = len(password) >= 8
+    score += any(char.isdigit() for char in password)
+    return score
+
+
+def strength_label(score):
+    if score >= 4:
+        return "strong"
+    if score >= 2:
+        return "medium"
+    return "weak"
+'''
+    score_test = unittest_source("password_tools", '''    def test_score_features(self):
+        self.assertEqual(password_score("Abcdef1!"), 4)
+
+    def test_score_short_password(self):
+        self.assertEqual(password_score("abc"), 1)
+
+    def test_strength_label(self):
+        self.assertEqual(strength_label(4), "strong")
+        self.assertEqual(strength_label(2), "medium")''')
+    tasks.append(task(
+        "password-tools", "src/password_tools.py",
+        {"src/password_tools.py": score_impl, "tests/test_password_tools.py": score_test},
+        "Inspect the workspace, repair src/password_tools.py, run the real unit tests, "
+        "and finish with one concise sentence. Use relative paths.",
+    ))
+
+    roman_impl = '''def roman_value(numeral):
+    values = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100}
+    return sum(values[char] for char in numeral)
+
+
+def is_valid_roman(numeral):
+    return bool(numeral)
+'''
+    roman_test = unittest_source("roman_tools", '''    def test_additive_roman(self):
+        self.assertEqual(roman_value("VIII"), 8)
+
+    def test_subtractive_roman(self):
+        self.assertEqual(roman_value("IX"), 9)
+        self.assertEqual(roman_value("XL"), 40)
+
+    def test_invalid_characters(self):
+        self.assertFalse(is_valid_roman("ABC"))''')
+    tasks.append(task(
+        "roman-tools", "src/roman_tools.py",
+        {"src/roman_tools.py": roman_impl, "tests/test_roman_tools.py": roman_test},
+        "Inspect the workspace, fix src/roman_tools.py, execute its Python tests, iterate on failures, "
+        "and finish concisely. Use relative paths.",
+    ))
+
     return tasks
 
 
@@ -414,9 +636,22 @@ def run_task(port: int, model: str, spec: dict, max_turns: int, max_tokens: int,
         }
 
 
+def nested_counter(status: dict, section: str, key: str) -> float:
+    return ((status.get(section) or {}).get(key) or 0) if status else 0
+
+
+def counter_delta(before: dict, after: dict, section: str, key: str) -> float:
+    return nested_counter(after, section, key) - nested_counter(before, section, key)
+
+
 def summarize(results: list[dict], suite_wall: float, before: dict, after: dict) -> dict:
     completion = sum(item["completion_tokens"] for item in results)
     successful = [item for item in results if item["success"]]
+    engine_failures = sum(
+        "engine is recovering" in item.get("failure", "")
+        or "inference engine stopped" in item.get("failure", "")
+        for item in results
+    )
     decode_after = (((after.get("model_timing") or {}).get("decode") or {}).get("total_gpu_ms") or 0)
     decode_before = (((before.get("model_timing") or {}).get("decode") or {}).get("total_gpu_ms") or 0)
     wall_after = (((after.get("model_timing") or {}).get("decode") or {}).get("total_wall_ms") or 0)
@@ -424,6 +659,9 @@ def summarize(results: list[dict], suite_wall: float, before: dict, after: dict)
     return {
         "tasks": len(results),
         "successful": len(successful),
+        "engine_failures": engine_failures,
+        "valid": engine_failures == 0,
+        "invalid_reason": "engine restart" if engine_failures else "",
         "success_rate": round(len(successful) / len(results), 4) if results else 0,
         "suite_wall_s": round(suite_wall, 3),
         "completion_tokens": completion,
@@ -437,6 +675,15 @@ def summarize(results: list[dict], suite_wall: float, before: dict, after: dict)
         "offered_draft_tokens": sum(item["offered"] for item in results),
         "decode_gpu_ms_delta": round(decode_after - decode_before, 3),
         "decode_wall_ms_delta": round(wall_after - wall_before, 3),
+        "decode_gpu_ms_per_token": round((decode_after - decode_before) / completion, 4) if completion else 0,
+        "decode_wall_ms_per_token": round((wall_after - wall_before) / completion, 4) if completion else 0,
+        "ngram_mixed_lanes_delta": round(counter_delta(before, after, "ngram", "mixed_lanes"), 3),
+        "ngram_corpus_lanes_delta": round(counter_delta(before, after, "ngram", "mixed_corpus_lanes"), 3),
+        "ngram_chain_tokens_delta": round(counter_delta(before, after, "ngram", "chain_tokens"), 3),
+        "ngram_host_us_delta": round(counter_delta(before, after, "ngram", "host_microseconds"), 3),
+        "verify_rows_delta": round(counter_delta(before, after, "ngram", "verify_rows_total"), 3),
+        "verify_rows_per_token": round(counter_delta(before, after, "ngram", "verify_rows_total") / completion, 4) if completion else 0,
+        "corpus_hits_delta": round(counter_delta(before, after, "corpus", "hits"), 3),
     }
 
 

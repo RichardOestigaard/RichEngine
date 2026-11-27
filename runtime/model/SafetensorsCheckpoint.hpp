@@ -3,6 +3,7 @@
 #include "model/WeightSource.hpp"
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -56,6 +57,15 @@ public:
   void requireLayerTypeMask(uint32_t layers, uint64_t attentionMask,
                           std::string_view attention, std::string_view other) const;
   void checkUnchanged() const;
+  // The oQ quantization resolver of a thin target directory — its payload
+  // shards dropped, its config.json and packed-manifest.json remaining. A
+  // module's spec resolves exactly as quantization() resolves it on the
+  // full checkpoint: the manifest preserves the tensor index the `.scales`
+  // probe needs, the configuration the per-module and global entries.
+  // Throws WeightStoreError when the manifest or configuration is
+  // unreadable, as opening the checkpoint itself would.
+  [[nodiscard]] static std::function<std::optional<QuantSpec>(std::string_view module)>
+  thinQuantizationResolver(const std::filesystem::path &directory);
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

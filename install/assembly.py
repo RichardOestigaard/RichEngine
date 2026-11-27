@@ -1,9 +1,10 @@
 """Assemblies: the directories upstream models are served from.
 
-An assembly is models/.resolved/<SHA-256 of its record>: links to its source
-snapshots' files (hub.py) and to metadata derived from a GGUF
-(models/.metadata/<key>), and model.json, the record naming its sources and
-the identity of every linked file. It never changes once published.
+An assembly is models/.resolved/<SHA-256 of its record as first published>:
+links to its source snapshots' files (hub.py) and to metadata derived from
+a GGUF (models/.metadata/<key>), and model.json, the record naming its
+sources and the identity of every linked file. It never changes once
+published.
 Selection links point to assemblies; one that no selection links and no
 server holds is collected.
 
@@ -77,8 +78,42 @@ def build(models_root: Path, record, files) -> Path:
         _write_durably(stage / layout.ASSEMBLY_RECORD, encoded)
 
     destination = models_root / layout.RESOLVED / hashlib.sha256(encoded).hexdigest()
+    if not destination.exists():
+        legacy = _assembly_of_record(models_root, record)
+        if legacy is not None:
+            destination = legacy
     _reuse_or_write(destination, write, verify)
     return destination
+
+
+def _assembly_of_record(models_root: Path, record):
+    """The existing assembly of record at a digest computed before ctime was
+    normalized out of file records: one whose record differs only in those
+    volatile times. Reusing it keeps its directory name — the packed-cache
+    owner key the runtime writes — stable, instead of orphaning the
+    assembly's owner and validation markers at the first reinstall."""
+    resolved = models_root / layout.RESOLVED
+    entries = sorted(resolved.iterdir()) if resolved.is_dir() else ()
+    for entry in entries:
+        if not models.is_hex_digest(entry.name, 64):
+            continue
+        try:
+            other = models.read_json(entry / layout.ASSEMBLY_RECORD)
+        except models.ModelError:
+            continue
+        files = other.get("files")
+        if not isinstance(files, dict):
+            continue
+        if any(
+            not isinstance(file, dict) or "ctime_ns" not in file
+            for file in files.values()
+        ):
+            continue
+        for file in files.values():
+            file["ctime_ns"] = 0
+        if other == record:
+            return entry
+    return None
 
 
 def _reuse_or_write(destination, write, check):
@@ -366,6 +401,16 @@ def drop_thin_sources(assembly: Path, models_root: Path) -> int:
         for entry in files.values() if isinstance(files, dict) else ():
             if isinstance(entry, dict) and isinstance(entry.get("path"), str):
                 other_references.add(entry["path"])
+    # One source file can serve several entries of this same record — a shard
+    # holding both language and vision tensors links as a target payload and
+    # as a vision file. The entries kept after the drop (vision, tokenizer,
+    # everything not a thin payload) reference their blobs still: counting
+    # only other assemblies' records would unlink the blob under them.
+    for name, entry in record.get("files", {}).items():
+        if thin_payload_name(name):
+            continue
+        if isinstance(entry, dict) and isinstance(entry.get("path"), str):
+            other_references.add(entry["path"])
     dropped = 0
     for name, entry in record.get("files", {}).items():
         if not thin_payload_name(name):
@@ -400,13 +445,17 @@ def retire_thin_source_pin(link: Path, record):
 def file_record(path: Path):
     """What model.json records of a linked file: its path, size and times,
     which verify compares on every start, and its content digest, which
-    verify(full=True) recomputes (_digest_of)."""
+    verify(full=True) recomputes (_digest_of). ctime is volatile — linking
+    or unlinking one hardlink of a shared inode updates it — and verify
+    never compares it, so it is recorded as zero: the record, and with it
+    the assembly digest, stays identical across the link churn of a thin
+    installation's drop and repair cycle."""
     stat = path.stat()
     return {
         "path": str(path.absolute()),
         "bytes": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
-        "ctime_ns": stat.st_ctime_ns,
+        "ctime_ns": 0,
         "digest": _digest(path),
     }
 
@@ -453,9 +502,10 @@ def verify(assembly: Path, *, full=False):
             raise models.ModelError("resolved model file missing: " + name) from None
         # A blob is content-addressed and may be a hardlink of its original
         # cache object. Linking or unlinking either name updates the shared
-        # inode's ctime, so ctime is recorded only for format compatibility,
-        # never verified. Hub snapshot files keep the mtime check; owned blobs
-        # are immutable content addressed by their name.
+        # inode's ctime, so ctime is recorded as zero (file_record) — older
+        # records carry it for format compatibility — and never verified.
+        # Hub snapshot files keep the mtime check; owned blobs are immutable
+        # content addressed by their name.
         owned_blob = Path(entry["path"]).parent.name == layout.BLOBS
         if (
             not path.is_symlink()

@@ -17,6 +17,11 @@
 //   gguf-moe-benchmark <metallib> bolt [rounds]
 // - same-graph direct/indirect A/B of two latent routed-layer shapes from
 //   Bolt 74B-A9B 24GB GGUF, with synthetic weights and routing inputs.
+//   gguf-moe-benchmark <metallib> packmatrix [rounds]
+// - same-graph packed/per-sequence invariant prefill A/B over uniform and
+//   ragged row compositions. Both arms use the same invariant kernels.
+//   gguf-moe-benchmark <metallib> boltpack [rounds]
+// - the same A/B on Bolt's latent routed-layer shapes.
 #include "../tests/engine/AffineQ4Fixture.hpp"
 #include "../tests/engine/GgufFormatReference.hpp"
 #include "DispatchReplay.hpp"
@@ -103,7 +108,7 @@ void allocate(MetalBackend &backend, MoeBuffers &m, const MoePlan &plan) {
     m.scratch.*field.buffer = zeros(backend, w.*field.bytes, "moe-scratch");
 }
 
-int boltTiming(MetalBackend &backend, uint32_t rounds) {
+int boltTiming(MetalBackend &backend, uint32_t rounds, bool packMatrix) {
   if (!rounds)
     throw std::invalid_argument("bolt rounds must be positive");
   constexpr uint32_t hidden = 4096, latent = 1024, topK = 9;
@@ -145,7 +150,7 @@ int boltTiming(MetalBackend &backend, uint32_t rounds) {
     block.down.routed = expertPlanes(experts * latent, intermediate);
     const MoeWeights weights = block;
     for (const auto [lanes, stride] :
-         {std::pair{1u, 1u}, std::pair{4u, 1u}, std::pair{1u, 8u}}) {
+         {std::pair{1u, 1u}, std::pair{4u, 1u}, std::pair{1u, 8u}}) if (!packMatrix) {
       const uint32_t rows = lanes * stride;
       const auto plan = plans.moeDecode(shape, lanes, stride);
       MoeBuffers b;
@@ -204,12 +209,115 @@ int boltTiming(MetalBackend &backend, uint32_t rounds) {
                   experts, intermediate, lanes, stride, live, plan.maximumTiles(),
                   a, bms, 100.0 * (1.0 - bms / a));
     }
+    if (packMatrix) {
+      constexpr uint32_t rowsMax = 512;
+      std::vector<float> x(uint64_t{rowsMax} * hidden, -0.25f),
+          expertInput(uint64_t{rowsMax} * latent);
+      std::uniform_real_distribution<float> value(-1.0f, 1.0f);
+      for (float &v : expertInput) v = value(rng);
+      for (uint32_t r = 0; r < rowsMax; ++r)
+        for (uint32_t k = 0; k < topK; ++k)
+          x[uint64_t{r} * hidden + (r * 3 + k) % experts] = 1.0f - 0.05f * k;
+      const MetalBuffer input = bfloatBuffer(backend, x, "bolt-pack-input");
+      const MetalBuffer latentInput = bfloatBuffer(backend, expertInput, "bolt-pack-latent");
+      const MetalBuffer residual = zeros(backend, uint64_t{rowsMax} * latent * 2, "bolt-pack-residual");
+      const MetalBuffer output = zeros(backend, uint64_t{rowsMax} * latent * 2, "bolt-pack-output");
+      const auto rowView = [&](const MetalBuffer &buffer, uint32_t row, uint32_t rows, uint32_t width) {
+        return buffer.subview(uint64_t{row} * width * 2, uint64_t{rows} * width * 2);
+      };
+      const auto allocateMaximum = [&](MoeBuffers &buffers, const std::vector<MoePlan> &planList) {
+        for (const MoeScratchField &field : kMoeScratchFields) {
+          uint64_t bytes = 0;
+          for (const MoePlan &plan : planList)
+            bytes = std::max(bytes, plan.workspace().*field.bytes);
+          buffers.scratch.*field.buffer = zeros(backend, bytes, "moe-scratch");
+        }
+      };
+      const auto medianOf = [](std::vector<double> samples) {
+        std::sort(samples.begin(), samples.end());
+        return samples[samples.size() / 2];
+      };
+      std::printf("  E%u I%u invariant prefill pack matrix: rows (total), packed ms | split ms | ratio\n",
+                  experts, intermediate);
+      const auto runCase = [&](const std::vector<uint32_t> &lengths, const std::string &label) {
+        const uint32_t total =
+            std::accumulate(lengths.begin(), lengths.end(), uint32_t{0});
+        MoeBuffers packedBuffers;
+        packedBuffers.input = input;
+        packedBuffers.expertInput = latentInput;
+        packedBuffers.residual = residual;
+        packedBuffers.output = output;
+        const MoePlan packedPlan = plans.moePrefill(shape, total);
+        allocate(backend, packedBuffers, packedPlan);
+        CommandGraph packedGraph;
+        MoE::add(packedGraph, packedBuffers, weights, packedPlan);
+        MoeBuffers splitBuffers;
+        splitBuffers.input = input;
+        splitBuffers.expertInput = latentInput;
+        splitBuffers.residual = residual;
+        splitBuffers.output = output;
+        std::vector<MoePlan> splitPlans;
+        for (const uint32_t length : lengths)
+          splitPlans.push_back(plans.moePrefill(shape, length));
+        allocateMaximum(splitBuffers, splitPlans);
+        CommandGraph splitGraph;
+        uint32_t rowBegin = 0;
+        for (size_t sequence = 0; sequence < lengths.size(); ++sequence) {
+          const uint32_t length = lengths[sequence];
+          MoeBuffers slice = splitBuffers;
+          slice.input = rowView(input, rowBegin, length, hidden);
+          slice.expertInput = rowView(latentInput, rowBegin, length, latent);
+          slice.residual = rowView(residual, rowBegin, length, latent);
+          slice.output = rowView(output, rowBegin, length, latent);
+          MoE::add(splitGraph, slice, weights, splitPlans[sequence]);
+          rowBegin += length;
+        }
+        const auto outputBits = [&] {
+          const auto *bits = static_cast<const uint16_t *>(output.contents());
+          return std::vector<uint16_t>(bits, bits + uint64_t{total} * latent);
+        };
+        static_cast<void>(backend.submitCommand(packedGraph.dispatches()));
+        const std::vector<uint16_t> packedBits = outputBits();
+        static_cast<void>(backend.submitCommand(splitGraph.dispatches()));
+        if (outputBits() != packedBits)
+          throw std::runtime_error(label + ": Bolt packed and split invariant outputs differ");
+        std::vector<double> packedSamples, splitSamples;
+        const auto run = [&] {
+          packedSamples.push_back(backend.submitCommand(packedGraph.dispatches()).gpuSeconds * 1e3);
+          splitSamples.push_back(backend.submitCommand(splitGraph.dispatches()).gpuSeconds * 1e3);
+          splitSamples.push_back(backend.submitCommand(splitGraph.dispatches()).gpuSeconds * 1e3);
+          packedSamples.push_back(backend.submitCommand(packedGraph.dispatches()).gpuSeconds * 1e3);
+        };
+        run();
+        packedSamples.clear();
+        splitSamples.clear();
+        for (uint32_t round = 0; round < rounds; ++round) run();
+        const double packedMs = medianOf(packedSamples), splitMs = medianOf(splitSamples);
+        std::printf("    %s (%u): %.3f | %.3f | %.3f | %s\n", label.c_str(), total,
+                    packedMs, splitMs, packedMs / splitMs,
+                    packedMs <= splitMs ? "pack" : "split");
+      };
+      for (const uint32_t width : {2u, 4u})
+        for (const uint32_t length : {8u, 32u, 128u})
+          runCase(std::vector<uint32_t>(width, length),
+                  std::to_string(width) + "x" + std::to_string(length));
+      for (const std::vector<uint32_t> &lengths :
+           {std::vector<uint32_t>{8, 240}, std::vector<uint32_t>{32, 224},
+            std::vector<uint32_t>{64, 192}, std::vector<uint32_t>{32, 64, 128, 256}}) {
+        std::string label;
+        for (const uint32_t length : lengths) {
+          if (!label.empty()) label += "+";
+          label += std::to_string(length);
+        }
+        runCase(lengths, label);
+      }
+    }
   }
   return 0;
 }
 
-int timing(MetalBackend &backend, uint32_t rounds, bool int8, Fmt gateUpFormat, Fmt downFormat, Fmt sharedFormat,
-           bool a1b) {
+int timing(MetalBackend &backend, uint32_t rounds, bool int8, bool packMatrix, Fmt gateUpFormat,
+           Fmt downFormat, Fmt sharedFormat, bool a1b) {
   // The 35B shape by default; `a1b` is LFM2.5-8B-A1B's sparse block: 32
   // experts, top 4, intermediate 1792, sigmoid-bias router, no shared expert.
   const uint32_t H = 2048, I = a1b ? 1792 : 512, E = a1b ? 32 : 256,
@@ -309,6 +417,95 @@ int timing(MetalBackend &backend, uint32_t rounds, bool int8, Fmt gateUpFormat, 
   printf("%s, GPU family %u, %u cores: median GPU ms per MoE layer of %u rounds\n",
          backend.capabilities().deviceName.c_str(), backend.capabilities().appleGpuFamily,
          backend.capabilities().gpuCoreCount, rounds);
+  if (packMatrix) {
+    const auto rowView = [&](const MetalBuffer &buffer, uint32_t row, uint32_t rows) {
+      return buffer.subview(uint64_t{row} * H * 2, uint64_t{rows} * H * 2);
+    };
+    const auto allocateMaximum = [&](const std::vector<MoePlan> &planList) {
+      for (const MoeScratchField &field : kMoeScratchFields) {
+        uint64_t bytes = 0;
+        for (const MoePlan &plan : planList)
+          bytes = std::max(bytes, plan.workspace().*field.bytes);
+        b.scratch.*field.buffer = zeros(backend, bytes, "moe-scratch");
+      }
+    };
+    const auto medianOf = [](std::vector<double> samples) {
+      std::sort(samples.begin(), samples.end());
+      return samples[samples.size() / 2];
+    };
+    printf("  pack matrix: invariant packed graph against per-sequence invariant graphs\n");
+    printf("  rows (total): packed ms | split ms | packed/split | choice\n");
+    std::fflush(stdout);
+    b.residual = zeros(backend, uint64_t{kRowsMax} * H * 2, "matrix-residual");
+    b.output = zeros(backend, uint64_t{kRowsMax} * H * 2, "matrix-output");
+    const auto runCase = [&](const std::vector<uint32_t> &lengths,
+                             const std::string &label) {
+      const uint32_t total =
+          std::accumulate(lengths.begin(), lengths.end(), uint32_t{0});
+      b.input = bfloatBuffer(backend, input(total, E), "matrix-input");
+      const MoePlan packedPlan = plans.moePrefill(ggufShape, total);
+      allocate(backend, b, packedPlan);
+      CommandGraph packedGraph;
+      MoE::add(packedGraph, b, gguf, packedPlan);
+      std::vector<MoePlan> splitPlans;
+      for (const uint32_t length : lengths)
+        splitPlans.push_back(plans.moePrefill(ggufShape, length));
+      allocateMaximum(splitPlans);
+      CommandGraph splitGraph;
+      uint32_t rowBegin = 0;
+      for (size_t sequence = 0; sequence < lengths.size(); ++sequence) {
+        const uint32_t length = lengths[sequence];
+        MoeBuffers slice = b;
+        slice.input = rowView(b.input, rowBegin, length);
+        slice.residual = rowView(b.residual, rowBegin, length);
+        slice.output = rowView(b.output, rowBegin, length);
+        MoE::add(splitGraph, slice, gguf, splitPlans[sequence]);
+        rowBegin += length;
+      }
+      const auto outputBits = [&] {
+        const auto *bits = static_cast<const uint16_t *>(b.output.contents());
+        return std::vector<uint16_t>(bits, bits + uint64_t{total} * H);
+      };
+      static_cast<void>(backend.submitCommand(packedGraph.dispatches()));
+      const std::vector<uint16_t> packedBits = outputBits();
+      static_cast<void>(backend.submitCommand(splitGraph.dispatches()));
+      if (outputBits() != packedBits)
+        throw std::runtime_error(label + ": packed and split invariant outputs differ");
+      std::vector<double> packedSamples, splitSamples;
+      const auto run = [&] {
+        packedSamples.push_back(backend.submitCommand(packedGraph.dispatches()).gpuSeconds * 1e3);
+        splitSamples.push_back(backend.submitCommand(splitGraph.dispatches()).gpuSeconds * 1e3);
+        splitSamples.push_back(backend.submitCommand(splitGraph.dispatches()).gpuSeconds * 1e3);
+        packedSamples.push_back(backend.submitCommand(packedGraph.dispatches()).gpuSeconds * 1e3);
+      };
+      run();
+      packedSamples.clear();
+      splitSamples.clear();
+      for (uint32_t round = 0; round < rounds; ++round) run();
+      const double packedMs = medianOf(packedSamples), splitMs = medianOf(splitSamples);
+      printf("  %s (%u): %.3f | %.3f | %.3f | %s\n", label.c_str(), total,
+             packedMs, splitMs, packedMs / splitMs,
+             packedMs <= splitMs ? "pack" : "split");
+      std::fflush(stdout);
+    };
+    for (const uint32_t width : {2u, 4u})
+      for (const uint32_t length : {8u, 16u, 32u, 64u, 128u, 256u})
+        runCase(std::vector<uint32_t>(width, length),
+                std::to_string(width) + "x" + std::to_string(length));
+    for (const std::vector<uint32_t> &lengths :
+         {std::vector<uint32_t>{8, 240}, std::vector<uint32_t>{32, 224},
+          std::vector<uint32_t>{64, 192}, std::vector<uint32_t>{8, 16, 32, 64},
+          std::vector<uint32_t>{16, 16, 16, 192},
+          std::vector<uint32_t>{32, 64, 128, 256}}) {
+      std::string label;
+      for (const uint32_t length : lengths) {
+        if (!label.empty()) label += "+";
+        label += std::to_string(length);
+      }
+      runCase(lengths, label);
+    }
+    return 0;
+  }
   if (int8) {
     // The staged prefill passes against the int8 ones: forced off and on at
     // the same plan, as upstream's `int8` mode A/Bs them. The "plan" column
@@ -400,16 +597,17 @@ int timing(MetalBackend &backend, uint32_t rounds, bool int8, Fmt gateUpFormat, 
 } // namespace
 
 int main(int argc, const char *argv[]) {
-  if (argc > 2 && std::string_view(argv[2]) == "bolt") {
+  const bool boltPack = argc > 2 && std::string_view(argv[2]) == "boltpack";
+  if (argc > 2 && (std::string_view(argv[2]) == "bolt" || boltPack)) {
     if (argc > 4) {
-      std::cerr << "usage: gguf-moe-benchmark <metallib> bolt [rounds]\n";
+      std::cerr << "usage: gguf-moe-benchmark <metallib> [bolt|boltpack] [rounds]\n";
       return 2;
     }
     setenv("RICHENGINE_MOE_INDIRECT_DISPATCH", "1", 1);
     @autoreleasepool {
       try {
         MetalBackend backend(argv[1]);
-        return boltTiming(backend, argc == 4 ? std::stoul(argv[3]) : 20);
+        return boltTiming(backend, argc == 4 ? std::stoul(argv[3]) : 20, boltPack);
       } catch (const std::exception &error) {
         std::cerr << "gguf-moe-benchmark: " << error.what() << '\n';
         return 1;
@@ -420,11 +618,12 @@ int main(int argc, const char *argv[]) {
   // gate reads modelPolicy().prefillFastInt8 — arm it before anything reads
 // tuning() or modelPolicy(), as gguf-prefill-int8's binary does.
   const bool int8 = argc > 2 && std::string_view(argv[2]) == "int8";
+  const bool packMatrix = argc > 2 && std::string_view(argv[2]) == "packmatrix";
   if (int8) setenv("RICHENGINE_PREFILL_FAST_INT8", "1", 1);
   @autoreleasepool {
     const bool a1b = argc > 1 && std::string_view(argv[argc - 1]) == "a1b";
     std::vector<const char *> args(argv, argv + argc - (a1b ? 1 : 0));
-    if (int8) args.erase(args.begin() + 2);
+    if (int8 || packMatrix) args.erase(args.begin() + 2);
     const size_t count = args.size();
     // The int8 passes take the MLX affine formats alone
     // (gguf_prefill_int8_format): af4 throughout by default.
@@ -432,13 +631,13 @@ int main(int argc, const char *argv[]) {
               down = count > 4 ? fmtNamed(args[4]) : int8 ? AF4 : Q5K,
               shared = count > 5 ? fmtNamed(args[5]) : int8 ? AF4 : Q80;
     if (count < 2 || count > 6 || gateUp == FMT_COUNT || down == FMT_COUNT || shared == FMT_COUNT) {
-      std::cerr << "usage: gguf-moe-benchmark <metallib> [int8] [rounds] [gate/up format] [down format] "
+      std::cerr << "usage: gguf-moe-benchmark <metallib> [int8|packmatrix] [rounds] [gate/up format] [down format] "
                    "[shared format] [a1b]\n";
       return 2;
     }
     try {
       MetalBackend backend(args[1]);
-      return timing(backend, count > 2 ? std::stoul(args[2]) : 20, int8, gateUp, down, shared, a1b);
+      return timing(backend, count > 2 ? std::stoul(args[2]) : 20, int8, packMatrix, gateUp, down, shared, a1b);
     } catch (const std::exception &error) {
       std::cerr << "gguf-moe-benchmark: " << error.what() << '\n';
       return 1;

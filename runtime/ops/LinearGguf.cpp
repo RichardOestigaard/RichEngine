@@ -424,9 +424,12 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
       !(policy_.family == 10 && w.rows <= kMaximumStagedPrefillRows))
     return fitBlockSplits(registerDecode(policy_, n, k), k);
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
-  // kernel beats staging but for the projections apple9Stages names.
+  // kernel beats staging but for the projections apple9Stages names. A
+  // projection with a segment the register tile does not decode stages
+  // rather than reading it wrongly (quant_register_format).
   if (w.epilogue != LinearEpilogue::ReluSquared &&
-      policy_.isApple9() && !apple9Stages(w, projections))
+      policy_.isApple9() && everyQuantizedSegment(projections, registerTileTakes) &&
+      !apple9Stages(w, projections))
     return fitBlockSplits(registerDecode(policy_, n, k), k);
   const bool spreads = spreadsStagedDecode(policy_);
   const bool onePass =

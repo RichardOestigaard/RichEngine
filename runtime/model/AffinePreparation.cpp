@@ -540,7 +540,18 @@ void registerPackedMarker(const std::filesystem::path &cacheDirectory,
   std::filesystem::create_directories(markers, error);
   if (error) return;
   const std::filesystem::path marker = markers / owner;
-  if (std::filesystem::exists(marker, error)) return;
+  const std::string contents =
+      sourceDirectory.parent_path().string() + "\n" + engineFingerprint() + "\n";
+  // A present marker stands only while it says what this engine would write:
+  // the validation fingerprint a rebuild refreshes reaches the marker on the
+  // engine's first successful read, instead of stranding the thin install it
+  // validated on the previous binary's.
+  {
+    std::ifstream existing(marker);
+    std::ostringstream current;
+    current << existing.rdbuf();
+    if (existing && current.str() == contents) return;
+  }
   const std::filesystem::path tmp = markers / (owner + ".tmp");
   {
     std::ofstream out(tmp, std::ios::trunc);
