@@ -96,6 +96,37 @@ def _live_assemblies(models_root):
     ]
 
 
+def _live_pinned_snapshots(models_root):
+    """(repo folder, commit) pairs live installations may pin for repair.
+
+    Pin-owner hashes are irreversible, and roots or selection hashes can
+    change while the pinned snapshot remains exactly the repair source a live
+    installation records. A pin therefore protects a revision when a live
+    installation needs that revision, whichever selection originally wrote
+    the ref. Pins of revisions no live installation needs — including an
+    abandoned thin target payload — protect nothing and do not block gc.
+    """
+    from . import assembly, models
+
+    needed = set()
+    for link in models.selection_links(Path(models_root)):
+        try:
+            if models.installation_kind(link) is None:
+                continue
+            if models.installation_kind(link) == models.ASSEMBLY:
+                record = models.read_json(link / "model.json")
+                pairs = assembly.pins(record, link)
+            else:
+                pairs = models._installation_pin_pairs(link)
+        except Exception:
+            # One malformed install must not make every repair pin look dead.
+            continue
+        for snapshot, _repo in pairs:
+            if models.is_hex_digest(snapshot.name, 40):
+                needed.add((snapshot.parent.parent.name, snapshot.name))
+    return needed
+
+
 def owned_blob_plan(models_root):
     """Unreferenced files of the model store's content-addressed .blobs root.
 
@@ -237,12 +268,17 @@ def plan(models_root=None, cache_dir=None):
     try:
         from . import models as install_models
 
+        live_pins = _live_pinned_snapshots(models_root)
         for repo_info in info.repos:
             refs = repo_info.repo_path / "refs" / "richengine"
             if not refs.is_dir():
                 continue
             for ref in refs.rglob("*"):
-                if ref.is_file() and install_models.is_hex_digest(ref.name, 40):
+                if (
+                    ref.is_file()
+                    and (repo_info.repo_path.name, ref.name) in live_pins
+                    and install_models.is_hex_digest(ref.name, 40)
+                ):
                     pinned.add(ref.name)
     except Exception:
         pass

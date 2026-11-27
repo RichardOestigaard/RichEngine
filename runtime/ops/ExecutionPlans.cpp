@@ -11,7 +11,10 @@ namespace {
 
 constexpr uint32_t kMaximumLanes = RICHENGINE_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kDecodeRows = RICHENGINE_TARGET_VERIFY_ROWS;
-static_assert(kMaximumLanes == 4);
+// Four lanes are the production contract. Eight is the experimental physical
+// ceiling; intermediate widths are runtime batch shapes inside that ceiling.
+static_assert(kMaximumLanes == 4 || kMaximumLanes == 8,
+              "decode lane experiments require the width-8 kernel ABI");
 
 template <typename Workspace, size_t N>
 void include(Workspace &bound, const Workspace &required,

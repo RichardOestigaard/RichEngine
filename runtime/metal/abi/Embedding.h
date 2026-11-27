@@ -35,7 +35,7 @@ struct VerifyInputBatchParams {
   uint32_t live_rows[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(VerifyInputBatchParams) == 28,
+static_assert(sizeof(VerifyInputBatchParams) == 12 + 4 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "Verify input parameters are 28 bytes on both sides");
 
 // verify_input_tokens_dev's payload (RICHENGINE_DEVICE_VERIFY_PARAMS):
@@ -52,5 +52,5 @@ struct VerifyInputDeviceParams {
   uint32_t device_lanes;
 };
 
-static_assert(sizeof(VerifyInputDeviceParams) == 80,
+static_assert(sizeof(VerifyInputDeviceParams) == 16 + 16 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "Verify input device parameters are 80 bytes on both sides");

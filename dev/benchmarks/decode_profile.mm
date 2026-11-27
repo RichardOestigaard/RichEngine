@@ -153,34 +153,45 @@ struct Lane final {
   std::vector<uint32_t> emitted;
 };
 
-void prefill(model::Runtime &executor, Lane &lane,
-             std::span<const uint32_t> prompt) {
+void beginLane(model::Runtime &executor, Lane &lane,
+               std::span<const uint32_t> prompt) {
   EngineRequest request;
   request.id = lane.id;
   request.prompt.assign(prompt.begin(), prompt.end());
   request.maxNewTokens = 256;
   executor.beginColdRequest(request.modelView(), lane.stateLane);
+}
+
+uint32_t prefillChunk(model::Runtime &executor, Lane &lane,
+                      std::span<const uint32_t> prompt, uint32_t offset,
+                      uint32_t count) {
+  BatchPlan plan{.kind = WorkKind::Prefill,
+                 .items = {{lane.id, count, offset}},
+                 .decodeStage = DecodeStage::Regular};
+  ModelBatchItem item{.requestId = lane.id,
+                      .logicalPosition = offset,
+                      .tokenCount = count,
+                      .pageTable = lane.pages,
+                      .pageTableRevision = lane.pageTableRevision};
+  item.inputTokens = prompt.subspan(offset, count);
+  auto results =
+      executor.prefill(plan, std::span<const ModelBatchItem>(&item, 1));
+  if (results.size() != 1 || results[0].consumedPromptTokens != count)
+    throw std::runtime_error("prefill consumed the wrong row count");
+  if (!results[0].failure.empty())
+    throw std::runtime_error(results[0].failure);
+  return count;
+}
+
+void prefill(model::Runtime &executor, Lane &lane,
+             std::span<const uint32_t> prompt) {
+  beginLane(executor, lane, prompt);
   uint32_t offset = 0;
   while (offset < prompt.size()) {
     const uint32_t count = std::min<uint32_t>(
         model::ExecutionLimits::prefillTokenBudget,
         static_cast<uint32_t>(prompt.size()) - offset);
-    BatchPlan plan{.kind = WorkKind::Prefill,
-                   .items = {{lane.id, count, offset}},
-                   .decodeStage = DecodeStage::Regular};
-    ModelBatchItem item{.requestId = lane.id,
-                        .logicalPosition = offset,
-                        .tokenCount = count,
-                        .pageTable = lane.pages,
-                        .pageTableRevision = lane.pageTableRevision};
-    item.inputTokens = prompt.subspan(offset, count);
-    auto results =
-        executor.prefill(plan, std::span<const ModelBatchItem>(&item, 1));
-    if (results.size() != 1 || results[0].consumedPromptTokens != count)
-      throw std::runtime_error("prefill consumed the wrong row count");
-    if (!results[0].failure.empty())
-      throw std::runtime_error(results[0].failure);
-    offset += count;
+    offset += prefillChunk(executor, lane, prompt, offset, count);
   }
   lane.position = prompt.size();
 }
@@ -243,6 +254,7 @@ int main(int argc, char **argv) {
                      "--memory-cap-mib MIB "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
                      "[--prompt-file PATH] [--dump-tokens PATH] [--fused-only 1] [--max-width N] "
+                     "[--mixed-rows N] [--mixed-decode-per-prefill N] [--mixed-rounds N] "
                      "[--weight-layout auto|affine|block] "
                      "[--ane-ffn-share SHARE|auto] "
                      "[--ane-ffn-minimum-rows N]\n";
@@ -264,6 +276,9 @@ int main(int argc, char **argv) {
       bool aneFfnCalibrate = false;
       bool fusedOnly = false;
       uint32_t maxWidth = 4;
+      uint32_t mixedRows = 0;
+      uint32_t mixedDecodePerPrefill = 4;
+      uint32_t mixedRounds = 4;
       for (int index = 3; index < argc; index += 2) {
         const std::string_view option(argv[index]);
         if (index + 1 >= argc)
@@ -276,6 +291,14 @@ int main(int argc, char **argv) {
           dumpTokens = argv[index + 1];
         else if (option == "--cycles")
           cycles = parseCount(argv[index + 1], "--cycles");
+        else if (option == "--mixed-rows") {
+          const std::string_view text(argv[index + 1]);
+          mixedRows = text == "0" ? 0 : parseCount(text, "--mixed-rows");
+        }
+        else if (option == "--mixed-decode-per-prefill")
+          mixedDecodePerPrefill = parseCount(argv[index + 1], "--mixed-decode-per-prefill");
+        else if (option == "--mixed-rounds")
+          mixedRounds = parseCount(argv[index + 1], "--mixed-rounds");
         else if (option == "--max-width") {
           maxWidth = parseCount(argv[index + 1], "--max-width");
           if (maxWidth > 4) throw std::invalid_argument("--max-width exceeds 4");
@@ -361,9 +384,22 @@ int main(int argc, char **argv) {
 
       const std::vector<uint32_t> prompt =
           promptFile ? filePrompt(promptFile) : chatPrompt(promptTokens);
-      // Enough Page32 pages for measured lanes and their generated rows.
+      std::vector<uint32_t> mixedPrompt;
+      size_t mixedPromptTokens = 0;
+      if (mixedRows) {
+        if (mixedRows > model::ExecutionLimits::prefillTokenBudget)
+          throw std::invalid_argument("--mixed-rows exceeds the prefill token budget");
+        mixedPromptTokens = size_t(mixedRows) * (mixedRounds + 1);
+        mixedPrompt = promptFile ? filePrompt(promptFile) : chatPrompt(mixedPromptTokens);
+        if (mixedPrompt.size() < mixedPromptTokens)
+          throw std::invalid_argument("prompt file is too short for the mixed probe");
+      }
+      // Enough Page32 pages for measured lanes, the mixed prompt, and their
+      // generated rows.
+      const uint32_t promptStorageTokens = static_cast<uint32_t>(
+          std::max(prompt.size(), mixedPromptTokens));
       const uint32_t pagesPerLane =
-          (static_cast<uint32_t>(prompt.size()) + 256 +
+          (promptStorageTokens + 256 +
            model::ExecutionLimits::targetVerifyRows) /
               kv::kPageTokens +
           2;
@@ -371,8 +407,9 @@ int main(int argc, char **argv) {
       // pool's would be.
       const kv::Layout kvLayout = model.targetKvLayout(format);
       const uint32_t extentPages = kvLayout.maximumExtentPages();
+      const uint32_t laneCount = mixedRows ? 4 : maxWidth;
       const uint32_t pageCount =
-          (pagesPerLane * maxWidth + extentPages - 1) / extentPages * extentPages;
+          (pagesPerLane * laneCount + extentPages - 1) / extentPages * extentPages;
       MemoryGovernor governor(backend, cap, hostReserve,
                               queryHostAvailableMemory, 0);
       kv::PageStorage pages(backend, governor.allocationAdmission(), kvLayout,
@@ -550,9 +587,107 @@ int main(int argc, char **argv) {
         profileWidth(title.c_str(), std::span<Lane>(lanes.data(), index + 1));
       }
 
+      if (mixedRows) {
+        std::printf("\nmixed probe: %u prefill rows after every %u B1 decode cycle(s), %u rounds\n",
+                    mixedRows, mixedDecodePerPrefill, mixedRounds);
+        // Lane three is the spare prefill lane. At width four its profiling
+        // request occupies the state lane, so retire that request first.
+        if (maxWidth == 4 && lanes[3].id) {
+          executor.end(lanes[3].id);
+          lanes[3].id = 0;
+        }
+        uint64_t mixedRequestId = 100;
+        auto freshPrefillLane = [&]() {
+          Lane lane{mixedRequestId++, 3, 0,
+                    pageRange(3 * pagesPerLane, pagesPerLane), 1, {}};
+          beginLane(executor, lane, mixedPrompt);
+          return lane;
+        };
+        auto prefillRows = [&](Lane &lane, uint32_t offset) {
+          const auto started = std::chrono::steady_clock::now();
+          prefillChunk(executor, lane, mixedPrompt, offset, mixedRows);
+          return CycleTiming{executor.telemetry().lastPrefillGpuSeconds,
+                             std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - started)
+                                 .count(),
+                             mixedRows, 1};
+        };
+        auto totalTiming = [](const std::vector<CycleTiming> &steps) {
+          CycleTiming total;
+          for (const CycleTiming &step : steps) {
+            total.gpuSeconds += step.gpuSeconds;
+            total.wallSeconds += step.wallSeconds;
+            total.tokens += step.tokens;
+            total.commands += step.commands;
+          }
+          return total;
+        };
+        std::span<Lane> decodeLane(&lanes[0], 1);
+        std::vector<CycleTiming> isolatedDecode;
+        const uint32_t decodeCount = mixedDecodePerPrefill * mixedRounds;
+        for (uint32_t index = 0; index < decodeCount; ++index) {
+          admission(0);
+          isolatedDecode.push_back(decodeCycle(backend, executor, decodeLane));
+        }
+        std::vector<CycleTiming> isolatedPrefill;
+        {
+          Lane lane = freshPrefillLane();
+          admission(0);
+          static_cast<void>(prefillRows(lane, 0)); // warm this row shape
+          for (uint32_t round = 0; round < mixedRounds; ++round) {
+            admission(0);
+            isolatedPrefill.push_back(
+                prefillRows(lane, (round + 1) * mixedRows));
+          }
+          executor.end(lane.id);
+        }
+        std::vector<CycleTiming> alternatingDecode;
+        std::vector<CycleTiming> alternatingPrefill;
+        double alternatingWall = 0.0;
+        {
+          Lane lane = freshPrefillLane();
+          admission(0);
+          static_cast<void>(prefillRows(lane, 0)); // warm this row shape
+          for (uint32_t round = 0; round < mixedRounds; ++round) {
+            for (uint32_t index = 0; index < mixedDecodePerPrefill; ++index) {
+              admission(0);
+              alternatingDecode.push_back(decodeCycle(backend, executor, decodeLane));
+            }
+            admission(0);
+            alternatingPrefill.push_back(
+                prefillRows(lane, (round + 1) * mixedRows));
+          }
+          executor.end(lane.id);
+        }
+        for (const CycleTiming &step : alternatingDecode)
+          alternatingWall += step.wallSeconds;
+        for (const CycleTiming &step : alternatingPrefill)
+          alternatingWall += step.wallSeconds;
+        const CycleTiming decodeTotal = totalTiming(isolatedDecode);
+        const CycleTiming prefillTotal = totalTiming(isolatedPrefill);
+        const CycleTiming alternatingDecodeTotal = totalTiming(alternatingDecode);
+        const CycleTiming alternatingPrefillTotal = totalTiming(alternatingPrefill);
+        const double isolatedGpu = decodeTotal.gpuSeconds + prefillTotal.gpuSeconds;
+        const double isolatedWall = decodeTotal.wallSeconds + prefillTotal.wallSeconds;
+        const double alternatingGpu =
+            alternatingDecodeTotal.gpuSeconds + alternatingPrefillTotal.gpuSeconds;
+        std::printf("mixed isolated decode %u cycles: gpu %.2f ms, wall %.2f ms\n",
+                    decodeCount, decodeTotal.gpuSeconds * 1e3,
+                    decodeTotal.wallSeconds * 1e3);
+        std::printf("mixed isolated prefill %u chunks: gpu %.2f ms, wall %.2f ms\n",
+                    mixedRounds, prefillTotal.gpuSeconds * 1e3,
+                    prefillTotal.wallSeconds * 1e3);
+        std::printf("mixed alternating same work: gpu %.2f ms, wall %.2f ms; "
+                    "isolated-sum gpu %.2f ms, wall %.2f ms; gpu overhead %.2f ms\n",
+                    alternatingGpu * 1e3, alternatingWall * 1e3,
+                    isolatedGpu * 1e3, isolatedWall * 1e3,
+                    (alternatingGpu - isolatedGpu) * 1e3);
+      }
+
       admission(0);
-      for (Lane &lane : std::span(lanes).first(maxWidth))
-        executor.end(lane.id);
+      for (Lane &lane : std::span(lanes).first(maxWidth)) {
+        if (lane.id) executor.end(lane.id);
+      }
       if (dumpTokens) {
         FILE *file = std::fopen(dumpTokens, "wb");
         if (!file) throw std::runtime_error("cannot open --dump-tokens path");

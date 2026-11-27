@@ -755,6 +755,44 @@ def _verify_model_storage(args):
     return 0
 
 
+def _abandon_thin_sources(args):
+    models_root = paths.models_root(getattr(args, "models", None))[0].resolve()
+    if args.selection is not None and args.model is not None:
+        raise LauncherError(
+            "models abandon-thin-sources takes a model or --selection NAME, not both"
+        )
+    if args.selection is not None:
+        link = _selection_link(models_root, args.selection)
+        display = args.selection
+    elif args.model is not None:
+        selection = model_artifacts.Selection.of(
+            models_root,
+            args.model,
+            revision=args.revision,
+            language_only=args.language_only,
+            draft_model=args.draft_model,
+            thin=args.thin,
+        )
+        link = selection.link
+        display = args.model
+    else:
+        raise LauncherError("models abandon-thin-sources needs a model or --selection NAME")
+    if model_artifacts.installation_kind(link) is None:
+        raise LauncherError(f"{display} is not installed in {models_root}")
+    with model_artifacts.installation_lock(models_root):
+        result = assembly.abandon_thin_sources(link, models_root)
+    if result["already"]:
+        print(f"Thin repair sources of {display} are already abandoned.")
+        return 0
+    print(
+        f"Abandoned thin repair sources of {display}: "
+        f"{result['payloads']} payload records ({_size(result['bytes'])}), "
+        f"{result['links']} selection link(s) moved to {result['assembly'].name}."
+    )
+    print("Collect the unreferenced Hugging Face cache with: richengine disk gc --yes")
+    return 0
+
+
 def _remove_model_storage(args):
     models_root = paths.models_root(getattr(args, "models", None))[0].resolve()
     target = args.target
@@ -788,6 +826,8 @@ def list_models(args):
         return 0
     if action == "verify":
         return _verify_model_storage(args)
+    if action == "abandon-thin-sources":
+        return _abandon_thin_sources(args)
     if action == "migrate":
         if getattr(args, "models", None) is not None:
             raise LauncherError(
@@ -882,7 +922,7 @@ def list_flags(args):
         for name in ("serve", "models", "tune", "status", "flags", "doctor", "disk")
     ]
     for parent, nested in (
-        ("models", ("root", "verify", "migrate", "rm")),
+        ("models", ("root", "verify", "abandon-thin-sources", "migrate", "rm")),
         ("disk", ("dedupe", "wipe", "gc")),
     ):
         parent_parser = subcommands.choices[parent]
@@ -2200,6 +2240,32 @@ def _build_parser():
         "--full", action="store_true", help="rehash file contents, not just sizes and times"
     )
     source_options(verify_command)
+    abandon_command = model_commands.add_parser(
+        "abandon-thin-sources",
+        help="abandon a validated thin install's local payload repair sources",
+        description=(
+            "Rewrite one validated thin installation's target payload records to "
+            "metadata-only entries, move its selection to the rewritten assembly, "
+            "and retire its target snapshot pin. Serving continues from the "
+            "validated packed cache; losing that cache reinstalls by downloading "
+            "the recorded upstream revision again."
+        ),
+        formatter_class=_HelpFormatter,
+        **_PARSER_OPTIONS,
+    )
+    abandon_command.add_argument(
+        "model",
+        nargs="?",
+        type=model_artifacts.parse_model_id,
+        metavar="OWNER/REPO[:VARIANT]",
+        help="the installed thin model; omit only with --selection",
+    )
+    abandon_command.add_argument(
+        "--selection",
+        metavar="NAME",
+        help="an installed selection link relative to the models directory (e.g. .selections/<hash>)",
+    )
+    source_options(abandon_command)
     migrate_command = model_commands.add_parser(
         "migrate",
         help="copy the currently resolved models root and record the destination in config.json",

@@ -879,6 +879,25 @@ void testRestoredCheckpointsKeepTheirEvictionPriority() {
           "pressure eviction was counted as rolling retirement");
 }
 
+void testBranchCheckpointEvictsBeforeRollingCheckpoint() {
+  CacheFixture fixture;
+  fixture.cache.publishBranchCompositeState(fixture.blocks[1],
+                                            std::make_shared<TestState>(200));
+  fixture.cache.publishCompositeState(fixture.blocks[2],
+                                      std::make_shared<TestState>(300), true);
+  // Reuse makes the branch newest. Class still wins over recency: pressure
+  // takes the branch before the lane's rolling recovery checkpoint.
+  require(fixture.cache.reuseCompositeState(fixture.blocks[1], true),
+          "branch checkpoint was not reusable");
+  require(fixture.cache.reclaimOneState(false, 0, false) &&
+              !fixture.cache.checkpointState(fixture.blocks[1]) &&
+              fixture.cache.checkpointState(fixture.blocks[2]),
+          "branch checkpoint did not evict before rolling recovery state");
+  require(fixture.cache.reclaimOneState(false, 0, false) &&
+              !fixture.cache.checkpointState(fixture.blocks[2]),
+          "rolling checkpoint did not evict after branch states");
+}
+
 void testCheckpointReclaimPrecedesOlderKv() {
   CacheFixture fixture;
   fixture.publish(0, 150);
@@ -4192,6 +4211,7 @@ int main() {
     testCheckpointLookupProbeDoesNotPromote();
     testCheckpointRetirementRespectsUseAndPublicationIdentity();
     testRestoredCheckpointsKeepTheirEvictionPriority();
+    testBranchCheckpointEvictsBeforeRollingCheckpoint();
     testCheckpointReclaimPrecedesOlderKv();
     testOptionalReclaimLeavesOrdinaryStateIntact();
     testCheckpointPinsAndBoundaryUpgrade();

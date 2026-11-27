@@ -37,6 +37,7 @@ REQUEST_FIELDS = (
     "generation_prompt_tokens",
     "flags",
     "shared_prefix_tokens",
+    "branch_boundary_tokens",
 )
 assert len(REQUEST_FIELDS) == len(p._REQUEST.format) - 1
 OFFSET = dict(
@@ -68,6 +69,7 @@ def example_request():
         seed=0xFEDCBA9876543210,
         constraint=p.ConstraintMode.TOKEN_MASK,
         generation_prompt_tokens=2,
+        branch_boundary_tokens=3,
     )
 
 
@@ -421,6 +423,7 @@ class ProtocolPythonTests(unittest.TestCase):
                 request.generation_prompt_tokens,
                 int(request.flags),
                 request.shared_prefix_tokens,
+                request.branch_boundary_tokens,
             )
             + struct.pack(f"<{len(request.prompt_tokens)}I", *request.prompt_tokens)
             + struct.pack(p._IMAGE_SPAN.format, *astuple(span))
@@ -647,7 +650,7 @@ class ProtocolPythonTests(unittest.TestCase):
         # scoring decides the output, fails the request.
         cases = [
             (replace(request, flags=flags), p.IssueCode.INVALID_ENUM_VALUE)
-            for flags in (1 << 2, 1 << 31, 0xFFFFFFFF, True, -1, 1 << 32, 1.0)
+            for flags in (1 << 3, 1 << 31, 0xFFFFFFFF, True, -1, 1 << 32, 1.0)
         ] + [
             (
                 replace(base, flags=p.RequestFlag.IGNORE_END_OF_SEQUENCE),

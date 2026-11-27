@@ -127,7 +127,7 @@ struct DsplineRefineParams {
   float min_p[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(DsplineRefineParams) == 112,
+static_assert(sizeof(DsplineRefineParams) == 48 + 16 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "DSpline refine parameters are 112 bytes on both sides");
 
 // The refinement's gather-column head pass (dspline_head_gather): the

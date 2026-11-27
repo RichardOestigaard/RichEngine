@@ -18,7 +18,7 @@
 // pins the bytes both sides agree on.
 namespace richengine::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 9;
+inline constexpr uint16_t kProtocolVersion = 10;
 inline constexpr size_t kFrameHeaderBytes = 24;
 inline constexpr uint32_t kStatusSchemaVersion = 8;
 // Image pixels travel inside the request frame; a multi-image agent turn can
@@ -147,9 +147,10 @@ validateLimits(const ProtocolLimits &limits);
 //   87 u32 sharedPrefixTokens
 //   91 u32 audio span count (protocol 8; the image span record's u32
 //   frames field is protocol 9)
+//   95 u32 branchBoundaryTokens (protocol 10)
 // then the prompt tokens, the 36-byte image spans, the 28-byte audio spans,
 // the image pixels, the audio mel payload and the score tokens.
-inline constexpr uint64_t kRequestFixedBytes = 95;
+inline constexpr uint64_t kRequestFixedBytes = 99;
 
 struct RequestFrame {
   uint64_t requestId = 0;
@@ -190,6 +191,9 @@ struct RequestFrame {
   // the chat template's system prompt and tools; zero when unknown. It must
   // not exceed the prompt.
   uint32_t sharedPrefixTokens = 0;
+  // Leading prompt tokens before the final user/branch point sibling
+  // continuations share; zero when unknown. It must not exceed the prompt.
+  uint32_t branchBoundaryTokens = 0;
 
   bool operator==(const RequestFrame &) const = default;
 };

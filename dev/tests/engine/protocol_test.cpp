@@ -69,7 +69,8 @@ constexpr size_t scoreCount = returnProgress + 1;
 constexpr size_t generationPrompt = scoreCount + 4;
 constexpr size_t flags = generationPrompt + 4;
 constexpr size_t sharedPrefix = flags + 4;
-static_assert(sharedPrefix + 4 == kRequestFixedBytes);
+constexpr size_t branchBoundary = sharedPrefix + 4;
+static_assert(branchBoundary + 4 == kRequestFixedBytes);
 } // namespace request_offset
 
 uint32_t loadU32(const std::vector<uint8_t> &bytes, size_t offset) {
@@ -173,6 +174,7 @@ RequestFrame exampleRequest() {
   request.sampling.seed = 0xfedcba9876543210ULL;
   request.constraint = ConstraintMode::TokenMask;
   request.generationPromptTokens = 2;
+  request.branchBoundaryTokens = 3;
   return request;
 }
 
@@ -869,7 +871,7 @@ void testRequestFlags() {
   constexpr std::string_view test = "request flags";
   RequestFrame request = exampleIgnoreEosRequest();
   CHECK(test, roundTrip(request) == request);
-  for (const uint32_t flags : {1U << 2, 1U << 31, 0xffffffffU}) {
+  for (const uint32_t flags : {1U << 3, 1U << 31, 0xffffffffU}) {
     RequestFrame undefined = request;
     undefined.flags = flags;
     expectRequestIssue(test, undefined, IssueCode::InvalidEnumValue);

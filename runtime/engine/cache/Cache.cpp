@@ -358,8 +358,21 @@ void Cache::publishCompositeState(uint64_t kvBlock,
   states_.publishCompositeState(kvBlock, std::move(state), checkpoint);
 }
 
+void Cache::publishBranchCompositeState(
+    uint64_t kvBlock, std::shared_ptr<const CompositeState> state) {
+  states_.publishCompositeState(kvBlock, std::move(state), true);
+  states_.markBranch(kvBlock);
+}
+
 bool Cache::publishStateToDisk(uint64_t kvBlock, const StateWriter &write, bool checkpoint) {
   return states_.publishStateToDisk(kvBlock, write, checkpoint);
+}
+
+bool Cache::publishBranchStateToDisk(uint64_t kvBlock, const StateWriter &write) {
+  if (!states_.publishStateToDisk(kvBlock, write, true))
+    return false;
+  states_.markBranch(kvBlock);
+  return true;
 }
 
 StateCheckpoint Cache::checkpointState(uint64_t kvBlock) const noexcept {
@@ -547,6 +560,13 @@ std::optional<Cache::Victim> Cache::reclaimOldest(const VictimScan &scan) {
     }
   }
   return std::nullopt;
+}
+
+StateRoom Cache::reclaimOneBranchState() {
+  const auto branch = states_.branchCandidate();
+  if (branch && states_.reclaim(branch->id, StateCache::Unwritten::Wait).evicted)
+    return {true};
+  return {};
 }
 
 StateRoom Cache::reclaimOneState(bool checkpointsOnly, uint64_t forBlock, bool growth) {

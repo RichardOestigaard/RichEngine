@@ -315,6 +315,9 @@ public:
   void publishCompositeState(uint64_t kvBlock,
                              std::shared_ptr<const CompositeState> state,
                              bool checkpoint);
+  // Publishes an evict-before-recovery-checkpoints branch state.
+  void publishBranchCompositeState(uint64_t kvBlock,
+                                   std::shared_ptr<const CompositeState> state);
   // Publishes the state of the lane at this block straight to disk, for a
   // state no cache slot can hold: `write` starts the write from the lane.
   // False when the tier cannot take the state now; nothing is published then.
@@ -322,9 +325,14 @@ public:
   // over one is a logic error.
   [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
                                         bool checkpoint);
+  [[nodiscard]] bool publishBranchStateToDisk(uint64_t kvBlock, const StateWriter &write);
   // The request holding the handle is unfinished and its conversation
   // resumes from the state at this block: see StateCache::useState.
   [[nodiscard]] StateUse useState(uint64_t kvBlock) { return states_.useState(kvBlock); }
+  // The block holds an ordinary (non-checkpoint) reusable state in either tier.
+  [[nodiscard]] bool ordinary(uint64_t kvBlock) const noexcept {
+    return states_.ordinary(kvBlock);
+  }
   [[nodiscard]] StateCheckpoint checkpointState(uint64_t kvBlock) const noexcept;
   // The state at this block has a RAM copy.
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
@@ -423,6 +431,9 @@ public:
   // an extent's bytes are of no use to a snapshot: extents and KV stay, and
   // every publication takes states alone.
   [[nodiscard]] StateRoom reclaimOneState(bool checkpointsOnly, uint64_t forBlock, bool growth);
+  // Recycles one branch checkpoint only; branch publication never displaces
+  // rolling recovery checkpoints or reusable states.
+  [[nodiscard]] StateRoom reclaimOneBranchState();
   // Recycles one unpinned state, preferring checkpoints, for a lane that
   // takes the state's buffers, taking nothing of a class above upTo. For
   // running work (InUse) a state in use goes once no other state is left and

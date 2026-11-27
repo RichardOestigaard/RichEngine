@@ -89,7 +89,7 @@ struct DfaMaskParams {
   uint32_t indexed;
 };
 
-static_assert(sizeof(DfaMaskParams) == 208,
+static_assert(sizeof(DfaMaskParams) == 16 + 48 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "DFA mask parameters are 208 bytes on both sides");
 
 // Per-dispatch scalars of decode_dfa_chain, decode_dfa_advance and the
@@ -115,7 +115,7 @@ struct DfaWalkParams {
   uint32_t eos_ids[RICHENGINE_MAXIMUM_BATCH_WIDTH][RICHENGINE_DFA_EOS_TOKENS];
 };
 
-static_assert(sizeof(DfaWalkParams) == 220,
+static_assert(sizeof(DfaWalkParams) == 12 + 52 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "DFA walk parameters are 220 bytes on both sides");
 
 // Per-dispatch scalars of decode_dfa_truncate: one thread per lane scans
@@ -131,7 +131,7 @@ struct DfaTruncParams {
   uint32_t forced[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(DfaTruncParams) == 40,
+static_assert(sizeof(DfaTruncParams) == 8 + 8 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "DFA truncation parameters are 40 bytes on both sides");
 
 // Per-dispatch scalars of decode_dfa_mask_grid, the RICHENGINE_GPU_DECODE_GRID
@@ -152,7 +152,7 @@ struct DfaMaskGridParams {
   uint32_t live_rows[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(DfaMaskGridParams) == 60,
+static_assert(sizeof(DfaMaskGridParams) == 12 + 12 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "DFA mask grid parameters are 60 bytes on both sides");
 
 // Per-dispatch scalars of decode_dfa_span_apply, the
@@ -167,5 +167,5 @@ struct DfaSpanApplyParams {
   uint32_t maximum_retained[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(DfaSpanApplyParams) == 36,
+static_assert(sizeof(DfaSpanApplyParams) == 4 + 8 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "DFA span-apply parameters are 36 bytes on both sides");

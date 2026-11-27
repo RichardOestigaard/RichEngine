@@ -381,9 +381,16 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   if (trellis)
     return {.tile = w.phase == LinearPhase::Prefill && w.rows > kMaximumStagedPrefillRows ? LinearTile::GgufPrefill : LinearTile::GgufStaged,
             .splits = 1};
-  // The install's own kernel-pass measurement outranks every rule below.
-  if (const auto measured = measuredLinearPlan(policy_, w))
+  // The install's own kernel-pass measurement outranks every rule below. An
+  // explicit staged-64 opt-out still excludes the measured rows that name
+  // the experimental tile: their shapes otherwise become register-tile
+  // decodes, as the unmeasured rows below do.
+  if (const auto measured = measuredLinearPlan(policy_, w)) {
+    if (!tuning().ggufDecode64 && w.phase == LinearPhase::Decode && w.rows > 32 &&
+        measured->tile == LinearTile::GgufStaged)
+      return fitBlockSplits(registerDecode(policy_, n, k), k);
     return fitBlockSplits(*measured, k);
+  }
   // Prefill: 128-row tiles. A chunk of up to 32 rows runs the staged tile
   // of its rows (8, 16 or 32, two simdgroups) with the decode split rule:
   // the same half stage and matmul rows, so its outputs equal the prefill
@@ -411,17 +418,19 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
                          k);
   }
   // A decode step wider than the staged decode tile runs the register
-  // kernels, whose `_l` variants scale to the batch's rows; on Apple10
-  // the staged 64-row height serves 33-64-row steps instead, reading the
+  // kernels, whose `_l` variants scale to the batch's rows. On Apple10 the
+  // staged 64-row height can serve 33-64-row steps instead, reading the
   // weights once where the register tile's `_l` variants measured 2.5-4x
   // slower on the affine formats (gguf-projection-benchmark, 20-core
-  // M5 Pro). Its one-pass gate/up kernel is 5.5x slower than the two-pass
+  // M5 Pro). The width-eight lane experiment keeps that height behind
+  // RICHENGINE_GGUF_DECODE64 (Tuning.hpp); production width four defaults
+  // it on. Its one-pass gate/up kernel is 5.5x slower than the two-pass
   // staged pair at 64 rows, so decode beyond 32 rows keeps the pair.
   // The relu² epilogue instantiates on the staged tile alone, which holds
   // every decode step's rows, so its plans never take the register tile.
   if (w.epilogue != LinearEpilogue::ReluSquared &&
       w.rows > 32 &&
-      !(policy_.family == 10 && w.rows <= kMaximumStagedPrefillRows))
+      !(policy_.family == 10 && tuning().ggufDecode64 && w.rows <= kMaximumStagedPrefillRows))
     return fitBlockSplits(registerDecode(policy_, n, k), k);
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names. A

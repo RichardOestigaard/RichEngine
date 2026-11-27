@@ -159,9 +159,15 @@ TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
 TEST_GDN_CHUNKED_BENCH := $(ENGINE_TEST_BUILD)/gdn-chunked-bench
 TEST_GGUF_PROJECTION_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-projection-benchmark
+TEST_MIXED_GEMM_BENCH := $(ENGINE_TEST_BUILD)/mixed-gemm-bench
 TEST_GGUF_PREFILL_TILE_BENCH := $(ENGINE_TEST_BUILD)/gguf-prefill-tile-bench
 TEST_GGUF_PREFILL_TILE_AIR := $(ENGINE_TEST_BUILD)/gguf-prefill-tile-bench.air
 TEST_GGUF_PREFILL_TILE_LIB := $(ENGINE_TEST_BUILD)/gguf-prefill-tile-bench.metallib
+TEST_Q4_NAXR_AB := $(ENGINE_TEST_BUILD)/q4-naxr-ab
+TEST_Q4_NAXR_AB_BASE_AIR := $(ENGINE_TEST_BUILD)/q4-naxr-ab-base.air
+TEST_Q4_NAXR_AB_BASE_LIB := $(ENGINE_TEST_BUILD)/q4-naxr-ab-base.metallib
+TEST_Q4_NAXR_AB_NAXR_AIR := $(ENGINE_TEST_BUILD)/q4-naxr-ab-naxr.air
+TEST_Q4_NAXR_AB_NAXR_LIB := $(ENGINE_TEST_BUILD)/q4-naxr-ab-naxr.metallib
 TEST_GGUF_MOE_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-moe-benchmark
 TEST_ANE_MOE_BENCHMARK := $(ENGINE_TEST_BUILD)/ane-moe-benchmark
 TEST_ANE_FORWARD_BENCHMARK := $(ENGINE_TEST_BUILD)/ane-forward-benchmark
@@ -319,7 +325,8 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_MET
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) $(TEST_AFFINE_SOURCE_ORACLE) \
 	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) $(TEST_GDN_CHUNKED_BENCH) \
 	$(TEST_GGUF_DECODE_SWEEP) \
-	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
+	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_MIXED_GEMM_BENCH) \
+	$(TEST_GGUF_MOE_BENCHMARK) \
 	$(TEST_ANE_MOE_BENCHMARK) $(TEST_ANE_FORWARD_BENCHMARK) \
 	$(TEST_ANE_PREDRAFT_BENCHMARK) \
 	$(TEST_MTL4_BENCHMARK) $(TEST_ML_ENCODER_BENCH) \
@@ -329,7 +336,8 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_MET
 	$(TEST_ACC16_PROBE_TEST) $(TEST_ACC16_PROBE_AIR) $(TEST_ACC16_PROBE_LIB) \
 	$(TEST_STAGE_BARRIER_TEST) $(TEST_STAGE_BARRIER_AIR) $(TEST_STAGE_BARRIER_LIB) \
 	$(TEST_MOE_PREFILL_BENCH) $(TEST_MOE_PREFILL_AIR) $(TEST_MOE_PREFILL_LIB) \
-	$(TEST_GGUF_PREFILL_TILE_BENCH) $(TEST_GGUF_PREFILL_TILE_AIR) $(TEST_GGUF_PREFILL_TILE_LIB)
+	$(TEST_GGUF_PREFILL_TILE_BENCH) $(TEST_GGUF_PREFILL_TILE_AIR) $(TEST_GGUF_PREFILL_TILE_LIB) \
+	$(TEST_Q4_NAXR_AB) $(TEST_Q4_NAXR_AB_BASE_LIB) $(TEST_Q4_NAXR_AB_NAXR_LIB)
 # Benchmarks and the tuning tool that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_Q4_PREFILL_PROFILE) $(TEST_Q4_DECODE_PROFILE) \
 	$(TEST_I8_PREFILL_AB) \
@@ -968,6 +976,15 @@ $(TEST_GGUF_PROJECTION_BENCHMARK): dev/benchmarks/gguf_projection_benchmark.mm \
 		$(ENGINE_LIBRARY) \
 		$(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
 
+# Affine Q4 decode/prefill/mixed-row GEMM ceiling probe
+# (dev/benchmarks/mixed_gemm_bench.mm). It times production plans directly;
+# the mixed case is a ceiling approximation, not an execution implementation.
+$(TEST_MIXED_GEMM_BENCH): dev/benchmarks/mixed_gemm_bench.mm \
+		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		$(ENGINE_LIBRARY) \
+		$(ENGINE_FAMILY_OBJECTS) $(ENGINE_LINKFLAGS) -o $@
+
 # The prefill tile-shape sweep: bench-only variant kernels of
 # dev/benchmarks/gguf_prefill_tile_bench.metal (production flags, as the
 # kernels they mirror) dispatched directly by the harness.
@@ -982,6 +999,38 @@ $(TEST_GGUF_PREFILL_TILE_BENCH): dev/benchmarks/gguf_prefill_tile_bench.mm \
 		| $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
 		-framework Foundation -framework Metal -o $@
+
+# The NAXR-style register-dequantized Q4 small-M GEMM candidate against the
+# production direct-packed tiles (dev/benchmarks/q4_naxr_ab.mm). The baseline
+# kernels are the production q4_mpp_tiles.h instantiations at the production
+# standard; the candidate needs cooperative-tensor operands, which metal4.1
+# rejects (the Makefile's METAL40_FLAGS note), so its library is metal4.0.
+# Bench-only: nothing here enters the production metallib.
+$(TEST_Q4_NAXR_AB_BASE_AIR): dev/benchmarks/q4_naxr_ab_base.metal \
+		$(KERNEL_HEADERS) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $< -o $@
+
+$(TEST_Q4_NAXR_AB_BASE_LIB): $(TEST_Q4_NAXR_AB_BASE_AIR)
+	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
+
+$(TEST_Q4_NAXR_AB_NAXR_AIR): dev/benchmarks/q4_naxr_ab_naxr.metal \
+		$(KERNEL_HEADERS) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(METAL) $(METAL40_FLAGS) -c $< -o $@
+
+$(TEST_Q4_NAXR_AB_NAXR_LIB): $(TEST_Q4_NAXR_AB_NAXR_AIR)
+	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
+
+$(TEST_Q4_NAXR_AB): dev/benchmarks/q4_naxr_ab.mm \
+		| $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
+		-framework Foundation -framework Metal -o $@
+
+# A benchmark, not a parity gate: no MTL_SHADER_VALIDATION, as the other
+# benches. The harness validates both arms against its CPU reference itself
+# and exits non-zero on failure.
+.PHONY: bench-q4-naxr-ab
+bench-q4-naxr-ab: $(TEST_Q4_NAXR_AB) $(TEST_Q4_NAXR_AB_BASE_LIB) $(TEST_Q4_NAXR_AB_NAXR_LIB)
+	$(TEST_Q4_NAXR_AB) $(TEST_Q4_NAXR_AB_BASE_LIB) $(TEST_Q4_NAXR_AB_NAXR_LIB) $(Q4_NAXR_AB_ARGS)
 
 $(TEST_GGUF_MOE_BENCHMARK): dev/benchmarks/gguf_moe_benchmark.mm \
 		dev/benchmarks/DispatchReplay.hpp \
@@ -1192,7 +1241,7 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)"
 
 .PHONY: benchmark-prefill benchmark-decode benchmark-backend benchmark-dfa \
-	benchmark-decode-profile benchmark-attention-sweep \
+	benchmark-decode-profile benchmark-attention-sweep benchmark-mixed-gemm \
 	benchmark-gguf-projection benchmark-gguf-prefill-tile benchmark-gguf-moe benchmark-gdn-chunked
 benchmark-prefill: all $(TEST_Q4_PREFILL_PROFILE)
 	$(TEST_Q4_PREFILL_PROFILE) $(LIB)
@@ -1223,6 +1272,12 @@ benchmark-attention-sweep: $(TEST_ATTENTION_SWEEP) $(LIB)
 GGUF_PROJECTION_ARGS ?= q4k 5120 8192
 benchmark-gguf-projection: $(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB)
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB) $(GGUF_PROJECTION_ARGS)
+
+# The affine mixed-row ceiling probe; MIXED_GEMM_ARGS passes
+# [prefill-rows] [decode-rows] [rounds].
+MIXED_GEMM_ARGS ?=
+benchmark-mixed-gemm: $(TEST_MIXED_GEMM_BENCH) $(LIB)
+	$(TEST_MIXED_GEMM_BENCH) $(LIB) $(MIXED_GEMM_ARGS)
 
 # The gguf_prefill_tile shape sweep (dev/benchmarks/gguf_prefill_tile_bench.mm):
 # GGUF_PREFILL_TILE_ARGS passes <fmt> <N> <K> <rows[,rows...]> [rounds] [check].

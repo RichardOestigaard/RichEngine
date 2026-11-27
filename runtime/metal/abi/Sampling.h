@@ -57,7 +57,7 @@ struct HeadArgmaxParams {
   uint32_t logits_lane_mask;
 };
 
-static_assert(sizeof(HeadArgmaxParams) == 48,
+static_assert(sizeof(HeadArgmaxParams) == 32 + 4 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "Head argmax parameters are 48 bytes on both sides");
 
 // The K-split affine head's parameters: the ordinary head fields plus the
@@ -70,7 +70,7 @@ struct HeadArgmaxSplitParams {
   uint32_t end_group;
 };
 
-static_assert(sizeof(HeadArgmaxSplitParams) == 56,
+static_assert(sizeof(HeadArgmaxSplitParams) == 40 + 4 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "Head argmax split parameters are 56 bytes on both sides");
 
 struct TargetSamplingParams {
@@ -117,7 +117,7 @@ struct TargetSamplingParams {
   uint32_t fused_mask;
 };
 
-static_assert(sizeof(TargetSamplingParams) == 144,
+static_assert(sizeof(TargetSamplingParams) == 64 + 20 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "Target sampling parameters are 144 bytes on both sides");
 
 // One shard's share of a sampled row's softmax denominator: the largest
@@ -191,7 +191,7 @@ struct SamplingPenaltyParams {
   uint32_t logits_stride;
 };
 
-static_assert(sizeof(SamplingPenaltyParams) == 120,
+static_assert(sizeof(SamplingPenaltyParams) == 24 + 24 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "Sampling penalty parameters are 120 bytes on both sides");
 
 // The batched selector and acceptance kernels' grids cover exactly the
@@ -215,7 +215,7 @@ struct SelectorBatchParams {
   uint32_t rank;
 };
 
-static_assert(sizeof(SelectorBatchParams) == 56,
+static_assert(sizeof(SelectorBatchParams) == 24 + 8 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "Draft selector parameters are 56 bytes on both sides");
 
 // The rows of its block each lane of a decode cycle verifies (its verify
@@ -319,7 +319,7 @@ struct AcceptBatchParams {
   uint32_t trunc_mask;
 };
 
-static_assert(sizeof(AcceptBatchParams) == 56,
+static_assert(sizeof(AcceptBatchParams) == 24 + 8 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "Batched acceptance parameters are 56 bytes on both sides");
 
 // verify_input_tree_tokens parameters: one thread per (lane, node) fills the
@@ -331,7 +331,7 @@ struct VerifyTreeInputParams {
   uint32_t base[RICHENGINE_MAXIMUM_BATCH_WIDTH][3];
 };
 
-static_assert(sizeof(VerifyTreeInputParams) == 56,
+static_assert(sizeof(VerifyTreeInputParams) == 8 + 12 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "Verify tree input parameters are 56 bytes on both sides");
 
 // decode_accept_tree walks one lane's tree: it shares the remaining/limits
@@ -343,7 +343,7 @@ struct TreeAcceptBatchParams {
   uint32_t lanes;
 };
 
-static_assert(sizeof(TreeAcceptBatchParams) == 28,
+static_assert(sizeof(TreeAcceptBatchParams) == 12 + 4 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "Batched tree acceptance parameters are 28 bytes on both sides");
 
 // tree_leaf_patch splices ANE-produced leaf alternates into a lane's comb

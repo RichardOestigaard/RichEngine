@@ -1,5 +1,6 @@
 #pragma once
 
+#include "metal/abi/ExecutionGeometry.h"
 #include "ops/PagedKv.hpp"
 #include "ops/Vision.hpp"
 #include "model/StateTransfer.hpp"
@@ -483,7 +484,7 @@ maskWordsPerToken(uint32_t vocabularySize) noexcept {
 // are the runtime's own. Cache-page and attention-kernel geometry live with
 // their operators.
 struct ExecutionLimits final {
-  static constexpr uint32_t maximumBatchWidth = 4;
+  static constexpr uint32_t maximumBatchWidth = RICHENGINE_MAXIMUM_BATCH_WIDTH;
   static constexpr uint32_t prefillTokenBudget = 2048;
   // KV pages startup warmup runs on, from page 0: the runway the engine's KV
   // pool allocates when it is built.

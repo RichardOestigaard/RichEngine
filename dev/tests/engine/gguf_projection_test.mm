@@ -439,10 +439,14 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile) {
                  g = tensor(backend, Fmt(formats[(fi + 3) % formats.size()]), N, K);
     const Projection up = projection({&w}, columns), gate = projection({&g}, columns);
     for (const Inputs inputs : {Inputs::Dense, Inputs::Sparse}) {
-      const std::vector<float> x = activations(inputs, kMaximumRows, K);
-      const std::vector<float> residual = residuals(kMaximumRows, columns);
-      const std::vector<Dot> dots = products({&w}, columns, x, kMaximumRows);
-      const std::vector<Dot> gateDots = products({&g}, columns, x, kMaximumRows);
+      // The staged tile's 64-row height also serves decode rows 33-64. The
+      // exhaustive lane matrix remains 1-4 lanes; the targeted rows below
+      // cover 40-64 without doubling every format's pass.
+      constexpr uint32_t wideRows = 64;
+      const std::vector<float> x = activations(inputs, wideRows, K);
+      const std::vector<float> residual = residuals(wideRows, columns);
+      const std::vector<Dot> dots = products({&w}, columns, x, wideRows);
+      const std::vector<Dot> gateDots = products({&g}, columns, x, wideRows);
       for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp,
                                             LinearEpilogue::ReluSquared})
         for (const uint32_t splits : kSplits) {
@@ -478,6 +482,26 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile) {
               if (!sameRows(out.output, lane * kLaneRows, lanesAlone[lane].output, 0, kLaneRows, columns))
                 fail(label + ": lane " + std::to_string(lane) + " differs from its one-lane projection");
           }
+          // Decode rows 33-64 pad into the staged tile's 64-row height. Cover
+          // the width-eight experiment's row counts on Q4_K/Q6_K dense inputs:
+          // within fp64, and the first lane bitwise equal to its one-lane
+          // projection at the same split (rows are independent across heights).
+          const bool probe64 = staged && inputs == Inputs::Dense &&
+                               (formats[fi] == GGUF_FMT_Q4K || formats[fi] == GGUF_FMT_Q6K) &&
+                               (splits == 1 || splits == 4);
+          if (probe64)
+            for (const uint32_t rows : {40u, 48u, 57u, 64u}) {
+              const LinearWorkload wl{{columns, K}, rows, LinearPhase::Decode, epilogue, WeightLayout::Block32};
+              const LinearPlan plan = Linear::plan(wl, config(tile, wl, splits), FloatOutput::BFloat16);
+              const uint32_t storage = plan.storageRows();
+              const std::string label = what + " rows=" + std::to_string(rows);
+              const std::vector<uint16_t> aux = storageRows(residual, columns, rows, storage);
+              const Outcome out = run(backend, linear, plan, up, gated, storageRows(x, K, rows, storage), aux,
+                                      kPoisonFinite, N, label);
+              checkValues(out, dots, gateDots, aux, wl, rows, N, staged, label);
+              if (!sameRows(out.output, 0, lanesAlone[0].output, 0, kLaneRows, columns))
+                fail(label + ": the first lane differs from its one-lane projection");
+            }
         }
     }
   }

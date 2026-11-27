@@ -221,6 +221,7 @@ void run(const std::string &metallibPath, const std::string &filter) {
       {"gguf_decode_%s_m8_a", 8},
       {"gguf_decode_%s_m16_a", 16},
       {"gguf_decode_%s_m32_a", 32},
+      {"gguf_decode_%s_m64_a", 64},
   };
   for (const Shape &shape : shapes) {
     if (!filter.empty() && std::string_view(shape.label).find(filter) == std::string_view::npos)

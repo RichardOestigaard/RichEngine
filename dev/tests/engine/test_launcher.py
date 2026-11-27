@@ -172,6 +172,12 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(
             launcher.parse_args(["models", "verify", MODEL_ID]).models_command, "verify"
         )
+        self.assertEqual(
+            launcher.parse_args(
+                ["models", "abandon-thin-sources", "--selection", ".selections/" + "a" * 64]
+            ).models_command,
+            "abandon-thin-sources",
+        )
         wiped = launcher.parse_args(
             ["disk", "wipe", "richengine", ".selections/" + "a" * 64, "--yes"]
         )

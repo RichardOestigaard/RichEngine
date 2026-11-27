@@ -27,6 +27,9 @@ MODEL_ARGS = --model "$(MODEL)" $(if $(REVISION),--revision "$(REVISION)") \
 	$(if $(DRAFT_MODEL),--draft-model "$(DRAFT_MODEL)") \
 	$(if $(filter 1,$(LANGUAGE_ONLY)),--language-only)
 MODELS_DIR ?=
+# Extra experimental host/shader defines. Keeping these out of
+# PROD_METALFLAGS lets the metal4.0 target-specific override still work.
+EXTRA_DEFINES ?=
 MODEL_INSTALL = $(PYTHON) install/models.py \
 	$(if $(MODELS_DIR),--models "$(MODELS_DIR)") $(MODEL_ARGS)
 # The installation's selection link, as the installer names it.
@@ -60,7 +63,7 @@ MACOS_TARGET_FLAG := -mmacosx-version-min=$(MACOS_MIN_VERSION)
 HOST_CPU_BRAND := $(shell sysctl -n machdep.cpu.brand_string 2>/dev/null)
 M5_CXXFLAGS := $(if $(findstring Apple M5,$(HOST_CPU_BRAND)),-mcpu=apple-m5 -flto=thin)
 PROD_METALFLAGS := -std=metal4.1 -O3 -Wall -Wextra -Werror -Iruntime \
-	$(MACOS_TARGET_FLAG)
+	$(MACOS_TARGET_FLAG) $(EXTRA_DEFINES)
 # gguf_prefill_int8.metal's int8 cooperative tensors compile under metal4.0
 # only: metal4.1 rejects get_destination_cooperative_tensor for ANY
 # cooperative-tensor operands (retested on the macOS 27.2 SDK / Xcode 27.2;
@@ -69,7 +72,7 @@ PROD_METALFLAGS := -std=metal4.1 -O3 -Wall -Wextra -Werror -Iruntime \
 # moe_int8.metal shares the tile (kernels/common/gguf_prefill_int8_tile.h).
 METAL40_FLAGS := $(subst metal4.1,metal4.0,$(PROD_METALFLAGS))
 ENGINE_CXXFLAGS := -std=c++20 -O3 $(M5_CXXFLAGS) -Wall -Wextra -Werror -Iruntime \
-	$(MACOS_TARGET_FLAG)
+	$(MACOS_TARGET_FLAG) $(EXTRA_DEFINES)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
 LIB := $(BUILD)/richengine.metallib
 # The block-8 verify geometry ships inside the same binary: its objects are

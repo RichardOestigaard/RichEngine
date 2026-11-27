@@ -449,7 +449,7 @@ CompositeStateStorage::snapshot(uint32_t index, LogicalLengths lengths) {
   const std::vector<DFlashDraftRingLayer> &ring = draft(index);
   validateLengths(lengths, true);
   Buffers buffers;
-  if (auto admission = acquire(1, "state-cache", buffers, 0, {}, cachedInt8_))
+  if (!acquire(1, "state-cache", buffers, 0, {}, cachedInt8_))
     return nullptr;
   CachedStateBuffers cached{std::move(buffers.gdn[0]), std::move(buffers.draft)};
   if (cachedInt8_)

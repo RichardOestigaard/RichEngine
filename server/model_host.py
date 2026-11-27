@@ -460,6 +460,7 @@ class ModelHost:
                 contract=contract,
                 serving=serving_contract,
                 shared_prefix_states=self.args.shared_prefix_state,
+                branch_checkpoint_states=self.args.branch_checkpoint_state,
             )
         except BaseException:
             # A start that failed while the engine loaded stops it.

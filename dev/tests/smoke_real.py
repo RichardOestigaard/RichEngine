@@ -116,6 +116,8 @@ class RealServer:
         if arguments.max_image_pixels is not None:
             command.extend(("--max-image-pixels", str(arguments.max_image_pixels)))
         command.extend(("--kv-format", arguments.kv_format))
+        if getattr(arguments, "branch_checkpoint_state", False):
+            command.append("--branch-checkpoint-state")
         self.process = subprocess.Popen(
             command,
             cwd=ROOT,

@@ -1,4 +1,5 @@
 #include "metal/kernels/common/paged_attention_tile.h"
+#include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/activation.h"
 
 // Verify tiles process one lane's eight rows per KV head and history split.
@@ -22,7 +23,7 @@ struct RichVerifyTile {
 
 template <uint KVHeads, uint QueryHeadsPerKVHead,
           uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION>
-inline RichVerifyTile richengine_verify_attention_tile_at(
+inline RichVerifyTile richengine_verify_attention_tile_at4(
     device bfloat *queries, device const RichKvPage *page_table0,
     device const RichKvPage *page_table1, device const RichKvPage *page_table2,
     device const RichKvPage *page_table3,
@@ -54,6 +55,37 @@ inline RichVerifyTile richengine_verify_attention_tile_at(
   return tile;
 }
 
+template <uint KVHeads, uint QueryHeadsPerKVHead,
+          uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION>
+inline RichVerifyTile richengine_verify_attention_tile_at(
+    device bfloat *queries,
+    RICHENGINE_LANE_PARAMS(device const RichKvPage *, page_table),
+    constant RichVerifyAttentionParams *params, uint3 group) {
+  constexpr uint D = HeadDim;
+  RichVerifyTile tile{};
+  uint kv_head = group.x;
+  uint split = group.y;
+  uint batch = group.z;
+  constant RichVerifyAttentionParams &lane_params = params[batch];
+  if (!richengine_verify_attention_contract_valid(lane_params) ||
+      kv_head >= KVHeads || split >= lane_params.split_count)
+    return tile;
+  constexpr ulong group_stride =
+      ulong(RICHENGINE_VERIFY_CHUNK_STRIDE) * QueryHeadsPerKVHead * D;
+  tile.queries = queries + (ulong(batch) * KVHeads + kv_head) * group_stride;
+  tile.page_table =
+      RICHENGINE_LANE_SELECT(batch, page_table);
+  tile.slot =
+      (ulong(batch) * KVHeads + kv_head) * lane_params.slot_splits + split;
+  tile.kv_head = kv_head;
+  tile.split = split;
+  tile.splits = lane_params.split_count;
+  tile.committed_tokens = lane_params.committed_tokens;
+  tile.active_rows = lane_params.active_rows;
+  tile.active = true;
+  return tile;
+}
+
 // Verify entries: one lane per group.z, eight rows, one configured history
 // partition, with scratch for scores, probabilities and row statistics.
 // INT8 and BF16 entries share one signature: pages are reached through the
@@ -63,11 +95,9 @@ inline RichVerifyTile richengine_verify_attention_tile_at(
       device bfloat *queries [[buffer(0)]],                                    \
       device bfloat *partials [[buffer(1)]],                                    \
       device float *statistics [[buffer(2)]],                                  \
-      device const RichKvPage *page_table0 [[buffer(3)]],                    \
-      device const RichKvPage *page_table1 [[buffer(4)]],                    \
-      device const RichKvPage *page_table2 [[buffer(5)]],                    \
-      device const RichKvPage *page_table3 [[buffer(6)]],                    \
-      constant RichVerifyAttentionParams *params [[buffer(7)]],              \
+      RICHENGINE_LANE_BUFFER_ARGS(device const RichKvPage *, page_table, 3), \
+      constant RichVerifyAttentionParams *params                             \
+          [[buffer(3 + RICHENGINE_MAXIMUM_BATCH_WIDTH)]],                    \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]])
 
@@ -83,8 +113,16 @@ inline RichVerifyTile richengine_verify_attention_tile_at(
 
 #define PAGED_VERIFY_TILE_AT(Heads, Group, HeadDim)                            \
   const RichVerifyTile tile =                                                \
+      richengine_verify_attention_tile_at4<Heads, Group, HeadDim>(           \
+          queries, page_table0, page_table1, page_table2, page_table3,       \
+          params, group);                                                    \
+  if (!tile.active)                                                            \
+    return;
+
+#define PAGED_VERIFY_TILE_AT_WIDE(Heads, Group, HeadDim)                            \
+  const RichVerifyTile tile =                                                \
       richengine_verify_attention_tile_at<Heads, Group, HeadDim>(                  \
-          queries, page_table0, page_table1, page_table2, page_table3, params, \
+          queries, RICHENGINE_LANE_VALUES(page_table), params, \
           group);                                                              \
   if (!tile.active)                                                            \
     return;
@@ -97,7 +135,7 @@ inline RichVerifyTile richengine_verify_attention_tile_at(
 #define PAGED_VERIFY_SPLIT(Name, Heads, Group, CacheElement, HeadDim, VRows, ...) \
   PAGED_VERIFY_SPLIT_SIGNATURE(Name) {                                         \
     PAGED_VERIFY_SCRATCH(Group, VRows)                                         \
-    PAGED_VERIFY_TILE_AT(Heads, Group, HeadDim)                                \
+    PAGED_VERIFY_TILE_AT_WIDE(Heads, Group, HeadDim)                                \
     richengine_paged_attention_tile<Heads, Group, VRows,                       \
                                 CacheElement, HeadDim, ##__VA_ARGS__>(         \
         tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
@@ -204,7 +242,7 @@ PAGED_VERIFY_SPLIT(verify_attention_bf16_split_k4q4d128_m8_a16, 4, 4, bfloat, 12
                               VRows, ...)                                   \
   PAGED_VERIFY_SPLIT_SIGNATURE(Name) {                                       \
     PAGED_VERIFY_SCRATCH_M2(Group, VRows)                                    \
-    PAGED_VERIFY_TILE_AT(Heads, Group, HeadDim)                              \
+    PAGED_VERIFY_TILE_AT_WIDE(Heads, Group, HeadDim)                              \
     richengine_paged_attention_tile<Heads, Group, VRows,                     \
                                 CacheElement, HeadDim, 2, ##__VA_ARGS__>(    \
         tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
@@ -266,7 +304,7 @@ PAGED_VERIFY_SPLIT_M2(verify_attention_bf16_split_hd128_m8_a16, 2, 8, bfloat, 12
                               VRows, Passes, ...)                           \
   PAGED_VERIFY_SPLIT_SIGNATURE(Name) {                                       \
     PAGED_VERIFY_SCRATCH_MP(Group, VRows, Passes)                            \
-    PAGED_VERIFY_TILE_AT(Heads, Group, HeadDim)                              \
+    PAGED_VERIFY_TILE_AT_WIDE(Heads, Group, HeadDim)                              \
     richengine_paged_attention_tile<Heads, Group, VRows,                    \
                                 CacheElement, HeadDim, Passes,               \
                                 ##__VA_ARGS__>(                              \
@@ -304,7 +342,7 @@ PAGED_VERIFY_SPLIT_MP(verify_attention_bf16_split_k2q16d128_m8_a16, 2, 16, bfloa
     PAGED_VERIFY_SCRATCH_M2(Group, VRows)                                    \
     const RichVerifyTile tile =                                              \
         richengine_verify_attention_tile_at<Heads, Group, HeadDim>(          \
-            queries, page_table0, page_table1, page_table2, page_table3,     \
+            queries, RICHENGINE_LANE_VALUES(page_table),     \
             params, uint3(group.x >> 1, group.y, group.z));                  \
     if (!tile.active)                                                        \
       return;                                                                \
@@ -354,7 +392,7 @@ PAGED_VERIFY_SPLIT_R2_BOTH(verify_attention_bf16_split_k4q4d128_r2, verify_atten
     PAGED_VERIFY_SCRATCH_RP(Group, Passes)                                   \
     const RichVerifyTile tile =                                              \
         richengine_verify_attention_tile_at<Heads, Group, HeadDim>(          \
-            queries, page_table0, page_table1, page_table2, page_table3,     \
+            queries, RICHENGINE_LANE_VALUES(page_table),     \
             params, uint3(group.x / Passes, group.y, group.z));              \
     if (!tile.active)                                                        \
       return;                                                                \
@@ -524,7 +562,7 @@ PAGED_VERIFY_SPLIT_SWA_BOTH(verify_attention_bf16_split_swa_k4q4d128, verify_att
       uint thread_index [[thread_index_in_threadgroup]]) {                   \
     PAGED_VERIFY_SCRATCH_M2(Group, VRows)                                    \
     const RichVerifyTile tile =                                              \
-        richengine_verify_attention_tile_at<Heads, Group, HeadDim>(          \
+        richengine_verify_attention_tile_at4<Heads, Group, HeadDim>(          \
             queries, page_table0, page_table1, page_table2, page_table3,     \
             params, uint3(group.x >> 1, group.y, group.z));                  \
     if (!tile.active)                                                        \
@@ -618,7 +656,7 @@ PAGED_VERIFY_SPLIT_SWA_M2_BOTH(verify_attention_bf16_split_swa_hd512_m2, verify_
       uint thread_index [[thread_index_in_threadgroup]]) {                   \
     PAGED_VERIFY_DUO_SCRATCH(Group, VRows, Passes)                             \
     const RichVerifyTile tile =                                              \
-        richengine_verify_attention_tile_at<Heads, Group>(                   \
+        richengine_verify_attention_tile_at4<Heads, Group>(                   \
             queries, page_table0, page_table1, page_table2, page_table3,     \
             params, uint3(group.x / Passes, group.y, group.z));              \
     if (!tile.active)                                                        \
@@ -722,7 +760,7 @@ PAGED_VERIFY_SPLIT_DUO(verify_attention_int4_split_kv4_g4_duo_r4_a16, 4, 4, Rich
       uint thread_index [[thread_index_in_threadgroup]]) {                   \
     PAGED_VERIFY_DUO_SCRATCH_M2(Group, VRows)                                  \
     const RichVerifyTile tile =                                              \
-        richengine_verify_attention_tile_at<Heads, Group>(                   \
+        richengine_verify_attention_tile_at4<Heads, Group>(                   \
             queries, page_table0, page_table1, page_table2, page_table3,     \
             params, group);                                                  \
     if (!tile.active)                                                        \

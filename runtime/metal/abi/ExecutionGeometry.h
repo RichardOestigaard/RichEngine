@@ -28,8 +28,17 @@
        : RICHENGINE_TARGET_VERIFY_ROWS)
 #define RICHENGINE_MAXIMUM_PHYSICAL_KV_TOKENS                                  \
   (RICHENGINE_MAXIMUM_CONTEXT_TOKENS + RICHENGINE_SPECULATIVE_SCRATCH_TOKENS)
+// The physical decode-lane ceiling. Production remains four lanes; the
+// width experiment compiles a separate binary with eight. The value is an
+// ABI constant: host parameter arrays and every precompiled kernel must use
+// the same definition, so it is overrideable only at compile time.
+#ifndef RICHENGINE_MAXIMUM_BATCH_WIDTH
 #define RICHENGINE_MAXIMUM_BATCH_WIDTH 4u
+#endif
 #define RICHENGINE_PREFILL_TOKEN_BUDGET 2048u
+// ABI layout helper for static size formulas whose uint64 arrays require
+// eight-byte alignment on both host and shader sides.
+#define RICHENGINE_ABI_ALIGN8(x) (((x) + 7u) & ~7u)
 // Physical slots per KV head of the draft KV ring: the widest declared
 // draft sliding_window the runtime serves. A draft's own declared window
 // bounds how much of the ring its attention reads (DraftAttentionBatchParams).

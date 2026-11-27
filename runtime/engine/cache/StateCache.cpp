@@ -231,8 +231,17 @@ bool StateCache::retireCheckpointState(StateCheckpoint checkpoint) noexcept {
   return erase(checkpoint.kvBlock, true).evicted;
 }
 
+void StateCache::markBranch(uint64_t kvBlock) {
+  Entry &entry = this->entry(kvBlock);
+  if (!entry.checkpoint)
+    throw std::logic_error("only a checkpoint can become a branch state");
+  entry.branch = true;
+  reindex(kvBlock, entry);
+}
+
 void StateCache::makeOrdinary(uint64_t kvBlock, Entry &entry) {
   kv_.noteState(kvBlock);
+  entry.branch = false;
   if (!entry.checkpoint)
     return;
   --checkpointEntries_;
@@ -321,7 +330,14 @@ StateCache::oldestOf(const RecencyOrder &order, bool keepResumePoint) const noex
 }
 
 std::optional<CacheEvictionCandidate>
+StateCache::branchCandidate() const noexcept {
+  return oldestOf(branches_, false);
+}
+
+std::optional<CacheEvictionCandidate>
 StateCache::checkpointCandidate(bool keepResumePoint) const noexcept {
+  if (const auto branch = branchCandidate())
+    return branch;
   return oldestOf(checkpoints_, keepResumePoint);
 }
 
@@ -638,7 +654,7 @@ void StateCache::reindex(uint64_t kvBlock, Entry &target) noexcept {
     return;
   const bool used = inUse(kvBlock);
   if (target.ram && !persisting(kvBlock))
-    (used ? inUse_ : target.checkpoint ? checkpoints_ : ordinary_)
+    (used ? inUse_ : target.branch ? branches_ : target.checkpoint ? checkpoints_ : ordinary_)
         .link(target.ramNode, target.lastUsed, kvBlock);
   if (target.disk && !writing(kvBlock))
     (target.ram ? duplicates_ : used ? inUseOnDisk_ : diskOnly_)

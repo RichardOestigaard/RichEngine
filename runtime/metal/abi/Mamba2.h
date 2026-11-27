@@ -93,7 +93,12 @@ struct Mamba2DecodeBatchParams {
   uint64_t step_tape[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(Mamba2DecodeBatchParams) == 152,
+static_assert(sizeof(Mamba2DecodeBatchParams) ==
+                  RICHENGINE_ABI_ALIGN8(
+                      RICHENGINE_ABI_ALIGN8(52 +
+                                            4 * RICHENGINE_MAXIMUM_BATCH_WIDTH) +
+                      12 * RICHENGINE_MAXIMUM_BATCH_WIDTH) +
+                      8 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "Mamba2 decode parameters are 152 bytes on both sides");
 
 struct Mamba2BatchCommitParams {

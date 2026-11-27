@@ -218,6 +218,14 @@ class TemplateTokenizer(FakeTokenizer):
         return self.renderer.apply_chat_template(messages, **kwargs)
 
 
+class ByteTemplateTokenizer(TemplateTokenizer):
+    """Renders real templates and encodes each byte as one token, so tests
+    can count exact prompt-prefix boundaries in a long render."""
+
+    def __call__(self, text, **_kwargs):
+        return {"input_ids": list(text.encode("utf-8"))}
+
+
 class BlockingTokenizer(FakeTokenizer):
     """Holds each render until released, once armed after its chat template
     was probed."""
@@ -588,6 +596,7 @@ def main_args(**overrides):
             "moe_union": None,
             "canvas_profile": "paper",
             "shared_prefix_state": True,
+            "branch_checkpoint_state": False,
             "max_image_pixels": images.MAX_PIXELS,
             "request_timeout": None,
             "queue_size": 1,
@@ -1882,6 +1891,44 @@ class ServerTest(unittest.TestCase):
         )
         self.assertIn("I was charged twice this month", prompt)
         self.assertIn(decisions.IM_START + "assistant\n", prompt)
+
+    def test_branch_checkpoint_state_marks_final_user_boundary(self):
+        template = FakeTokenizer.chat_template
+        messages = [
+            {"role": "system", "content": "rules " * 240},
+            {"role": "user", "content": "history " * 220},
+            {"role": "assistant", "content": "answer " * 120},
+            {"role": "user", "content": "the editable final question"},
+        ]
+        rendered = (
+            ByteTemplateTokenizer(template)
+            .renderer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            .encode("utf-8")
+        )
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                runtime = FakeRuntime()
+                harness = self.harness(
+                    runtime,
+                    tokenizer=ByteTemplateTokenizer(template),
+                    max_context=20000,
+                    branch_checkpoint_states=enabled,
+                )
+                status, _, payload = harness.request(
+                    "POST", "/v1/chat/completions", self.body(messages=messages)
+                )
+                self.assertEqual(status, 200, payload)
+                request = runtime.requests[0].frame
+                if not enabled:
+                    self.assertEqual(request.branch_boundary_tokens, 0)
+                    continue
+                boundary = request.branch_boundary_tokens
+                self.assertGreaterEqual(boundary, 1024)
+                self.assertLess(boundary, len(request.prompt_tokens))
+                prefix = bytes(rendered[:boundary])
+                self.assertTrue(prefix.endswith(b"<|im_start|>user\n"), prefix[-80:])
 
     def test_models_routes_use_normalized_paths(self):
         harness = self.harness(FakeRuntime())

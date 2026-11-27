@@ -303,6 +303,7 @@ bool NativeRuntime::handleRequest(protocol::RequestFrame &request) {
     engineRequest.prompt = std::move(request.promptTokens);
     engineRequest.generationPromptTokens = request.generationPromptTokens;
     engineRequest.sharedPrefixTokens = request.sharedPrefixTokens;
+    engineRequest.branchBoundaryTokens = request.branchBoundaryTokens;
     engineRequest.images = std::move(request.imageSpans);
     engineRequest.imagePixels = std::move(request.imagePixels);
     engineRequest.audio = std::move(request.audioSpans);

@@ -34,6 +34,7 @@ The paths an assembly links, and what reads each:
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import hashlib
 import json
@@ -63,6 +64,7 @@ RECORD_KEYS = {
     "thin",
 }
 FILE_RECORD_KEYS = {"path", "bytes", "mtime_ns", "ctime_ns", "digest"}
+ABANDONED_FILE_RECORD_KEYS = {"bytes", "digest", "source_abandoned"}
 
 
 def build(models_root: Path, record, files) -> Path:
@@ -342,24 +344,19 @@ def _engine_fingerprint_text() -> str | None:
     return f"{fingerprint['size']}:{fingerprint['mtime_ns']}:{metal}"
 
 
-def thin_cache_valid(assembly: Path) -> bool:
-    """Whether this assembly has a complete packed cache validated by the runtime.
-
-    The native loader writes .validated/<assembly digest> only after reading or
-    completing the entry keyed by the same plan it is running. This is the thin
-    installation's canonical-storage check; an absent or incomplete entry makes
-    verification fail so prepare reinstalls the source payload.
-    """
+def _thin_cache_entries(assembly: Path):
+    """The complete packed-cache entries validated for assembly by this engine."""
     root = _packed_cache_root()
     if root is None or not root.is_dir():
-        return False
+        return []
     try:
         owner = assembly.resolve().name
     except OSError:
-        return False
+        return []
     fingerprint = _engine_fingerprint_text()
     if fingerprint is None:
-        return False
+        return []
+    entries = []
     for entry in root.iterdir():
         marker = entry / ".validated" / owner
         if not entry.is_dir() or not marker.is_file():
@@ -369,24 +366,58 @@ def thin_cache_valid(assembly: Path) -> bool:
         except OSError:
             continue
         if len(lines) >= 2 and lines[1] == fingerprint and packed_cache_entry_valid(entry):
-            return True
-    return False
+            entries.append((entry, fingerprint))
+    return entries
 
 
-def drop_thin_sources(assembly: Path, models_root: Path) -> int:
-    """Drop a thin assembly's target payload links once its cache is validated.
+def thin_cache_valid(assembly: Path) -> bool:
+    """Whether this assembly has a complete packed cache validated by the runtime.
 
-    Owned blobs are unlinked only when no other assembly record references the
-    same content. The record intentionally keeps its original file entries:
-    they are the repair manifest and the refcount metadata, while missing
-    payload links are what verify() tolerates for a thin install.
+    The native loader writes .validated/<assembly digest> only after reading or
+    completing the entry keyed by the same plan it is running. This is the thin
+    installation's canonical-storage check; an absent or incomplete entry makes
+    verification fail so prepare reinstalls the source payload.
     """
+    return bool(_thin_cache_entries(assembly))
+
+
+def _write_packed_marker(markers: Path, owner: str, assembly: Path, fingerprint: str):
+    """Write one packed-cache owner/validation marker atomically."""
+    markers.mkdir(parents=True, exist_ok=True)
+    temporary = markers / (owner + ".tmp")
     try:
-        record = models.read_json(assembly / layout.ASSEMBLY_RECORD)
-    except models.ModelError:
-        return 0
-    if record.get("thin") is not True or not thin_cache_valid(assembly):
-        return 0
+        temporary.write_text(str(assembly) + "\n" + fingerprint + "\n")
+        os.replace(temporary, markers / owner)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _migrate_thin_cache_markers(entries, old_owner: str, assembly: Path):
+    """Move validated cache ownership from old_owner to assembly's digest.
+
+    The cache key itself is the packed-sources stamp and image plan, not the
+    assembly digest, so an assembly rewritten under a new record digest uses
+    the same payload bytes. The operation requires a validated cache before
+    rewriting; propagating that already-checked validation keeps the rewritten
+    installation bootable without another serve. Owner markers move too: the
+    packed-cache collector keys liveness on them.
+    """
+    owner = assembly.resolve().name
+    for entry, fingerprint in entries:
+        for kind in (".validated", ".owners"):
+            markers = entry / kind
+            _write_packed_marker(markers, owner, assembly, fingerprint)
+
+
+def _remove_thin_cache_markers(entries, owner: str):
+    """Remove a retired assembly digest's small packed-cache markers."""
+    for entry, _fingerprint in entries:
+        for kind in (".validated", ".owners"):
+            (entry / kind / owner).unlink(missing_ok=True)
+
+
+def _drop_payload_files(record, assembly: Path, models_root: Path) -> int:
+    """Unlink record's thin payload links and their otherwise-unreferenced blobs."""
     blobs = (models_root / layout.BLOBS).resolve()
     other_references = set()
     resolved = models_root / layout.RESOLVED
@@ -413,7 +444,7 @@ def drop_thin_sources(assembly: Path, models_root: Path) -> int:
             other_references.add(entry["path"])
     dropped = 0
     for name, entry in record.get("files", {}).items():
-        if not thin_payload_name(name):
+        if not thin_payload_name(name) or not isinstance(entry, dict):
             continue
         link = assembly / name
         try:
@@ -422,13 +453,34 @@ def drop_thin_sources(assembly: Path, models_root: Path) -> int:
                 dropped += 1
         except OSError:
             pass
+        path = entry.get("path")
+        if not isinstance(path, str):
+            continue
         try:
-            blob = Path(entry["path"])
+            blob = Path(path)
             if blob.parent.resolve() == blobs and str(blob) not in other_references:
                 blob.unlink(missing_ok=True)
         except OSError:
             pass
     return dropped
+
+
+def drop_thin_sources(assembly: Path, models_root: Path) -> int:
+    """Drop a thin assembly's target payload links once its cache is validated.
+
+    Owned blobs are unlinked only when no other assembly record references the
+    same content. Until the repair source is explicitly abandoned, the record
+    intentionally keeps its original file entries: they are the repair
+    manifest and the refcount metadata, while missing payload links are what
+    verify() tolerates for a thin install.
+    """
+    try:
+        record = models.read_json(assembly / layout.ASSEMBLY_RECORD)
+    except models.ModelError:
+        return 0
+    if record.get("thin") is not True or not thin_cache_valid(assembly):
+        return 0
+    return _drop_payload_files(record, assembly, models_root)
 
 
 def retire_thin_source_pin(link: Path, record):
@@ -440,6 +492,133 @@ def retire_thin_source_pin(link: Path, record):
     repo = source.get("repo")
     if isinstance(repo, str) and models.is_hex_digest(revision, 40):
         hub.retire_other_pins([], [hub.pinned(hub.snapshot(repo, revision), link)])
+
+
+def abandon_thin_sources(link: Path, models_root: Path):
+    """Abandon a validated thin installation's local payload repair sources.
+
+    The payload file records keep only their byte count and content digest.
+    Because those records are the assembly record, the rewritten assembly has
+    a new digest. It is published beside the old one, its packed-cache owner
+    and validation markers are propagated (the cache key does not include the
+    assembly digest), every selection pointing at the old assembly is moved
+    atomically, and only then the old symlink tree is removed. Call it under
+    the installation lock. A crash before the selection move leaves the old
+    installation intact; a crash after it leaves a valid new installation and
+    an unlinked old assembly for assembly.collect_garbage.
+    """
+    models_root = Path(models_root)
+    link = Path(link)
+    try:
+        old = link.resolve(strict=True)
+    except OSError as error:
+        raise models.ModelError(f"no installed assembly at {link}") from error
+    resolved = (models_root / layout.RESOLVED).resolve()
+    try:
+        if old.parent.resolve() != resolved:
+            raise models.ModelError(f"{link} does not resolve to an assembly")
+    except OSError as error:
+        raise models.ModelError(f"could not resolve {link}") from error
+    record = verify(link)
+    if record.get("thin") is not True:
+        raise models.ModelError("abandoning repair sources requires a thin installation")
+    files = record.get("files", {})
+    payload_names = sorted(name for name in files if thin_payload_name(name))
+    if not payload_names:
+        raise models.ModelError("thin installation records no target payload")
+    abandoned = {
+        name: files[name] for name in payload_names if abandoned_file_record(files[name])
+    }
+    if len(abandoned) == len(payload_names):
+        return {
+            "already": True,
+            "assembly": old,
+            "links": 0,
+            "payloads": len(payload_names),
+            "bytes": sum(files[name]["bytes"] for name in payload_names),
+            "dropped": 0,
+        }
+    if any(abandoned_file_record(files[name]) for name in payload_names):
+        raise models.ModelError("thin installation is partly abandoned; reinstall it first")
+    if is_held(old):
+        raise models.ModelError("the model is serving; stop its server first")
+    cache_entries = _thin_cache_entries(old)
+    if not cache_entries:
+        raise models.ModelError(
+            "thin packed cache is missing, incomplete, or stale; serve the model once first"
+        )
+    affected = []
+    for selection in models.selection_links(models_root):
+        try:
+            if selection.resolve() == old:
+                affected.append(selection)
+        except OSError:
+            pass
+    if link not in affected:
+        affected.append(link)
+
+    # Drop links before copying. If anything fails after this point but before
+    # publication, the old assembly is exactly the pre-existing post-drop thin
+    # state: verified by the same validated cache and repairable by reinstall.
+    dropped = _drop_payload_files(record, old, models_root)
+    rewritten = copy.deepcopy(record)
+    for name in payload_names:
+        rewritten["files"][name] = _abandonment(files[name])
+    encoded = models.json_bytes(rewritten)
+    digest = hashlib.sha256(encoded).hexdigest()
+    new = models_root / layout.RESOLVED / digest
+
+    stage = Path(tempfile.mkdtemp(prefix=layout.ENTRY_STAGING, dir=resolved))
+    try:
+        shutil.rmtree(stage)
+        shutil.copytree(old, stage, symlinks=True)
+        for name in payload_names:
+            (stage / name).unlink(missing_ok=True)
+        _write_durably(stage / layout.ASSEMBLY_RECORD, encoded)
+        if new.exists():
+            try:
+                if (new / layout.ASSEMBLY_RECORD).read_bytes() != encoded:
+                    raise models.ModelError(f"assembly digest collision at {new}")
+            except OSError as error:
+                raise models.ModelError(f"could not inspect {new}") from error
+        else:
+            os.rename(stage, new)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
+
+    _migrate_thin_cache_markers(cache_entries, old.name, new)
+    try:
+        verify(new)
+    except (models.ModelError, OSError):
+        linked = False
+        for selection in models.selection_links(models_root):
+            try:
+                linked = linked or selection.resolve() == new
+            except OSError:
+                pass
+        if not linked:
+            shutil.rmtree(new, ignore_errors=True)
+        raise
+
+    for selection in affected:
+        models.link_selection(selection, new)
+    for selection in affected:
+        retire_thin_source_pin(selection, rewritten)
+    try:
+        shutil.rmtree(old)
+    except OSError as error:
+        models.warn(f"could not remove the replaced thin assembly {old}: {error}")
+    _remove_thin_cache_markers(cache_entries, old.name)
+    return {
+        "already": False,
+        "assembly": new,
+        "previous": old,
+        "links": len(affected),
+        "payloads": len(payload_names),
+        "bytes": sum(files[name]["bytes"] for name in payload_names),
+        "dropped": dropped,
+    }
 
 
 def file_record(path: Path):
@@ -480,6 +659,24 @@ def _digest_of(path, digest):
     return models.hash_file(path, hashlib.sha1(f"blob {size}\0".encode()))
 
 
+def abandoned_file_record(entry):
+    """Whether entry is payload metadata whose repair source was abandoned."""
+    return (
+        isinstance(entry, dict)
+        and set(entry) == ABANDONED_FILE_RECORD_KEYS
+        and entry.get("source_abandoned") is True
+    )
+
+
+def _abandonment(entry):
+    """The metadata-only form of a full payload file record."""
+    return {
+        "bytes": entry["bytes"],
+        "digest": entry["digest"],
+        "source_abandoned": True,
+    }
+
+
 def verify(assembly: Path, *, full=False):
     """The record of the assembly at assembly (an entry of .resolved, or a
     selection link to one) if it verifies: model.json has the shape build
@@ -493,6 +690,14 @@ def verify(assembly: Path, *, full=False):
         raise models.ModelError("its draft is not a DFlash2 checkpoint")
     thin_valid = record.get("thin") is True and thin_cache_valid(assembly)
     for name, entry in record["files"].items():
+        if abandoned_file_record(entry):
+            # An abandoned payload has no local file to inspect. Its serving
+            # bytes are the packed cache, so the validated-cache check is the
+            # installation check; without it the next prepare reinstalls from
+            # the recorded upstream revision rather than from a local payload.
+            if not thin_valid:
+                raise models.ModelError("thin packed cache missing or stale")
+            continue
         path = assembly / name
         try:
             stat = path.stat()
@@ -517,6 +722,27 @@ def verify(assembly: Path, *, full=False):
         if full and _digest_of(path, entry["digest"]) != entry["digest"]:
             raise models.ModelError("source content hash mismatch: " + name)
     return record
+
+
+def _file_record_well_formed(name, entry, thin):
+    """Whether one assembly-path record is a full source record or abandoned metadata."""
+    if not models.is_safe_path(name) or not isinstance(entry, dict):
+        return False
+    digest = entry.get("digest")
+    digest_valid = models.is_hex_digest(digest, 40) or models.is_hex_digest(digest, 64)
+    if abandoned_file_record(entry):
+        return (
+            thin
+            and thin_payload_name(name)
+            and type(entry["bytes"]) is int
+            and digest_valid
+        )
+    return (
+        set(entry) == FILE_RECORD_KEYS
+        and isinstance(entry["path"], str)
+        and all(type(entry[key]) is int for key in ("bytes", "mtime_ns", "ctime_ns"))
+        and digest_valid
+    )
 
 
 def _well_formed(record):
@@ -552,17 +778,7 @@ def _well_formed(record):
         and ("thin" not in record or type(record["thin"]) is bool)
         and (record.get("thin") is not True or record["target_format"] == "mlx-affine")
         and all(
-            models.is_safe_path(name)
-            and isinstance(entry, dict)
-            and set(entry) == FILE_RECORD_KEYS
-            and isinstance(entry["path"], str)
-            and all(
-                type(entry[key]) is int for key in ("bytes", "mtime_ns", "ctime_ns")
-            )
-            and (
-                models.is_hex_digest(entry["digest"], 40)
-                or models.is_hex_digest(entry["digest"], 64)
-            )
+            _file_record_well_formed(name, entry, record.get("thin") is True)
             for name, entry in files.items()
         )
     )
@@ -587,14 +803,20 @@ def pins(record, assembly: Path | None = None):
         and record.get("thin") is True
         and thin_cache_valid(assembly)
     )
+    target_abandoned = any(
+        thin_payload_name(name) and abandoned_file_record(entry)
+        for name, entry in record["files"].items()
+    )
     sources = {
         (hub.folder_name(source["repo"]), source["revision"]): source["repo"]
         for kind, source in record["sources"].items()
         if source["revision"] is not None
-        and not (thin_valid and kind == layout.TARGET)
+        and not ((thin_valid or target_abandoned) and kind == layout.TARGET)
     }
     snapshots = {}
     for entry in record["files"].values():
+        if not isinstance(entry.get("path"), str):
+            continue
         path = hub.snapshot_of(entry["path"])
         key = path and (path.parent.parent.name, path.name)
         if key in sources:

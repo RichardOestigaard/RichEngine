@@ -15,7 +15,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 9
+PROTOCOL_VERSION = 10
 FRAME_HEADER_BYTES = 24
 STATUS_SCHEMA_VERSION = 8
 # Score-only requests carry 2..255 distinct option token ids and produce no
@@ -56,7 +56,7 @@ _MAGIC = b"RICH"
 _HEADER = struct.Struct("<4sHHHHQI")
 # Replay can update the integer deadlines without decoding sampling floats.
 _REQUEST_HEAD = struct.Struct("<QBBQQ")
-_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIIffIffffQBIIII")
+_REQUEST = struct.Struct(_REQUEST_HEAD.format + "IIIIffIffffQBIIIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQI")
 _AUDIO_SPAN = struct.Struct("<IIIQQ")
 _CANCEL = struct.Struct("<Q")
@@ -84,7 +84,7 @@ assert (
     and sys.byteorder == "little"
 )
 assert _HEADER.size == FRAME_HEADER_BYTES
-assert _REQUEST.size == 95
+assert _REQUEST.size == 99
 assert _IMAGE_SPAN.size == 36
 assert _AUDIO_SPAN.size == 28
 assert _READY.size == 12
@@ -329,6 +329,9 @@ class RequestFrame:
     # as the chat template's system prompt and tools; zero when unknown. It
     # must not exceed the prompt.
     shared_prefix_tokens: int = 0
+    # Leading prompt tokens before the final user/branch point sibling
+    # continuations share; zero when unknown. It must not exceed the prompt.
+    branch_boundary_tokens: int = 0
     # A shared prefix held outside prompt_tokens so batch jobs never copy it
     # per request; the serialized prompt is prefix_tokens + prompt_tokens.
     prefix_tokens: tuple = ()
@@ -918,6 +921,9 @@ def _validated_request(
         shared = _u32(request.shared_prefix_tokens, "shared prefix tokens")
         if shared > len(prompt):
             raise ValueError("shared prefix must lie within the prompt")
+        branch = _u32(request.branch_boundary_tokens, "branch boundary tokens")
+        if branch > len(prompt):
+            raise ValueError("branch boundary must lie within the prompt")
         if scores and (
             request.image_spans or request.image_pixels or request.audio_spans
         ):
@@ -1057,6 +1063,7 @@ def _request_frame(request: RequestFrame) -> bytearray:
         request.generation_prompt_tokens,
         request.flags,
         request.shared_prefix_tokens,
+        request.branch_boundary_tokens,
     )
     for index, span in enumerate(request.image_spans):
         _IMAGE_SPAN.pack_into(

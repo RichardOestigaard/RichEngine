@@ -39,7 +39,7 @@ struct DecodeStepPackParams {
   uint32_t budget[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(DecodeStepPackParams) == 96,
+static_assert(sizeof(DecodeStepPackParams) == 16 + 20 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "step-pack parameters are 96 bytes on both sides");
 
 // One lane's device mirror of the next step's host-computed inputs. A

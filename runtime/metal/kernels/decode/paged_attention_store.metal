@@ -1,12 +1,12 @@
 #include "metal/kernels/common/paged_store_row.h"
+#include "metal/kernels/common/lane_bindings.h"
 
 template <uint KVHeads, typename CacheElement,
           uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION,
           bool ValuesTokenMajor = false>
 inline void richengine_store_verify_phase(
     device const bfloat *chunk_keys, device const bfloat *chunk_values,
-    device const RichKvPage *page_table0, device const RichKvPage *page_table1,
-    device const RichKvPage *page_table2, device const RichKvPage *page_table3,
+    RICHENGINE_LANE_PARAMS(device const RichKvPage *, page_table),
     constant RichChunkedPrefillParams *params,
     threadgroup float *maxima, uint group, uint thread_index, uint simd_lane,
     uint simd_group) {
@@ -27,9 +27,7 @@ inline void richengine_store_verify_phase(
       thread_index >= HeadDim)
     return;
   device const RichKvPage *page_table =
-      batch == 0 ? page_table0
-                 : (batch == 1 ? page_table1
-                               : (batch == 2 ? page_table2 : page_table3));
+      RICHENGINE_LANE_SELECT(batch, page_table);
   const ulong lane_tensor_stride =
       ulong(KVHeads) * RICHENGINE_VERIFY_CHUNK_STRIDE * HeadDim;
   chunk_keys += batch * lane_tensor_stride;
@@ -48,73 +46,61 @@ inline void richengine_store_verify_phase(
 kernel void verify_attention_q8_store(
     device const bfloat *chunk_keys [[buffer(0)]],
     device const bfloat *chunk_values [[buffer(1)]],
-    device const RichKvPage *page_table0 [[buffer(2)]],
-    device const RichKvPage *page_table1 [[buffer(3)]],
-    device const RichKvPage *page_table2 [[buffer(4)]],
-    device const RichKvPage *page_table3 [[buffer(5)]],
-    constant RichChunkedPrefillParams *params [[buffer(6)]],
+    RICHENGINE_LANE_BUFFER_ARGS(device const RichKvPage *, page_table, 2),
+    constant RichChunkedPrefillParams *params
+        [[buffer(2 + RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float maxima[8];
   richengine_store_verify_phase<4, int8_t>(
-      chunk_keys, chunk_values, page_table0, page_table1, page_table2,
-      page_table3, params, maxima, group, thread_index, simd_lane, simd_group);
+      chunk_keys, chunk_values, RICHENGINE_LANE_VALUES(page_table), params, maxima, group, thread_index, simd_lane, simd_group);
 }
 
 kernel void verify_attention_q8_store_kv2_g8(
     device const bfloat *chunk_keys [[buffer(0)]],
     device const bfloat *chunk_values [[buffer(1)]],
-    device const RichKvPage *page_table0 [[buffer(2)]],
-    device const RichKvPage *page_table1 [[buffer(3)]],
-    device const RichKvPage *page_table2 [[buffer(4)]],
-    device const RichKvPage *page_table3 [[buffer(5)]],
-    constant RichChunkedPrefillParams *params [[buffer(6)]],
+    RICHENGINE_LANE_BUFFER_ARGS(device const RichKvPage *, page_table, 2),
+    constant RichChunkedPrefillParams *params
+        [[buffer(2 + RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float maxima[8];
   richengine_store_verify_phase<2, int8_t>(
-      chunk_keys, chunk_values, page_table0, page_table1, page_table2,
-      page_table3, params, maxima, group, thread_index, simd_lane, simd_group);
+      chunk_keys, chunk_values, RICHENGINE_LANE_VALUES(page_table), params, maxima, group, thread_index, simd_lane, simd_group);
 }
 
 kernel void verify_attention_int4_store(
     device const bfloat *chunk_keys [[buffer(0)]],
     device const bfloat *chunk_values [[buffer(1)]],
-    device const RichKvPage *page_table0 [[buffer(2)]],
-    device const RichKvPage *page_table1 [[buffer(3)]],
-    device const RichKvPage *page_table2 [[buffer(4)]],
-    device const RichKvPage *page_table3 [[buffer(5)]],
-    constant RichChunkedPrefillParams *params [[buffer(6)]],
+    RICHENGINE_LANE_BUFFER_ARGS(device const RichKvPage *, page_table, 2),
+    constant RichChunkedPrefillParams *params
+        [[buffer(2 + RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float maxima[8];
   richengine_store_verify_phase<4, RichKvPacked4>(
-      chunk_keys, chunk_values, page_table0, page_table1, page_table2,
-      page_table3, params, maxima, group, thread_index, simd_lane, simd_group);
+      chunk_keys, chunk_values, RICHENGINE_LANE_VALUES(page_table), params, maxima, group, thread_index, simd_lane, simd_group);
 }
 
 kernel void verify_attention_int4_store_kv2_g8(
     device const bfloat *chunk_keys [[buffer(0)]],
     device const bfloat *chunk_values [[buffer(1)]],
-    device const RichKvPage *page_table0 [[buffer(2)]],
-    device const RichKvPage *page_table1 [[buffer(3)]],
-    device const RichKvPage *page_table2 [[buffer(4)]],
-    device const RichKvPage *page_table3 [[buffer(5)]],
-    constant RichChunkedPrefillParams *params [[buffer(6)]],
+    RICHENGINE_LANE_BUFFER_ARGS(device const RichKvPage *, page_table, 2),
+    constant RichChunkedPrefillParams *params
+        [[buffer(2 + RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float maxima[8];
   richengine_store_verify_phase<2, RichKvPacked4>(
-      chunk_keys, chunk_values, page_table0, page_table1, page_table2,
-      page_table3, params, maxima, group, thread_index, simd_lane, simd_group);
+      chunk_keys, chunk_values, RICHENGINE_LANE_VALUES(page_table), params, maxima, group, thread_index, simd_lane, simd_group);
 }
 
 // BF16 entries copy the source bits and need no scale reduction.
@@ -122,35 +108,29 @@ kernel void verify_attention_int4_store_kv2_g8(
 kernel void verify_attention_bf16_store(
     device const bfloat *chunk_keys [[buffer(0)]],
     device const bfloat *chunk_values [[buffer(1)]],
-    device const RichKvPage *page_table0 [[buffer(2)]],
-    device const RichKvPage *page_table1 [[buffer(3)]],
-    device const RichKvPage *page_table2 [[buffer(4)]],
-    device const RichKvPage *page_table3 [[buffer(5)]],
-    constant RichChunkedPrefillParams *params [[buffer(6)]],
+    RICHENGINE_LANE_BUFFER_ARGS(device const RichKvPage *, page_table, 2),
+    constant RichChunkedPrefillParams *params
+        [[buffer(2 + RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   richengine_store_verify_phase<4, bfloat>(
-      chunk_keys, chunk_values, page_table0, page_table1, page_table2,
-      page_table3, params, nullptr, group, thread_index, simd_lane, simd_group);
+      chunk_keys, chunk_values, RICHENGINE_LANE_VALUES(page_table), params, nullptr, group, thread_index, simd_lane, simd_group);
 }
 
 kernel void verify_attention_bf16_store_kv2_g8(
     device const bfloat *chunk_keys [[buffer(0)]],
     device const bfloat *chunk_values [[buffer(1)]],
-    device const RichKvPage *page_table0 [[buffer(2)]],
-    device const RichKvPage *page_table1 [[buffer(3)]],
-    device const RichKvPage *page_table2 [[buffer(4)]],
-    device const RichKvPage *page_table3 [[buffer(5)]],
-    constant RichChunkedPrefillParams *params [[buffer(6)]],
+    RICHENGINE_LANE_BUFFER_ARGS(device const RichKvPage *, page_table, 2),
+    constant RichChunkedPrefillParams *params
+        [[buffer(2 + RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   richengine_store_verify_phase<2, bfloat>(
-      chunk_keys, chunk_values, page_table0, page_table1, page_table2,
-      page_table3, params, nullptr, group, thread_index, simd_lane, simd_group);
+      chunk_keys, chunk_values, RICHENGINE_LANE_VALUES(page_table), params, nullptr, group, thread_index, simd_lane, simd_group);
 }
 
 // Head-dimension variants: the dense target's KV2 pages of 128 (_hd128)
@@ -160,19 +140,16 @@ kernel void verify_attention_bf16_store_kv2_g8(
   kernel void Name(                                                       \
       device const bfloat *chunk_keys [[buffer(0)]],                      \
       device const bfloat *chunk_values [[buffer(1)]],                    \
-      device const RichKvPage *page_table0 [[buffer(2)]],               \
-      device const RichKvPage *page_table1 [[buffer(3)]],               \
-      device const RichKvPage *page_table2 [[buffer(4)]],               \
-      device const RichKvPage *page_table3 [[buffer(5)]],               \
-      constant RichChunkedPrefillParams *params [[buffer(6)]],          \
+      RICHENGINE_LANE_BUFFER_ARGS(device const RichKvPage *, page_table, 2), \
+      constant RichChunkedPrefillParams *params                              \
+          [[buffer(2 + RICHENGINE_MAXIMUM_BATCH_WIDTH)]],                    \
       uint group [[threadgroup_position_in_grid]],                        \
       uint thread_index [[thread_index_in_threadgroup]],                  \
       uint simd_lane [[thread_index_in_simdgroup]],                       \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {               \
     threadgroup float maxima[HeadDim / 32];                               \
     richengine_store_verify_phase<Heads, CacheElement, HeadDim>(              \
-        chunk_keys, chunk_values, page_table0, page_table1, page_table2,  \
-        page_table3, params, maxima, group, thread_index, simd_lane,      \
+        chunk_keys, chunk_values, RICHENGINE_LANE_VALUES(page_table), params, maxima, group, thread_index, simd_lane,      \
         simd_group);                                                      \
   }
 VERIFY_ATTENTION_STORE_HD(verify_attention_q8_store_hd128, 2, int8_t, 128)
@@ -204,19 +181,16 @@ VERIFY_ATTENTION_STORE_HD(verify_attention_bf16_store_k4d128, 4, bfloat, 128)
   kernel void Name(                                                          \
       device const bfloat *chunk_keys [[buffer(0)]],                         \
       device const bfloat *chunk_values [[buffer(1)]],                       \
-      device const RichKvPage *page_table0 [[buffer(2)]],                    \
-      device const RichKvPage *page_table1 [[buffer(3)]],                    \
-      device const RichKvPage *page_table2 [[buffer(4)]],                    \
-      device const RichKvPage *page_table3 [[buffer(5)]],                    \
-      constant RichChunkedPrefillParams *params [[buffer(6)]],               \
+      RICHENGINE_LANE_BUFFER_ARGS(device const RichKvPage *, page_table, 2), \
+      constant RichChunkedPrefillParams *params                              \
+          [[buffer(2 + RICHENGINE_MAXIMUM_BATCH_WIDTH)]],                    \
       uint group [[threadgroup_position_in_grid]],                           \
       uint thread_index [[thread_index_in_threadgroup]],                     \
       uint simd_lane [[thread_index_in_simdgroup]],                          \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                  \
     threadgroup float maxima[8];                                             \
     richengine_store_verify_phase<Heads, CacheElement, HeadDim, true>(       \
-        chunk_keys, chunk_values, page_table0, page_table1, page_table2,     \
-        page_table3, params, maxima, group, thread_index, simd_lane,         \
+        chunk_keys, chunk_values, RICHENGINE_LANE_VALUES(page_table), params, maxima, group, thread_index, simd_lane,         \
         simd_group);                                                         \
   }
 VERIFY_ATTENTION_STORE_TM(verify_attention_q8_store_kv2_g8_tm, 2, int8_t, RICHENGINE_KV_HEAD_DIMENSION)
@@ -240,10 +214,7 @@ VERIFY_ATTENTION_STORE_TM(verify_attention_bf16_store_k4q8d128_tm, 4, bfloat, 12
 template <uint KVHeads, typename CacheElement,
           uint HeadDim = RICHENGINE_KV_HEAD_DIMENSION>
 inline void richengine_compact_verify_tree_phase(
-    device const RichKvPage *page_table0,
-    device const RichKvPage *page_table1,
-    device const RichKvPage *page_table2,
-    device const RichKvPage *page_table3,
+    RICHENGINE_LANE_PARAMS(device const RichKvPage *, page_table),
     constant RichChunkedPrefillParams *params,
     device const uint *retained_path, device const uint *retained_count,
     uint group, uint thread_index) {
@@ -254,9 +225,7 @@ inline void richengine_compact_verify_tree_phase(
   if (count == 0)
     return;
   device const RichKvPage *page_table =
-      batch == 0 ? page_table0
-                 : (batch == 1 ? page_table1
-                               : (batch == 2 ? page_table2 : page_table3));
+      RICHENGINE_LANE_SELECT(batch, page_table);
   const RichKvAddressing<KVHeads, CacheElement, HeadDim> addressing(
       lane_params.kv, head);
   constexpr bool packed = is_same<CacheElement, RichKvPacked4>::value;
@@ -321,17 +290,17 @@ inline void richengine_compact_verify_tree_phase(
 
 #define VERIFY_TREE_COMPACT(Name, Heads, CacheElement, HeadDim)            \
   kernel void Name(                                                        \
-      device const RichKvPage *page_table0 [[buffer(0)]],                \
-      device const RichKvPage *page_table1 [[buffer(1)]],                \
-      device const RichKvPage *page_table2 [[buffer(2)]],                \
-      device const RichKvPage *page_table3 [[buffer(3)]],                \
-      device const uint *retained_path [[buffer(4)]],                      \
-      device const uint *retained_count [[buffer(5)]],                     \
-      constant RichChunkedPrefillParams *params [[buffer(6)]],           \
+      RICHENGINE_LANE_BUFFER_ARGS(device const RichKvPage *, page_table, 0), \
+      device const uint *retained_path                                      \
+          [[buffer(RICHENGINE_MAXIMUM_BATCH_WIDTH)]],                        \
+      device const uint *retained_count                                     \
+          [[buffer(1 + RICHENGINE_MAXIMUM_BATCH_WIDTH)]],                    \
+      constant RichChunkedPrefillParams *params                             \
+          [[buffer(2 + RICHENGINE_MAXIMUM_BATCH_WIDTH)]],                  \
       uint group [[threadgroup_position_in_grid]],                         \
       uint thread_index [[thread_index_in_threadgroup]]) {                 \
     richengine_compact_verify_tree_phase<Heads, CacheElement, HeadDim>(        \
-        page_table0, page_table1, page_table2, page_table3, params,        \
+        RICHENGINE_LANE_VALUES(page_table), params,        \
         retained_path, retained_count, group, thread_index);               \
   }
 VERIFY_TREE_COMPACT(verify_tree_attention_q8_compact, 4, int8_t, 256)

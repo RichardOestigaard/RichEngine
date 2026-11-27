@@ -111,6 +111,9 @@ void Engine::submit(EngineRequest value) {
   if (value.sharedPrefixTokens > value.prompt.size()) {
     throw std::invalid_argument("shared prefix must lie within the prompt");
   }
+  if (value.branchBoundaryTokens > value.prompt.size()) {
+    throw std::invalid_argument("branch boundary must lie within the prompt");
+  }
   if (std::any_of(value.prompt.begin(), value.prompt.end(), outOfVocabulary)) {
     throw std::invalid_argument("prompt token is out of vocabulary");
   }
@@ -608,10 +611,24 @@ bool Engine::admitQueued(double now) {
   // probed, to tell a prefix wait: a request waiting for a prefix would
   // leave the freed lane to the suspended one, which would resume into it
   // and replay for nothing.
+  // Experimental admission control: the compiled ABI fixes the physical
+  // width, while RICHENGINE_MAX_BATCH_WIDTH can only narrow admission below
+  // it. Widths 5-7 therefore run inside a width-8 build with padded lanes.
+  static const uint32_t admissionWidth = [] {
+    const char *text = std::getenv("RICHENGINE_MAX_BATCH_WIDTH");
+    const uint32_t physical = model::ExecutionLimits::maximumBatchWidth;
+    if (!text || !*text)
+      return physical;
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(text, &end, 10);
+    if (end == text || *end != '\0' || parsed == 0)
+      return physical;
+    return uint32_t(std::min<unsigned long>(parsed, physical));
+  }();
   const bool lanesFull =
       std::count_if(requests_.begin(), requests_.end(), [](const auto &entry) {
         return entry.second.lane.has_value();
-      }) >= model::ExecutionLimits::maximumBatchWidth;
+      }) >= admissionWidth;
   bool laneSought = false;
   const auto waitForLane = [&](uint64_t id, Request &active) {
     if (!laneSought && !pendingSharedPrefill(active, cachedTokens(active))) {
@@ -953,7 +970,13 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
     scheduler_.resumeFromResources(active.request.id, resumeBoundary, active.replayTokens);
   active.latestCheckpoint = {};
   if (lookup.state) {
-    active.latestCheckpoint = cache_.checkpointState(lookup.state->kvBlock());
+    const uint32_t branchJunction = active.request.branchBoundaryTokens /
+                                    KvCache::pageTokens * KvCache::pageTokens;
+    // A restored branch point is not this lane's rolling recovery point:
+    // taking it as one would let the lane's next publication retire the state
+    // its remaining siblings still need.
+    if (cache_.ordinary(lookup.state->kvBlock()) || resumeBoundary != branchJunction)
+      active.latestCheckpoint = cache_.checkpointState(lookup.state->kvBlock());
     // A restored replay point of the prompt already has the ordinary state
     // we need, in whichever tier holds it: a promotion that found no cache
     // slot leaves it on disk. Other restored progress points, the end of a
@@ -1111,7 +1134,8 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
     // restoration.
     for (const uint32_t checkpoint : plannedCheckpoints(
              stateBoundary, latestReplayBoundary, checkpointTokens_)) {
-      addStateBoundary(active, stateBoundary, checkpoint, true);
+      addStateBoundary(active, stateBoundary, checkpoint,
+                        Request::StateBoundaryKind::RollingCheckpoint);
     }
   }
   // A score-only request replays nothing but its prompt, so a decision
@@ -1121,21 +1145,40 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   const uint32_t junctionGain =
       scoreOnly ? KvCache::pageTokens : kMinimumJunctionGain;
   if (junctionBoundary >= stateBoundary + junctionGain)
-    addStateBoundary(active, stateBoundary, junctionBoundary, false);
+    addStateBoundary(active, stateBoundary, junctionBoundary,
+                     Request::StateBoundaryKind::Reusable);
   // A prefix other requests will share is a junction they have not reached
   // yet: keeping its state now spares the first of them recomputing it.
   const uint32_t sharedJunction = active.request.sharedPrefixTokens /
                                   KvCache::pageTokens * KvCache::pageTokens;
   if (sharedJunction >= stateBoundary + junctionGain)
-    addStateBoundary(active, stateBoundary, sharedJunction, false);
+    addStateBoundary(active, stateBoundary, sharedJunction,
+                     Request::StateBoundaryKind::Reusable);
+  // A branch point names where the final user turn begins. Its state is a
+  // checkpoint for eviction, but unlike a rolling progress point it is not
+  // retired when this lane advances: edited turns and sibling forks resume
+  // from it after the lane is gone.
+  const uint32_t branchJunction = active.request.branchBoundaryTokens /
+                                  KvCache::pageTokens * KvCache::pageTokens;
+  // Unlike an ordinary junction, the branch point's value is not the work
+  // this lane saves by reaching it: it is the whole final user turn a later
+  // edit or sibling does not replay. That turn may be long even when the
+  // point is only a few tokens past this lane's restore, so the ordinary
+  // junction gain does not apply. The opt-in server boundary already clears
+  // its own size floor; addStateBoundary still rejects a point at or before
+  // the restore, or one inside the generation prompt.
+  addStateBoundary(active, stateBoundary, branchJunction,
+                   Request::StateBoundaryKind::BranchCheckpoint);
   if (!scoreOnly) {
     addStateBoundary(active, stateBoundary, latestReplayBoundary,
-                     latestReplayBoundary != promptReplayBoundary(active));
+                     latestReplayBoundary != promptReplayBoundary(active)
+                         ? Request::StateBoundaryKind::RollingCheckpoint
+                         : Request::StateBoundaryKind::Reusable);
     // A resumed lane below its prompt's replay point lost that state; it
     // rebuilds the one its conversation's next turn resumes from on the
     // way.
     addStateBoundary(active, stateBoundary, promptReplayBoundary(active),
-                     false);
+                     Request::StateBoundaryKind::Reusable);
   }
 
   // A score-only lane publishes no state, so boundaries armed on it for a
@@ -1148,7 +1191,7 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
 }
 
 bool Engine::addStateBoundary(Request &active, uint32_t after, uint32_t tokens,
-                              bool disposable) {
+                              Request::StateBoundaryKind kind) {
   // A state past the replay boundary would lie inside the generation prompt,
   // which a later request may not share.
   if (tokens <= after || tokens > replayStateBoundary(active))
@@ -1160,10 +1203,15 @@ bool Engine::addStateBoundary(Request &active, uint32_t after, uint32_t tokens,
         return point.tokens < value;
       });
   if (found != active.stateBoundaries.end() && found->tokens == tokens) {
-    found->disposable = found->disposable && disposable;
+    using Kind = Request::StateBoundaryKind;
+    const auto rank = [](Kind value) {
+      return value == Kind::Reusable ? 2 : value == Kind::BranchCheckpoint ? 1 : 0;
+    };
+    if (rank(kind) > rank(found->kind))
+      found->kind = kind;
     return false;
   }
-  active.stateBoundaries.insert(found, {tokens, disposable});
+  active.stateBoundaries.insert(found, {tokens, kind});
   return true;
 }
 
@@ -1176,7 +1224,8 @@ bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after) {
         peer.finalized || peer.skipCache ||
         peer.request.priority < active.request.priority)
       continue;
-    changed = addStateBoundary(active, after, sharedPrefillBoundary(active, peer), false) ||
+    changed = addStateBoundary(active, after, sharedPrefillBoundary(active, peer),
+                         Request::StateBoundaryKind::Reusable) ||
               changed;
   }
   return changed;
@@ -1247,7 +1296,9 @@ void Engine::publishReachedStateBoundaries(Request &active,
              promptProcessed) {
     const Request::StateBoundary objective =
         active.stateBoundaries[active.stateBoundaryCursor++];
-    const bool checkpoint = objective.disposable;
+    const bool checkpoint = objective.kind != Request::StateBoundaryKind::Reusable;
+    const bool rolling = objective.kind == Request::StateBoundaryKind::RollingCheckpoint;
+    const bool branch = objective.kind == Request::StateBoundaryKind::BranchCheckpoint;
     // The conversation's next turn resumes from the prompt's replay point. A
     // rebuilt replay point counts as a replay-state publication, not a
     // junction.
@@ -1301,7 +1352,8 @@ void Engine::publishReachedStateBoundaries(Request &active,
         uint64_t released = 0;
         StateRoom room;
         do {
-          room = cache_.reclaimOneState(checkpoint, block, growth);
+          room = branch ? cache_.reclaimOneBranchState()
+                        : cache_.reclaimOneState(checkpoint, block, growth);
           released += room.extentBytes;
           if (room)
             state = model_.snapshot(active.request.id);
@@ -1310,18 +1362,28 @@ void Engine::publishReachedStateBoundaries(Request &active,
           ++counters_.recycledStatePublications;
       }
       if (state) {
-        cache_.publishCompositeState(block, std::move(state), checkpoint);
+        if (branch)
+          cache_.publishBranchCompositeState(block, std::move(state));
+        else
+          cache_.publishCompositeState(block, std::move(state), checkpoint);
         ++publications;
       } else if (cache_.reuseStoredState(block, checkpoint)) {
         // No cache slot takes a RAM copy of a state already on disk.
         ++counters_.deduplicatedStatePublications;
       } else if (model_.canSnapshotToDisk() &&
-                 cache_.publishStateToDisk(
-                     block,
-                     [&](std::function<void()> completion) {
-                       return model_.snapshotToDisk(active.request.id, std::move(completion));
-                     },
-                     checkpoint)) {
+                 (branch ? cache_.publishBranchStateToDisk(
+                               block,
+                               [&](std::function<void()> completion) {
+                                 return model_.snapshotToDisk(active.request.id,
+                                                              std::move(completion));
+                               })
+                         : cache_.publishStateToDisk(
+                               block,
+                               [&](std::function<void()> completion) {
+                                 return model_.snapshotToDisk(active.request.id,
+                                                              std::move(completion));
+                               },
+                               checkpoint))) {
         // No cache slot holds the state; the tier takes it from the lane.
         ++counters_.diskStatePublications;
         ++publications;
@@ -1332,8 +1394,11 @@ void Engine::publishReachedStateBoundaries(Request &active,
     }
     // The previous recovery point, if the lane still holds one, retires now.
     static_cast<void>(retireCheckpoint(active));
-    active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
-                                         : StateCheckpoint{};
+    // Branch checkpoints keep the cache's evict-first class without joining
+    // the lane's rolling replacement chain: later siblings may still use one
+    // after this lane advances or finishes.
+    active.latestCheckpoint = rolling ? cache_.checkpointState(block)
+                                      : StateCheckpoint{};
     if (!checkpoint)
       writeBehind_.published(block, objective.tokens, now);
   }

@@ -246,11 +246,19 @@ private:
   };
 
   struct Request final {
+    enum class StateBoundaryKind : uint8_t {
+      // The lane's own progress, retired when the next rolling one lands.
+      RollingCheckpoint,
+      // A conversation branch point: kept for later siblings, but still in
+      // the cache's evict-first checkpoint class.
+      BranchCheckpoint,
+      // A state a later request resumes from.
+      Reusable,
+    };
+
     struct StateBoundary final {
       uint32_t tokens = 0;
-      // A rolling checkpoint, the lane's own progress, retired when the next
-      // one lands; otherwise a state a later request resumes from.
-      bool disposable = false;
+      StateBoundaryKind kind = StateBoundaryKind::Reusable;
     };
 
     EngineRequest request;
@@ -381,10 +389,11 @@ private:
   configureDraftStatePlan(Request &request, uint32_t stateBoundary,
                           uint32_t junctionBoundary);
   // Plans a state at `tokens`, past `after` and no later than the replay
-  // boundary, keeping the plan in order; a boundary planned both ways is
-  // reusable. True when it inserted one.
+  // boundary, keeping the plan in order; a boundary planned both ways takes
+  // the stronger kind (reusable, then branch, then rolling). True when it
+  // inserted one.
   bool addStateBoundary(Request &request, uint32_t after, uint32_t tokens,
-                        bool disposable);
+                        Request::StateBoundaryKind kind);
   // Plans a junction at the boundary each queued peer of the same or lower
   // priority shares with this lane, past `after`, unless the peer ignores the
   // cache; true when one was added.

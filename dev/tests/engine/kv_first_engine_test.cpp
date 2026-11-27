@@ -1332,6 +1332,87 @@ void testSharedPrefixStateServesTheFirstReuse() {
   require(rejected, "a shared prefix beyond the prompt was admitted");
 }
 
+void testBranchCheckpointSurvivesRollingProgress() {
+  test::TestKvStorage storage(2048, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  engine::Engine engine({}, cache, model, events);
+  guardReleases(storage, engine);
+
+  std::vector<uint32_t> prompt(6200);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  EngineRequest first = request(1, prompt);
+  first.branchBoundaryTokens = 2100;
+  engine.submit(std::move(first));
+  runUntilIdle(engine);
+
+  // The edit resumes at the page-aligned branch point. Its long suffix then
+  // reaches a rolling checkpoint, which must not retire that branch point:
+  // further siblings still need it after this lane advances beyond it.
+  for (uint32_t id = 2; id <= 3; ++id) {
+    std::vector<uint32_t> edit(2048, 0);
+    std::iota(edit.begin(), edit.end(), 1);
+    edit.resize(6200, id == 2 ? 500 : 600);
+    EngineRequest turn = request(id, edit);
+    turn.branchBoundaryTokens = 2100;
+    engine.submit(std::move(turn));
+    runUntilIdle(engine);
+  }
+  require(events.starts.size() == 3 && events.starts[1] == 2048 &&
+              events.starts[2] == 2048,
+          "rolling progress retired the branch checkpoint its siblings need");
+
+  EngineRequest beyond = request(4, std::vector<uint32_t>(33, 5));
+  beyond.branchBoundaryTokens = 34;
+  bool rejected = false;
+  try {
+    engine.submit(std::move(beyond));
+  } catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  require(rejected, "a branch boundary beyond the prompt was admitted");
+}
+
+void testBranchCheckpointNearRestoreStillPlanned() {
+  test::TestKvStorage storage(2048, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  engine::Engine engine({}, cache, model, events);
+  guardReleases(storage, engine);
+
+  // A page-sized first turn leaves the next request's restore immediately
+  // before the final turn header. The branch point is only one page beyond
+  // that restore, far below the ordinary junction gain, but the final user
+  // content after it is long: exactly the shape an edited agent tool result
+  // has. It is still worth its snapshot.
+  std::vector<uint32_t> firstPrompt(2048);
+  std::iota(firstPrompt.begin(), firstPrompt.end(), 1);
+  engine.submit(request(1, firstPrompt));
+  runUntilIdle(engine);
+
+  std::vector<uint32_t> prompt(4192, 7);
+  std::copy(firstPrompt.begin(), firstPrompt.end(), prompt.begin());
+  EngineRequest second = request(2, prompt);
+  second.branchBoundaryTokens = 2112;
+  engine.submit(std::move(second));
+  runUntilIdle(engine);
+
+  std::vector<uint32_t> edit = prompt;
+  std::fill(edit.begin() + 2080, edit.end(), 8);
+  EngineRequest turn = request(3, edit);
+  turn.branchBoundaryTokens = 2112;
+  engine.submit(std::move(turn));
+  runUntilIdle(engine);
+
+  require(events.starts.size() == 3 && events.starts[1] == 2048 &&
+              events.starts[2] == 2080,
+          "a branch point near the restore was not planned");
+}
+
 // Score-only requests are the decision pathway's batch shape: every
 // question shares the whole state prefix and each is its own replay, so a
 // shared junction pays at any size — the draft-scale gain only bounds
@@ -9248,6 +9329,8 @@ int main() {
     testRetryPublishesNoStateInsideTheGenerationPrompt();
     testSharedJunctionEndsBeforeTheGenerationPrompt();
     testSharedPrefixStateServesTheFirstReuse();
+    testBranchCheckpointSurvivesRollingProgress();
+    testBranchCheckpointNearRestoreStillPlanned();
     testScoreSharedPrefixJunctionBelowGain();
     benchScoreBatchPacking();
     testImageSpansKeyPrefixIdentity();

@@ -44,6 +44,10 @@ struct EngineRequest final {
   // follows them (a chat template's system prompt and tools), so a reusable
   // state is kept at the last whole page within them. Zero when unknown.
   uint32_t sharedPrefixTokens = 0;
+  // Leading prompt tokens before the final user/branch point that sibling
+  // continuations are expected to share, so an evict-first checkpoint state
+  // is kept at the last whole page within them. Zero when unknown.
+  uint32_t branchBoundaryTokens = 0;
   std::vector<ImageSpan> images;
   std::vector<uint8_t> imagePixels;
   // Sorted, non-overlapping audio spans and their float32 [128 x melFrames]

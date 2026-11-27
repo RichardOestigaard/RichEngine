@@ -101,6 +101,34 @@ fails and the next prepare downloads the recorded target files again, rebuilds
 the assembly and repacks the cache. Small metadata, tokenizer, draft and
 vision files remain in the models root either way.
 
+A validated thin install can additionally abandon its local payload repair
+sources:
+
+```bash
+richengine models abandon-thin-sources OWNER/REPO[:VARIANT]
+richengine models abandon-thin-sources --selection .selections/<hash>
+```
+
+The operation requires a complete packed cache validated by the current
+engine. It drops any remaining payload links, rewrites the payload entries in
+`model.json` to metadata-only records (byte count and content digest, no
+resolvable path), and retires the target snapshot pin. Because the record is
+the assembly digest input, the rewritten assembly is published under a new
+digest; selection links are moved to it atomically, and the packed cache's
+owner and validation markers are propagated. The packed-cache key itself is
+the packed-source stamp plus the engine image plan, not the assembly digest,
+so serving continues from the same cache entry.
+
+After abandonment the payload's serving copy is the packed cache alone. Quick
+verification passes while that cache is validated and fails when it is lost,
+incomplete, or stale after an engine rebuild. Recovery is still reinstall:
+the recorded upstream repository and revision are resolved again and the
+payload is downloaded from the Hugging Face Hub as needed. Abandoned payload
+entries do not pin Hub blobs, so `richengine disk gc --yes` can collect the
+unreferenced HF payload. Hub pins are also ignored when their owning selection
+no longer resolves to an installation; they are repair metadata, not a cache
+retention mechanism for dangling installs.
+
 Locally packed package installs normally release their upstream source
 snapshots because their `.packed` payload is self-contained. Set
 `RICHENGINE_PACK_KEEP_SOURCES=1` before installing to retain those snapshots

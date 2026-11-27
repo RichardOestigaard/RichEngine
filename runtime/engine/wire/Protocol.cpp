@@ -406,6 +406,10 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
     return invalid(IssueCode::InvalidCount,
                    "shared prefix must lie within the prompt");
   }
+  if (request.branchBoundaryTokens > request.promptTokens.size()) {
+    return invalid(IssueCode::InvalidCount,
+                   "branch boundary must lie within the prompt");
+  }
   if (scoring) {
     if (!request.imageSpans.empty() || !request.audioSpans.empty()) {
       return invalid(IssueCode::InvalidCount,
@@ -775,7 +779,8 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
       !reader.f32(request.sampling.minP) ||
       !reader.u64(request.sampling.seed) || !reader.u8(returnProgress) ||
       !reader.u32(scoreCount) || !reader.u32(request.generationPromptTokens) ||
-      !reader.u32(request.flags) || !reader.u32(request.sharedPrefixTokens)) {
+      !reader.u32(request.flags) || !reader.u32(request.sharedPrefixTokens) ||
+      !reader.u32(request.branchBoundaryTokens)) {
     return failure<ClientMessage>(
         makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
                   0, "request fixed payload is truncated"));

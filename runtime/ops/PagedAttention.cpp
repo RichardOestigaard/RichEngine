@@ -5,6 +5,7 @@
 #include "ops/BufferExtent.hpp"
 #include "ops/DevicePolicy.hpp"
 #include "ops/KernelNames.hpp"
+#include "ops/LaneBindings.hpp"
 #include "ops/Linear.hpp"
 
 #include <algorithm>
@@ -1070,14 +1071,16 @@ void PagedAttention::addVerify(
               attention[lane].row_capacity, attention[lane].kv.extent_pages,
               attention[lane].kv.offset);
   }
-  std::array<metal::MetalBuffer, 4> tables = {buffers.pageTables[0], buffers.pageTables[1],
-                                              buffers.pageTables[2], buffers.pageTables[3]};
   // The parameters carry each lane's committed length and split count; the
   // dispatches write them once per verify encoding, so their payloads are
   // patchable for a baked span's replays.
   graph.addPatchable(plan.storePipeline_,
-            {buffers.chunkKeys, buffers.chunkValues, tables[0], tables[1], tables[2],
-             tables[3]},
+            [&] {
+              std::vector<metal::MetalBuffer> bindings{buffers.chunkKeys,
+                                                       buffers.chunkValues};
+              appendLaneBindings(bindings, buffers.pageTables);
+              return bindings;
+            }(),
             stores, plan.storeGroups_, plan.storeThreads_);
   // A tree plan's split kernels bind each lane's ancestor bitmasks after the
   // page tables; the chain kernels have no such binding. The stem names it —
@@ -1085,18 +1088,18 @@ void PagedAttention::addVerify(
   const bool tree = plan.splitPipeline.starts_with(kVerifyTreeAttention);
   if (tree && !buffers.treeMasks)
     throw std::invalid_argument("tree verify requires its ancestor masks");
-  const auto splitBuffers =
-      tree ? std::vector<metal::MetalBuffer>{buffers.queries,
-               buffers.partials, buffers.statistics, tables[0],
-               tables[1], tables[2], tables[3], buffers.treeMasks}
-           : plan.sparse
-               ? std::vector<metal::MetalBuffer>{buffers.queries,
-                   buffers.partials, buffers.statistics, tables[0],
-                   tables[1], tables[2], tables[3], blocks.lists,
-                   blocks.counts}
-               : std::vector<metal::MetalBuffer>{buffers.queries,
-                   buffers.partials, buffers.statistics, tables[0],
-                   tables[1], tables[2], tables[3]};
+  auto splitBuffers = [&] {
+    std::vector<metal::MetalBuffer> bindings{
+        buffers.queries, buffers.partials, buffers.statistics};
+    appendLaneBindings(bindings, buffers.pageTables);
+    if (tree) {
+      bindings.push_back(buffers.treeMasks);
+    } else if (plan.sparse) {
+      bindings.push_back(blocks.lists);
+      bindings.push_back(blocks.counts);
+    }
+    return bindings;
+  }();
   // The _duo splits take the layer's DuoAttention policy as a patchable
   // constant after the lane parameters; the _swa splits take the window the
   // same way.
@@ -1232,8 +1235,13 @@ void PagedAttention::addVerifyTreeCompact(
                        formatTag(layout.format) + "_compact" +
                        std::string(storageSuffix(layout));
   graph.add(kernel,
-            {pageTables[0], pageTables[1], pageTables[2], pageTables[3],
-             retainedPath, retained},
+            [&] {
+              std::vector<metal::MetalBuffer> bindings;
+              appendLaneBindings(bindings, pageTables);
+              bindings.push_back(retainedPath);
+              bindings.push_back(retained);
+              return bindings;
+            }(),
             params,
             {uint64_t{lanes} * layout.kvHeads, 1, 1},
             metal::DispatchSize{layout.headDimension, 1, 1});

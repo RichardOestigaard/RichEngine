@@ -79,7 +79,12 @@ struct GDNDecodeBatchParams {
   uint64_t step_tape[RICHENGINE_MAXIMUM_BATCH_WIDTH];
 };
 
-static_assert(sizeof(GDNDecodeBatchParams) == 136,
+static_assert(sizeof(GDNDecodeBatchParams) ==
+                  RICHENGINE_ABI_ALIGN8(
+                      RICHENGINE_ABI_ALIGN8(36 +
+                                            4 * RICHENGINE_MAXIMUM_BATCH_WIDTH) +
+                      12 * RICHENGINE_MAXIMUM_BATCH_WIDTH) +
+                      8 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "GDN decode parameters are 136 bytes on both sides");
 
 struct GDNBatchCommitParams {

@@ -18,6 +18,18 @@
 
 namespace richengine {
 
+// The staged 64-row GGUF decode tile is production policy at the four-lane
+// geometry, where the 16-row verify stride already reaches it. Width-8 lane
+// experiments keep it opt-in: their verify stride is eight rows, so widths
+// 5-8 are the first batch shapes that pad into the tile. A build may override
+// the default with RICHENGINE_GGUF_DECODE64_DEFAULT; the runtime knob is
+// RICHENGINE_GGUF_DECODE64=1/0.
+#ifdef RICHENGINE_GGUF_DECODE64_DEFAULT
+inline constexpr bool kGgufDecode64Default = RICHENGINE_GGUF_DECODE64_DEFAULT != 0;
+#else
+inline constexpr bool kGgufDecode64Default = RICHENGINE_MAXIMUM_BATCH_WIDTH <= 4;
+#endif
+
 // RICHENGINE_MOE_INDIRECT_DISPATCH policy: Auto (the default) lets the
 // execution plans arm live-tile dispatch on measured device/model/checkpoint
 // combinations only, Off disables it everywhere, and any other present value
@@ -102,6 +114,10 @@ struct Tuning {
   // ops/Linear.cpp, ops/LinearGguf.cpp
   bool ggufPackedOn = false;  // RICHENGINE_GGUF_PACKED_ON (presence)
   bool ggufPackedOff = false; // RICHENGINE_GGUF_PACKED_OFF (presence)
+  // ops/LinearGguf.cpp: Apple10 decode steps of 33-64 rows use the staged
+  // tile's 64-row height instead of the register tile. Production width four
+  // defaults on; width-eight experiment binaries default off.
+  bool ggufDecode64 = kGgufDecode64Default; // RICHENGINE_GGUF_DECODE64=1/0
   // ops/LinearGguf.cpp BF16 float-projection A/B geometry. These variants
   // serve bf16-weight draft projections; f32 target projections keep the
   // production kernels.
@@ -423,6 +439,7 @@ inline Tuning makeTuning() {
   t.gdnChunked = envUint("RICHENGINE_GDN_CHUNKED", 0);
   t.ggufPackedOn = envFlag("RICHENGINE_GGUF_PACKED_ON");
   t.ggufPackedOff = envFlag("RICHENGINE_GGUF_PACKED_OFF");
+  t.ggufDecode64 = envUint("RICHENGINE_GGUF_DECODE64", kGgufDecode64Default ? 1 : 0) != 0;
   t.ggufFloatNaStep = envUint("RICHENGINE_GGUF_FLOAT_NA_STEP", 32);
   t.ggufFloatSplits = envUint("RICHENGINE_GGUF_FLOAT_SPLITS", 16);
   t.prefillFastInt8 = envFlag("RICHENGINE_PREFILL_FAST_INT8");

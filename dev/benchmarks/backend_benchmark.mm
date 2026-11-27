@@ -50,6 +50,22 @@ double milliseconds(Clock::time_point value) {
       .count();
 }
 
+// Benchmark-only width control. The engine's RICHENGINE_MAX_BATCH_WIDTH
+// narrows admission; this knob narrows which compiled widths the benchmark
+// exercises, so a width-8 binary can A/B runtime caps without running wider
+// warmups or requests than the cap.
+uint32_t benchmarkDecodeWidthLimit() {
+  const uint32_t physical = model::ExecutionLimits::maximumBatchWidth;
+  const char *text = std::getenv("RICHENGINE_BENCHMARK_MAX_WIDTH");
+  if (!text || !*text)
+    return physical;
+  char *end = nullptr;
+  const unsigned long parsed = std::strtoul(text, &end, 10);
+  if (end == text || *end != '\0' || parsed == 0)
+    return physical;
+  return static_cast<uint32_t>(std::min<unsigned long>(parsed, physical));
+}
+
 struct Observation final {
   std::string cacheStatus;
   uint32_t matchedTokens = 0;
@@ -159,6 +175,9 @@ struct DecodeThroughputMeasurement final {
   uint32_t outputTokens = 0;
   uint64_t decodeOutputTokens = 0;
   uint64_t decodeBatches = 0;
+  uint64_t fullWidthDecodeBatches = 0;
+  uint64_t narrowDecodeBatches = 0;
+  uint64_t fullWidthOutputTokens = 0;
   uint64_t draftedTokens = 0;
   uint64_t acceptedDraftTokens = 0;
   double requestWallMilliseconds = 0.0;
@@ -538,7 +557,10 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
   std::vector<uint64_t> requestIds;
   requestIds.reserve(width);
   uint64_t decodeBatches = 0;
+  uint64_t fullWidthDecodeBatches = 0;
+  uint64_t narrowDecodeBatches = 0;
   uint64_t decodeOutputTokens = 0;
+  uint64_t fullWidthOutputTokens = 0;
   uint64_t draftedTokens = 0;
   uint64_t acceptedDraftTokens = 0;
   bool narrowBatch = false;
@@ -560,6 +582,10 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
   driver.untilIdle([&](const BatchObservation &batch) {
     if (batch.kind != WorkKind::Decode)
       return;
+    ++decodeBatches;
+    decodeOutputTokens += batch.outputTokens;
+    draftedTokens += batch.draftedTokens;
+    acceptedDraftTokens += batch.acceptedDraftTokens;
     if (batch.width > width) {
       fprintf(stderr, "batch.width=%u exceeds request width %u\n",
               batch.width, width);
@@ -567,6 +593,7 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
       return;
     }
     if (batch.width != width) {
+      ++narrowDecodeBatches;
       // A model whose decode path cannot co-batch splits the request —
       // tolerated, but recorded so the throughput report is honest.
       if (!narrowWarned) {
@@ -576,10 +603,8 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
       narrowBatch = true;
       return;
     }
-    ++decodeBatches;
-    decodeOutputTokens += batch.outputTokens;
-    draftedTokens += batch.draftedTokens;
-    acceptedDraftTokens += batch.acceptedDraftTokens;
+    ++fullWidthDecodeBatches;
+    fullWidthOutputTokens += batch.outputTokens;
   });
   const auto ended = Clock::now();
   const model::ModelTelemetry telemetryAfter = executor.telemetry();
@@ -652,6 +677,8 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
   result.outputTokens = completedTokens;
   result.decodeOutputTokens = decodeOutputTokens;
   result.decodeBatches = decodeBatches;
+  result.fullWidthDecodeBatches = fullWidthDecodeBatches;
+  result.narrowDecodeBatches = narrowDecodeBatches;
   result.draftedTokens = draftedTokens;
   result.acceptedDraftTokens = acceptedDraftTokens;
   result.requestWallMilliseconds = milliseconds(ended) - milliseconds(began);
@@ -700,8 +727,10 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
     throw std::runtime_error("decode throughput DFlash accounting is invalid");
   }
   result.outputTokensPerLaneBatch =
-      static_cast<double>(decodeOutputTokens) /
-      static_cast<double>(width * result.decodeBatches);
+      fullWidthDecodeBatches
+          ? static_cast<double>(fullWidthOutputTokens) /
+                static_cast<double>(width * fullWidthDecodeBatches)
+          : 0.0;
   result.draftAcceptanceRate =
       result.draftedTokens
           ? static_cast<double>(result.acceptedDraftTokens) /
@@ -1024,7 +1053,8 @@ int main(int argc, char **argv) {
     std::array<double, model::ExecutionLimits::maximumBatchWidth>
         decodeWarmupGpu{};
     std::vector<std::string> performanceFailures;
-    for (uint32_t width = 1; width <= decodeWarmupWall.size(); ++width) {
+    const uint32_t benchmarkWidthLimit = benchmarkDecodeWidthLimit();
+    for (uint32_t width = 1; width <= benchmarkWidthLimit; ++width) {
       decodeWarmupWall[width - 1] =
           executor->warmupDecodeBatch(width).wallSeconds * 1000.0;
       decodeWarmupGpu[width - 1] =
@@ -1101,10 +1131,8 @@ int main(int argc, char **argv) {
       std::map<uint32_t, std::map<std::string, std::pair<double, uint64_t>>>
           profileByWidth;
       for (uint32_t sample = 0; sample < samples; ++sample) {
-        for (uint32_t offset = 0;
-             offset < model::ExecutionLimits::maximumBatchWidth; ++offset) {
-          const uint32_t width =
-              1 + (sample + offset) % model::ExecutionLimits::maximumBatchWidth;
+        for (uint32_t offset = 0; offset < benchmarkWidthLimit; ++offset) {
+          const uint32_t width = 1 + (sample + offset) % benchmarkWidthLimit;
           evictAllCache(resources->cache());
           if (dispatchProfile)
             static_cast<void>(
@@ -1607,13 +1635,13 @@ int main(int argc, char **argv) {
               << ",\"prefill_2048_gpu_ms\":"
               << prefillWarmupGpuMilliseconds
               << ",\"decode_wall_ms\":[";
-    for (size_t index = 0; index < decodeWarmupWall.size(); ++index) {
+    for (size_t index = 0; index < benchmarkWidthLimit; ++index) {
       if (index)
         std::cout << ',';
       std::cout << decodeWarmupWall[index];
     }
     std::cout << "],\"decode_gpu_ms\":[";
-    for (size_t index = 0; index < decodeWarmupGpu.size(); ++index) {
+    for (size_t index = 0; index < benchmarkWidthLimit; ++index) {
       if (index)
         std::cout << ',';
       std::cout << decodeWarmupGpu[index];
@@ -1631,6 +1659,14 @@ int main(int argc, char **argv) {
                 << ",\"output_tokens\":" << value.outputTokens
                 << ",\"decode_output_tokens\":" << value.decodeOutputTokens
                 << ",\"decode_batches\":" << value.decodeBatches
+                << ",\"full_width_decode_batches\":"
+                << value.fullWidthDecodeBatches
+                << ",\"narrow_decode_batches\":"
+                << value.narrowDecodeBatches
+                << ",\"per_lane_request_latency_ms\":"
+                << (value.requestWallMilliseconds / 64.0)
+                << ",\"per_lane_decode_latency_ms\":"
+                << (value.decodeWallMilliseconds / 64.0)
                 << ",\"drafted_tokens\":" << value.draftedTokens
                 << ",\"accepted_draft_tokens\":"
                 << value.acceptedDraftTokens

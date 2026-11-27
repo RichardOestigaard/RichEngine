@@ -93,6 +93,7 @@ def trace_tokens(job, streamer, result, error):
         "output": output,
         "temperature": getattr(job.sampling, "temperature", None),
         "shared_prefix_tokens": job.shared_prefix_tokens,
+        "branch_boundary_tokens": job.branch_boundary_tokens,
         "generation_prompt_tokens": job.generation_prompt_tokens,
         "previous_id": job.response_previous_id,
         "tools_signature": job.tools_signature,
@@ -212,6 +213,9 @@ class Job:
     # Leading prompt tokens that later requests are expected to share (the
     # system prompt and tools); zero when unknown.
     shared_prefix_tokens: int = 0
+    # Leading prompt tokens before the final user/branch point sibling
+    # continuations share; zero when unknown.
+    branch_boundary_tokens: int = 0
     # A shared prompt prefix held outside prompt_tokens so score batches
     # reference it instead of copying it per job; the prompt on the wire is
     # prefix_tokens + prompt_tokens.
@@ -802,6 +806,7 @@ class NativeBackend:
             generation_prompt_tokens=job.generation_prompt_tokens,
             flags=job.flags,
             shared_prefix_tokens=job.shared_prefix_tokens,
+            branch_boundary_tokens=job.branch_boundary_tokens,
         )
         return engine_runtime.GenerationRequest(
             frame, job.deadline, self._mask_provider(job), job.image_owner

@@ -188,6 +188,10 @@ public:
   // false only when the matching checkpoint is pinned; absent, replaced and
   // upgraded publications already satisfy the postcondition.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
+  // Marks a just-published checkpoint as a conversation branch point. It
+  // remains a checkpoint for accounting, disk behavior and restoration, but
+  // reclaims take it before rolling recovery checkpoints.
+  void markBranch(uint64_t kvBlock);
   // An unfinished request's conversation resumes from the state at this
   // block, published or yet to be. Until the handle is released that state
   // is in use, and so is the KV it restores through: the candidates below
@@ -222,15 +226,20 @@ public:
   // only withInUse.
   [[nodiscard]] uint32_t evictableStates(bool withInUse) const noexcept {
     return static_cast<uint32_t>(ordinary_.size() + checkpoints_.size() +
+                                 branches_.size() +
                                  (withInUse ? inUse_.size() : 0));
   }
   // The resume point a reclaim may keep (keepResumePoint): the newest
   // unpinned ordinary state in RAM, else the newest such checkpoint; 0
   // without either.
   [[nodiscard]] uint64_t resumePoint() const noexcept;
-  // Oldest unpinned checkpoint in RAM, the first class a reclaim frees.
-  // keepResumePoint withholds the resume point when it is a checkpoint: the
-  // newest one, while no ordinary state is in RAM.
+  // Oldest unpinned branch checkpoint in RAM, the first state a reclaim
+  // frees. Branches never wait behind rolling recovery checkpoints.
+  [[nodiscard]] std::optional<CacheEvictionCandidate>
+  branchCandidate() const noexcept;
+  // Oldest unpinned checkpoint in RAM, branch checkpoints first. keepResumePoint
+  // withholds the resume point when it is a rolling checkpoint: the newest
+  // one, while no ordinary state is in RAM.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   checkpointCandidate(bool keepResumePoint) const noexcept;
   // Oldest unpinned ordinary state in RAM. keepResumePoint withholds the
@@ -286,6 +295,9 @@ private:
     uint32_t pins = 0;
     uint64_t lastUsed = 0;
     bool checkpoint = false;
+    // A checkpoint at a conversation branch point, evicted before rolling
+    // recovery checkpoints.
+    bool branch = false;
     bool invalid = false;
     uint64_t publication = 0;
     RecencyOrder::Node ramNode;
@@ -353,6 +365,7 @@ private:
   std::unordered_map<uint64_t, Entry> entries_;
   RecencyOrder ordinary_;
   RecencyOrder checkpoints_;
+  RecencyOrder branches_;
   RecencyOrder inUse_;
   RecencyOrder duplicates_;
   RecencyOrder diskOnly_;

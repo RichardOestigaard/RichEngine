@@ -12,6 +12,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from huggingface_hub.errors import IncompleteSnapshotError
@@ -912,6 +913,130 @@ class UpstreamTest(unittest.TestCase):
             assembly.verify(chosen.link)
         self.assertTrue(payload.is_file())
         self.assertEqual(chosen.link.resolve().name, digest)
+
+    def test_abandon_thin_sources_strips_records_and_recovers_by_download(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root, thin=True)
+        self.prepare(chosen)
+        old = chosen.link.resolve()
+        payload = chosen.link / "target/model.safetensors"
+        blob = payload.readlink()
+        target_ref = hub.pinned(fake.snapshot(MODEL, "a" * 40), chosen.link)
+        self.assertTrue(target_ref.is_file())
+        # The live thin state this operation serves: the post-validation drop
+        # has already removed the payload symlink; only its record and blob
+        # remain as repair metadata.
+        payload.unlink()
+
+        cache_root = self.root / "packed-cache"
+        entry = cache_root / "cache-key"
+        (entry / ".validated").mkdir(parents=True)
+        (entry / "layer-0.bin").write_bytes(b"weights")
+        (entry / ".packed").write_text("layer-0.bin 0 0 0 7\n")
+        (entry / ".validated" / old.name).write_text("assembly\nfingerprint\n")
+        patches = (
+            mock.patch.dict(
+                os.environ, {"RICHENGINE_PACKED_CACHE_ROOT": str(cache_root)}
+            ),
+            mock.patch.object(
+                assembly, "_engine_fingerprint_text", return_value="fingerprint"
+            ),
+        )
+        with patches[0], patches[1]:
+            with models.installation_lock(chosen.models_root):
+                result = assembly.abandon_thin_sources(chosen.link, chosen.models_root)
+            new = result["assembly"]
+            self.assertFalse(result["already"])
+            self.assertNotEqual(new.name, old.name)
+            self.assertEqual(chosen.link.resolve(), new)
+            self.assertFalse(old.exists())
+            self.assertFalse((new / "target/model.safetensors").exists())
+            self.assertFalse(blob.exists())
+            self.assertFalse(target_ref.exists())
+            self.assertTrue((entry / ".validated" / new.name).is_file())
+            self.assertTrue((entry / ".owners" / new.name).is_file())
+            record = assembly.verify(chosen.link)
+            abandoned = record["files"]["target/model.safetensors"]
+            self.assertEqual(
+                set(abandoned), {"bytes", "digest", "source_abandoned"}
+            )
+            self.assertIs(abandoned["source_abandoned"], True)
+            pinned_repos = {repo for _path, repo in assembly.pins(record, new)}
+            self.assertNotIn(MODEL, pinned_repos)
+            self.assertIn(DENSE.draft.repo, pinned_repos)
+
+            # Without the validated cache the abandoned install is not
+            # self-sufficient: verification fails so prepare rebuilds it.
+            shutil.rmtree(cache_root)
+            with self.assertRaisesRegex(models.ModelError, "thin packed cache"):
+                assembly.verify(chosen.link)
+
+        # Once gc has removed the target snapshot too, recovery has no local
+        # payload entries to resolve: the recorded upstream revision is listed
+        # and its payload is downloaded again.
+        shutil.rmtree(self.cache / hub.folder_name(MODEL))
+        fake.downloads.clear()
+        self.prepare(chosen)
+        self.assertIn(f"{MODEL}/model.safetensors", fake.downloads)
+        self.assertTrue((chosen.link / "target/model.safetensors").is_file())
+        record = assembly.verify(chosen.link)
+        self.assertIn("path", record["files"]["target/model.safetensors"])
+
+    def test_gc_preserves_only_pins_a_live_installation_needs(self):
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        needed_commit = "a" * 40
+        stale_commit = "c" * 40
+        folder = self.cache / hub.folder_name(MODEL)
+        # Even a pin written by a retired selection protects the snapshot a
+        # live installation still records as its repair source. Conversely, a
+        # live owner's pin of a revision no installation needs protects nothing.
+        needed_ref = folder / "refs/richengine" / ("e" * 64) / needed_commit
+        stale_ref = (
+            folder
+            / "refs/richengine"
+            / hub.pin_owner(chosen.link)
+            / stale_commit
+        )
+        for ref in (needed_ref, stale_ref):
+            ref.parent.mkdir(parents=True, exist_ok=True)
+            ref.write_text(ref.name)
+        needed_file = folder / "snapshots" / needed_commit / "config.json"
+        stale_file = folder / "snapshots" / stale_commit / "config.json"
+        revision_files = {
+            needed_commit: [SimpleNamespace(file_path=needed_file)],
+            stale_commit: [SimpleNamespace(file_path=stale_file)],
+        }
+        info = SimpleNamespace(
+            repos=[
+                SimpleNamespace(
+                    repo_id=MODEL,
+                    repo_path=folder,
+                    size_on_disk=0,
+                    revisions=[
+                        SimpleNamespace(
+                            commit_hash=commit,
+                            files=files,
+                            size_on_disk=0,
+                        )
+                        for commit, files in revision_files.items()
+                    ],
+                )
+            ],
+            incomplete_files=[],
+        )
+        strategy = SimpleNamespace(expected_freed_size=123, execute=mock.Mock())
+        delete_revisions = mock.Mock(return_value=strategy)
+        info.delete_revisions = delete_revisions
+        with mock.patch("huggingface_hub.scan_cache_dir", return_value=info):
+            result = hub_gc.plan(chosen.models_root, self.cache)
+        self.assertIn(stale_commit, result["dead_revisions"])
+        self.assertNotIn(needed_commit, result["dead_revisions"])
+        freed = hub_gc.execute_detailed(result)
+        delete_revisions.assert_called_once_with(stale_commit)
+        strategy.execute.assert_called_once_with()
+        self.assertEqual(freed["revisions"], 123)
 
     def test_thin_drop_keeps_blobs_shared_with_vision_entries(self):
         # Qwen3.8-27B's layout: one repository shard holds both language and

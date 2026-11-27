@@ -1,5 +1,6 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/draft_context_kv.h"
+#include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/rms_inverse.h"
 
 // The process's draft split count: RICHENGINE_DRAFT_SPLITS overrides the
@@ -123,9 +124,8 @@ template <uint KVHeads, uint HeadDim, bool Interleaved, bool E5>
 inline void draft_context_kv_commit_impl(
     device const bfloat *context_kv, device const bfloat *k_norm,
     device const float *rope_cos, device const float *rope_sin,
-    device bfloat *keys0, device bfloat *keys1, device bfloat *keys2,
-    device bfloat *keys3, device bfloat *values0, device bfloat *values1,
-    device bfloat *values2, device bfloat *values3, device const uint *retained,
+    RICHENGINE_LANE_PARAMS(device bfloat *, keys),
+    RICHENGINE_LANE_PARAMS(device bfloat *, values), device const uint *retained,
     constant DraftContextBatchParams &params,
     threadgroup float *reductions, threadgroup bfloat *normalized, uint group,
     uint thread_index, uint lane, uint simd_group) {
@@ -138,11 +138,9 @@ inline void draft_context_kv_commit_impl(
   uint batch = group / (Rows * KVHeads);
   uint task = group % (Rows * KVHeads);
   device bfloat *keys =
-      batch == 0 ? keys0 : (batch == 1 ? keys1 : (batch == 2 ? keys2 : keys3));
-  device bfloat *values = batch == 0
-                              ? values0
-                              : (batch == 1 ? values1
-                                            : (batch == 2 ? values2 : values3));
+      RICHENGINE_LANE_SELECT(batch, keys);
+  device bfloat *values =
+      RICHENGINE_LANE_SELECT(batch, values);
   draft_context_kv_phase<KVHeads, HeadDim, Interleaved, E5>(
       context_kv + ulong(batch) * Rows * RowWidth, k_norm,
       rope_cos + ulong(batch) * RopeLaneStride,
@@ -158,14 +156,13 @@ inline void draft_context_kv_commit_impl(
       device const bfloat *k_norm [[buffer(1)]],                            \
       device const float *rope_cos [[buffer(2)]],                           \
       device const float *rope_sin [[buffer(3)]],                           \
-      device bfloat *keys0 [[buffer(4)]], device bfloat *keys1 [[buffer(5)]],\
-      device bfloat *keys2 [[buffer(6)]], device bfloat *keys3 [[buffer(7)]],\
-      device bfloat *values0 [[buffer(8)]],                                 \
-      device bfloat *values1 [[buffer(9)]],                                 \
-      device bfloat *values2 [[buffer(10)]],                                \
-      device bfloat *values3 [[buffer(11)]],                                \
-      device const uint *retained [[buffer(12)]],                           \
-      constant DraftContextBatchParams &params [[buffer(13)]],              \
+      RICHENGINE_LANE_BUFFER_ARGS(device bfloat *, keys, 4),               \
+      RICHENGINE_LANE_BUFFER_ARGS(device bfloat *, values,                  \
+                                  4 + RICHENGINE_MAXIMUM_BATCH_WIDTH),      \
+      device const uint *retained                                           \
+          [[buffer(4 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],               \
+      constant DraftContextBatchParams &params                              \
+          [[buffer(5 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],               \
       uint group [[threadgroup_position_in_grid]],                          \
       uint thread_index [[thread_index_in_threadgroup]],                    \
       uint lane [[thread_index_in_simdgroup]],                              \
@@ -173,8 +170,8 @@ inline void draft_context_kv_commit_impl(
     threadgroup float reductions[8];                                        \
     threadgroup bfloat normalized[HEAD_DIM];                                \
     draft_context_kv_commit_impl<KV_HEADS, HEAD_DIM, INTERLEAVED, E5>(      \
-        context_kv, k_norm, rope_cos, rope_sin, keys0, keys1, keys2, keys3, \
-        values0, values1, values2, values3, retained, params, reductions,   \
+        context_kv, k_norm, rope_cos, rope_sin, RICHENGINE_LANE_VALUES(keys), \
+        RICHENGINE_LANE_VALUES(values), retained, params, reductions,       \
         normalized, group, thread_index, lane, simd_group);                 \
   }
 
@@ -649,9 +646,8 @@ DRAFT_QKV_KERNEL(draft_attention_qkv_q32k2, 32, 2, 128, false, false)
 // walking the (head subtile, block row tile) pairs of each KV head.
 template <uint M, uint N, uint KVHeads, uint HeadDim, uint HeadTiles>
 inline void draft_attention_split_impl(
-    device bfloat *queries, device bfloat *keys0, device bfloat *keys1,
-    device bfloat *keys2, device bfloat *keys3, device bfloat *values0,
-    device bfloat *values1, device bfloat *values2, device bfloat *values3,
+    device bfloat *queries, RICHENGINE_LANE_PARAMS(device bfloat *, keys),
+    RICHENGINE_LANE_PARAMS(device bfloat *, values),
     device bfloat *query_keys, device bfloat *query_values,
     device const DecodeStepPackLane *step_pack,
     constant DraftAttentionBatchParams &params, threadgroup float *workspace,
@@ -666,11 +662,9 @@ inline void draft_attention_split_impl(
   constexpr ulong PartialFloats = ulong(M) * HeadDim + 2 * M;
   uint batch = group.y, kv_head = group.x / RowTiles;
   device bfloat *keys =
-      batch == 0 ? keys0 : (batch == 1 ? keys1 : (batch == 2 ? keys2 : keys3));
-  device bfloat *values = batch == 0
-                              ? values0
-                              : (batch == 1 ? values1
-                                            : (batch == 2 ? values2 : values3));
+      RICHENGINE_LANE_SELECT(batch, keys);
+  device bfloat *values =
+      RICHENGINE_LANE_SELECT(batch, values);
   device float *partials =
       reinterpret_cast<device float *>(queries +
                                        params.lanes * Rows * Attention) +
@@ -693,85 +687,89 @@ inline void draft_attention_split_impl(
 
 kernel void draft_attention_bf16_split(
     device bfloat *queries [[buffer(0)]],
-    device bfloat *keys0 [[buffer(1)]], device bfloat *keys1 [[buffer(2)]],
-    device bfloat *keys2 [[buffer(3)]], device bfloat *keys3 [[buffer(4)]],
-    device bfloat *values0 [[buffer(5)]],
-    device bfloat *values1 [[buffer(6)]],
-    device bfloat *values2 [[buffer(7)]],
-    device bfloat *values3 [[buffer(8)]],
-    device bfloat *query_keys [[buffer(9)]],
-    device bfloat *query_values [[buffer(10)]],
-    device const DecodeStepPackLane *step_pack [[buffer(11)]],
-    constant DraftAttentionBatchParams &params [[buffer(12)]],
+    RICHENGINE_LANE_BUFFER_ARGS(device bfloat *, keys, 1),
+    RICHENGINE_LANE_BUFFER_ARGS(device bfloat *, values,
+                                1 + RICHENGINE_MAXIMUM_BATCH_WIDTH),
+    device bfloat *query_keys
+        [[buffer(1 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
+    device bfloat *query_values
+        [[buffer(2 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
+    device const DecodeStepPackLane *step_pack
+        [[buffer(3 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
+    constant DraftAttentionBatchParams &params
+        [[buffer(4 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float workspace[32 * 128 + 3 * 32];
   draft_attention_split_impl<32, 128, 8, 128, 1>(
-      queries, keys0, keys1, keys2, keys3, values0, values1, values2, values3,
+      queries, RICHENGINE_LANE_VALUES(keys), RICHENGINE_LANE_VALUES(values),
       query_keys, query_values, step_pack, params, workspace, group,
       thread_index, lane, simd_group);
 }
 
 kernel void draft_attention_bf16_split_q16k2(
     device bfloat *queries [[buffer(0)]],
-    device bfloat *keys0 [[buffer(1)]], device bfloat *keys1 [[buffer(2)]],
-    device bfloat *keys2 [[buffer(3)]], device bfloat *keys3 [[buffer(4)]],
-    device bfloat *values0 [[buffer(5)]],
-    device bfloat *values1 [[buffer(6)]],
-    device bfloat *values2 [[buffer(7)]],
-    device bfloat *values3 [[buffer(8)]],
-    device bfloat *query_keys [[buffer(9)]],
-    device bfloat *query_values [[buffer(10)]],
-    device const DecodeStepPackLane *step_pack [[buffer(11)]],
-    constant DraftAttentionBatchParams &params [[buffer(12)]],
+    RICHENGINE_LANE_BUFFER_ARGS(device bfloat *, keys, 1),
+    RICHENGINE_LANE_BUFFER_ARGS(device bfloat *, values,
+                                1 + RICHENGINE_MAXIMUM_BATCH_WIDTH),
+    device bfloat *query_keys
+        [[buffer(1 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
+    device bfloat *query_values
+        [[buffer(2 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
+    device const DecodeStepPackLane *step_pack
+        [[buffer(3 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
+    constant DraftAttentionBatchParams &params
+        [[buffer(4 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float workspace[64 * 64 + 3 * 64];
   draft_attention_split_impl<64, 64, 2, 128, 1>(
-      queries, keys0, keys1, keys2, keys3, values0, values1, values2, values3,
+      queries, RICHENGINE_LANE_VALUES(keys), RICHENGINE_LANE_VALUES(values),
       query_keys, query_values, step_pack, params, workspace, group,
       thread_index, lane, simd_group);
 }
 
 kernel void draft_attention_bf16_split_q32k8d64i(
     device bfloat *queries [[buffer(0)]],
-    device bfloat *keys0 [[buffer(1)]], device bfloat *keys1 [[buffer(2)]],
-    device bfloat *keys2 [[buffer(3)]], device bfloat *keys3 [[buffer(4)]],
-    device bfloat *values0 [[buffer(5)]],
-    device bfloat *values1 [[buffer(6)]],
-    device bfloat *values2 [[buffer(7)]],
-    device bfloat *values3 [[buffer(8)]],
-    device bfloat *query_keys [[buffer(9)]],
-    device bfloat *query_values [[buffer(10)]],
-    device const DecodeStepPackLane *step_pack [[buffer(11)]],
-    constant DraftAttentionBatchParams &params [[buffer(12)]],
+    RICHENGINE_LANE_BUFFER_ARGS(device bfloat *, keys, 1),
+    RICHENGINE_LANE_BUFFER_ARGS(device bfloat *, values,
+                                1 + RICHENGINE_MAXIMUM_BATCH_WIDTH),
+    device bfloat *query_keys
+        [[buffer(1 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
+    device bfloat *query_values
+        [[buffer(2 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
+    device const DecodeStepPackLane *step_pack
+        [[buffer(3 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
+    constant DraftAttentionBatchParams &params
+        [[buffer(4 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float workspace[32 * 128 + 3 * 32];
   draft_attention_split_impl<32, 128, 8, 64, 1>(
-      queries, keys0, keys1, keys2, keys3, values0, values1, values2, values3,
+      queries, RICHENGINE_LANE_VALUES(keys), RICHENGINE_LANE_VALUES(values),
       query_keys, query_values, step_pack, params, workspace, group,
       thread_index, lane, simd_group);
 }
 
 kernel void draft_attention_bf16_split_q8k2d256(
     device bfloat *queries [[buffer(0)]],
-    device bfloat *keys0 [[buffer(1)]], device bfloat *keys1 [[buffer(2)]],
-    device bfloat *keys2 [[buffer(3)]], device bfloat *keys3 [[buffer(4)]],
-    device bfloat *values0 [[buffer(5)]],
-    device bfloat *values1 [[buffer(6)]],
-    device bfloat *values2 [[buffer(7)]],
-    device bfloat *values3 [[buffer(8)]],
-    device bfloat *query_keys [[buffer(9)]],
-    device bfloat *query_values [[buffer(10)]],
-    device const DecodeStepPackLane *step_pack [[buffer(11)]],
-    constant DraftAttentionBatchParams &params [[buffer(12)]],
+    RICHENGINE_LANE_BUFFER_ARGS(device bfloat *, keys, 1),
+    RICHENGINE_LANE_BUFFER_ARGS(device bfloat *, values,
+                                1 + RICHENGINE_MAXIMUM_BATCH_WIDTH),
+    device bfloat *query_keys
+        [[buffer(1 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
+    device bfloat *query_values
+        [[buffer(2 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
+    device const DecodeStepPackLane *step_pack
+        [[buffer(3 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
+    constant DraftAttentionBatchParams &params
+        [[buffer(4 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -781,7 +779,7 @@ kernel void draft_attention_bf16_split_q8k2d256(
   // statistics.
   threadgroup float workspace[32 * 128 + 3 * 32];
   draft_attention_split_impl<32, 128, 2, 256, 1>(
-      queries, keys0, keys1, keys2, keys3, values0, values1, values2, values3,
+      queries, RICHENGINE_LANE_VALUES(keys), RICHENGINE_LANE_VALUES(values),
       query_keys, query_values, step_pack, params, workspace, group,
       thread_index, lane, simd_group);
 }
@@ -791,23 +789,24 @@ kernel void draft_attention_bf16_split_q8k2d256(
 // so each KV group runs as two M=64 head subtiles (HeadTiles 2).
 kernel void draft_attention_bf16_split_q32k2(
     device bfloat *queries [[buffer(0)]],
-    device bfloat *keys0 [[buffer(1)]], device bfloat *keys1 [[buffer(2)]],
-    device bfloat *keys2 [[buffer(3)]], device bfloat *keys3 [[buffer(4)]],
-    device bfloat *values0 [[buffer(5)]],
-    device bfloat *values1 [[buffer(6)]],
-    device bfloat *values2 [[buffer(7)]],
-    device bfloat *values3 [[buffer(8)]],
-    device bfloat *query_keys [[buffer(9)]],
-    device bfloat *query_values [[buffer(10)]],
-    device const DecodeStepPackLane *step_pack [[buffer(11)]],
-    constant DraftAttentionBatchParams &params [[buffer(12)]],
+    RICHENGINE_LANE_BUFFER_ARGS(device bfloat *, keys, 1),
+    RICHENGINE_LANE_BUFFER_ARGS(device bfloat *, values,
+                                1 + RICHENGINE_MAXIMUM_BATCH_WIDTH),
+    device bfloat *query_keys
+        [[buffer(1 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
+    device bfloat *query_values
+        [[buffer(2 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
+    device const DecodeStepPackLane *step_pack
+        [[buffer(3 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
+    constant DraftAttentionBatchParams &params
+        [[buffer(4 + 2 * RICHENGINE_MAXIMUM_BATCH_WIDTH)]],
     uint3 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup float workspace[64 * 64 + 3 * 64];
   draft_attention_split_impl<64, 64, 2, 128, 2>(
-      queries, keys0, keys1, keys2, keys3, values0, values1, values2, values3,
+      queries, RICHENGINE_LANE_VALUES(keys), RICHENGINE_LANE_VALUES(values),
       query_keys, query_values, step_pack, params, workspace, group,
       thread_index, lane, simd_group);
 }

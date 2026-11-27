@@ -54,7 +54,7 @@ struct DraftAttentionBatchParams {
   uint32_t attention_sinks;
 };
 
-static_assert(sizeof(DraftAttentionBatchParams) == 44,
+static_assert(sizeof(DraftAttentionBatchParams) == 28 + 4 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "Draft attention parameters are 44 bytes on both sides");
 
 struct DraftContextParams {
@@ -72,5 +72,5 @@ struct DraftContextBatchParams {
   uint32_t query_rows;
 };
 
-static_assert(sizeof(DraftContextBatchParams) == 20,
+static_assert(sizeof(DraftContextBatchParams) == 4 + 4 * RICHENGINE_MAXIMUM_BATCH_WIDTH,
               "Draft context commit parameters are 20 bytes on both sides");

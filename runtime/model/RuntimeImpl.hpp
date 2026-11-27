@@ -750,7 +750,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   uint64_t gpuPredraftSuppressedEpoch_ = 0;
   SharedEvent predraftEvent_;
   uint64_t predraftEventValue_ = 0;
-  // RICHENGINE_PREDRAFT_OVERLAP keeps the second-command predraft in
+  // Default on; RICHENGINE_PREDRAFT_OVERLAP_OFF disables. Keeps the second-command predraft in
   // flight through the next decode's encode and submit: its queue-level
   // signal orders the verify's GPU work after it (Metal 4 commits are not
   // implicitly serialized), while the host's encode and the Metal submit
@@ -759,7 +759,7 @@ struct Runtime::Impl {  // An image by content: the fields a placement's span id
   // draft positions, which adoption requires match anyway — or
   // proposal-hint-only (uniforms, bypass fills), and the ticket drains
   // in the step's finish before the next launch.
-  const bool predraftOverlap_ = envFlag("RICHENGINE_PREDRAFT_OVERLAP");
+  const bool predraftOverlap_ = !envFlag("RICHENGINE_PREDRAFT_OVERLAP_OFF");
   // GPU/wall seconds of the last settleGpuPredraft drain, folded into the
   // next finalizeDecode's lastDecodeGpuSeconds/lastDecodeWallSeconds: a
   // second-command predraft serializes on the same queue between the

@@ -22,6 +22,9 @@ inline void appendLaneBindings(std::vector<metal::MetalBuffer> &bindings,
   bindings.insert(bindings.end(), second.begin(), second.end());
 }
 
+// Appends one padded per-lane binding vector in kernel order.
+inline void appendLaneBindings(std::vector<metal::MetalBuffer> &bindings,
+                               std::span<const metal::MetalBuffer> lanes);
 // A per-lane buffer of each lane of `lanes` (at least one), and lane 0's in
 // every slot past them, as a padded lane binds.
 inline std::array<metal::MetalBuffer, RICHENGINE_MAXIMUM_BATCH_WIDTH>
@@ -32,6 +35,12 @@ laneBindings(std::span<const metal::MetalBuffer> lanes) {
   for (size_t lane = 0; lane < result.size(); ++lane)
     result[lane] = lanes[lane < lanes.size() ? lane : 0];
   return result;
+}
+
+inline void appendLaneBindings(std::vector<metal::MetalBuffer> &bindings,
+                               std::span<const metal::MetalBuffer> lanes) {
+  const auto padded = laneBindings(lanes);
+  bindings.insert(bindings.end(), padded.begin(), padded.end());
 }
 
 } // namespace richengine::ops

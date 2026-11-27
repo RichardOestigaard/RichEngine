@@ -828,7 +828,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   validatePlan(plan, items, WorkKind::Decode);
   // A pending speculative draft holds one of the two in-flight command
   // slots — by default it drains before any encode touches the arena.
-  // RICHENGINE_PREDRAFT_OVERLAP keeps it in flight through this cycle's
+  // Default on; RICHENGINE_PREDRAFT_OVERLAP_OFF disables. Keeps it in flight through this cycle's
   // encode and submit instead: adoption is host facts only, the predraft's
   // writes reach the verify through queue order, and every host write it
   // could still be racing is either identical-valued (the anchors and
@@ -837,7 +837,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   // token is always the target's, whatever the proposals were). The
   // ticket drains in the step's finish, before the next launch.
   static const bool overlapPredraft =
-      envFlag("RICHENGINE_PREDRAFT_OVERLAP");
+      !envFlag("RICHENGINE_PREDRAFT_OVERLAP_OFF");
   if (!overlapPredraft)
     impl_->settleGpuPredraft();
   const auto encodeStart = richengine::AwakeClock::now();
@@ -954,6 +954,12 @@ Runtime::decodeAsync(const BatchPlan &plan,
           proposals[lane],
           std::max<uint32_t>(0, static_cast<uint32_t>(
               proposals[lane] / (1.0 + item.logicalPosition / ctxScale))));
+    // RICHENGINE_VERIFY_ROW_CAP: measurement-only fixed width — caps every
+    // lane's proposals at cap - 1 regardless of the adaptive budget, for
+    // width sweeps that price the verify rows' marginal cost.
+    static const uint32_t rowCap = envUint("RICHENGINE_VERIFY_ROW_CAP", 0);
+    if (rowCap)
+      proposals[lane] = std::min(proposals[lane], rowCap ? rowCap - 1 : 0);
     liveRows[lane] = proposals[lane] + 1;
     laneResult.proposals = proposals[lane];
 
@@ -1907,7 +1913,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
       request.id = firstId + lane;
       request.prompt = warmupPrompt;
       request.maxNewTokens = 16;
-      beginColdRequest(request, stateLaneOrder[lane]);
+      beginColdRequest(request, lane < 4 ? stateLaneOrder[lane] : lane);
       impl_->request(request.id).warmup = true;
       if (impl_->diffusion) {
         // The canvas writes KV into the request's own admitted pages:
@@ -1946,7 +1952,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     requireLanesSucceeded(decoded);
     bool committedEveryLane = decoded.size() == width;
     for (uint32_t lane = 0; committedEveryLane && lane < width; ++lane) {
-      const auto &lengths = impl_->states.metadata(stateLaneOrder[lane]).lengths;
+      const auto &lengths = impl_->states.metadata(lane < 4 ? stateLaneOrder[lane] : lane).lengths;
       // A diffusion decode commits a whole canvas, not the single anchor
       // the draft/verify arithmetic expects.
       committedEveryLane = impl_->diffusion
@@ -1969,7 +1975,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
     for (uint32_t lane = 0; lane < width; ++lane) {
       lanes.push_back({std::move(decoded[lane]),
                        impl_->request(firstId + lane).pendingToken,
-                       impl_->states.metadata(stateLaneOrder[lane]).lengths.targetTokens});
+                       impl_->states.metadata(lane < 4 ? stateLaneOrder[lane] : lane).lengths.targetTokens});
       end(firstId + lane);
     }
   } catch (...) {

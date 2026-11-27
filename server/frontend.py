@@ -344,6 +344,10 @@ def _cwd_hint(messages):
 # What follows the leading system prompt and tools in the probe that finds
 # their shared prefix: a first turn no request's own is likely to begin with.
 SHARED_PREFIX_PROBE = {"role": "user", "content": "⁣"}
+# A branch checkpoint costs a composite-state snapshot; below this many
+# tokens, recomputing the prefix is cheaper than keeping branch states for
+# ordinary short chats.
+BRANCH_CHECKPOINT_MIN_TOKENS = 1024
 
 
 # A stable marker lets repeated image requests reuse the compiled template.
@@ -495,6 +499,10 @@ class RenderedPrompt:
     # Leading tokens other requests with the same system prompt and tools
     # share; zero unless requested, or when an image lies within them.
     shared_prefix_tokens: int = 0
+    # Leading tokens before the final user/branch point sibling continuations
+    # share; zero unless requested, when media precedes it, or when no safe
+    # boundary is found.
+    branch_boundary_tokens: int = 0
     audios: list = field(default_factory=list)
     audio_positions: list[int] = field(default_factory=list)
     videos: list = field(default_factory=list)
@@ -548,6 +556,7 @@ class Frontend:
         contract=None,
         serving=None,
         shared_prefix_states=False,
+        branch_checkpoint_states=False,
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
@@ -708,6 +717,7 @@ class Frontend:
         self.response_store = ResponseStore()
         self.thinking_codec = thinking_codec
         self.shared_prefix_states = shared_prefix_states
+        self.branch_checkpoint_states = branch_checkpoint_states
         # A d1-family checkpoint answers /v1/systemone through its own
         # prompt and grouped readout; every other model keeps the SemIf
         # letter-slot pathway. Nothing else changes: same score-only jobs.
@@ -1739,6 +1749,46 @@ class Frontend:
             json_codec.encode_compact([head, template])
         )
 
+    def _branch_boundary_text(self, messages, template):
+        """The rendered prefix before the final user message's content.
+
+        Two probe users differ in their first content character, so their
+        common text is the part a sibling or edited final user turn still
+        shares. Rendering the whole conversation keeps the template's own
+        turn-context rewrites intact. The caller validates the candidate
+        against the request's real render and tokens; any mismatch only
+        loses the optimization."""
+        if len(messages) < 2 or messages[-1].get("role") != "user":
+            return ""
+        if isinstance(messages[-1].get("content"), str):
+            try:
+                variants = []
+                for content in ("\x01A", "\x02B"):
+                    final = {**messages[-1], "content": content}
+                    variants.append(
+                        self._apply_chat_template([*messages[:-1], final], template)
+                    )
+                end = next(
+                    (
+                        index
+                        for index, (left, right) in enumerate(zip(*variants))
+                        if left != right
+                    ),
+                    min(len(variants[0]), len(variants[1])),
+                )
+                return variants[0][:end]
+            except Exception:
+                pass
+        try:
+            # Multipart final content has no string probe with the same shape;
+            # fall back to the end of the preceding turn, excluding the final
+            # turn's header but still correct for edits and forks.
+            return self._apply_chat_template(
+                messages[:-1], {**template, "add_generation_prompt": False}
+            )
+        except Exception:
+            return ""
+
     def _render_prompt(
         self,
         prompt,
@@ -1747,6 +1797,7 @@ class Frontend:
         check_context=True,
         add_generation_prompt=True,
         shared_prefix=False,
+        branch_checkpoint=False,
     ):
         chat_template = self.chat_templates.select(prompt.tools)
         if not chat_template.accepts(prompt.messages):
@@ -1859,10 +1910,28 @@ class Frontend:
             if ours != probed:
                 break
             shared_prefix_tokens += 1
-        # Expanding media before it would move it.
+        # Expanding media before it would move either boundary.
         first_media = min(positions + audio_positions + video_positions, default=None)
         if first_media is not None and first_media < shared_prefix_tokens:
             shared_prefix_tokens = 0
+        branch_boundary_tokens = 0
+        if branch_checkpoint and first_media is None:
+            candidate = self._branch_boundary_text(prompt.messages, template)
+            if len(candidate) >= 2048 and rendered.startswith(candidate):
+                ids = self.prompt_tokenizer.encode(candidate)
+                matched = next(
+                    (
+                        index
+                        for index, (ours, theirs) in enumerate(zip(tokens, ids))
+                        if ours != theirs
+                    ),
+                    min(len(tokens), len(ids)),
+                )
+                if (
+                    matched >= BRANCH_CHECKPOINT_MIN_TOKENS
+                    and matched < len(tokens)
+                ):
+                    branch_boundary_tokens = matched
         # The text the model reads; the marks said how it encodes.
         rendered = unquoted(rendered)
         return RenderedPrompt(
@@ -1873,6 +1942,7 @@ class Frontend:
             thinking,
             generation_prompt_tokens,
             shared_prefix_tokens,
+            branch_boundary_tokens,
             audios=audios,
             audio_positions=audio_positions,
             videos=videos,
@@ -1979,7 +2049,10 @@ class Frontend:
                 "tool_choice none or structured output",
             )
         rendered = self._render_prompt(
-            prompt, deadline, shared_prefix=self.shared_prefix_states
+            prompt,
+            deadline,
+            shared_prefix=self.shared_prefix_states,
+            branch_checkpoint=self.branch_checkpoint_states,
         )
         prompt_tokens, prepared_images = rendered.tokens, rendered.images
         image_positions, thinking = rendered.image_positions, rendered.thinking
@@ -2058,6 +2131,7 @@ class Frontend:
             reply_memory=self.prompt_tokenizer,
             generation_prompt_tokens=rendered.generation_prompt_tokens,
             shared_prefix_tokens=rendered.shared_prefix_tokens,
+            branch_boundary_tokens=rendered.branch_boundary_tokens,
             output_clamped_to_context=requested is not None and max_new < requested,
             n_samples=n,
         )

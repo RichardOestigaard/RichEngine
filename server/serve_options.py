@@ -585,6 +585,16 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--branch-checkpoint-state",
+        dict(
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="keep an evict-first checkpoint before the final user turn, "
+            "so edited turns and sibling forks resume there (default: off; "
+            "experimental)",
+        ),
+    ),
+    ServeOption(
         "--no-webui",
         dict(action="store_true", default=False, help="disable the chat page"),
     ),
